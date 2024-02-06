@@ -223,7 +223,7 @@ function initServerRacks() {
     const loader = new GLTFLoader();
     serverRacks.forEach(([modelURL, x, z]) => {
         loader.load(
-            `https://mystage.interserver.net/images/3d/${modelURL}.glb`,
+            `https://mystage.interserver.net/images/3d/racks/${modelURL}.glb`,
             function (gltf) {
                 const model = gltf.scene;
                 const scale = 10;
