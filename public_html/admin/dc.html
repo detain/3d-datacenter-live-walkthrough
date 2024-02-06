@@ -162,212 +162,249 @@ const direction = new THREE.Vector3();
 const vertex = new THREE.Vector3();
 const color = new THREE.Color();
 const serverRacks = [
-	["1182_096_2", 0, -10],
-	["1182_096_2", 10, -10],
-	["1182_096_2", 20, -10],
-	["1182_096_2", 30, -10],
-	["1182_096_2", 40, -10],
-	["1182_096_2", 50, -10],
-	["1182_096_2", 60, -10],
-	["1182_096_2", 70, -10],
-	["1182_096_2", 80, -10],
-	["5507_150_2", 0, -40],
-	["5507_150_2", 10, -40],
-	["5507_150_2", 20, -40],
-	["5507_150_2", 30, -40],
-	["5507_150_2", 40, -40],
-	["5507_150_2", 50, -40],
-	["5507_150_2", 60, -40],
-	["1182_096_2", 70, -40],
-	["5507_150_2", 80, -40]
+    ["1182_096_2", -10, -10],
+    ["1182_096_2", -20, -10],
+    ["1182_096_2", -30, -10],
+    ["1182_096_2", -40, -10],
+    ["1182_096_2", -50, -10],
+    ["1182_096_2", -60, -10],
+    ["1182_096_2", -70, -10],
+    ["1182_096_2", -80, -10],
+    ["5307_824_2", 10, -10],
+    ["5307_824_2", 20, -10],
+    ["5307_824_2", 30, -10],
+    ["5307_824_2", 40, -10],
+    ["5307_824_2", 50, -10],
+    ["5307_824_2", 60, -10],
+    ["5307_824_2", 70, -10],
+    ["5307_824_2", 80, -10],
+    ["5507_150_2", -10, -30],
+    ["5507_150_2", -20, -30],
+    ["5507_150_2", -30, -30],
+    ["5507_150_2", -40, -30],
+    ["5507_150_2", -50, -30],
+    ["5507_150_2", -60, -30],
+    ["5507_150_2", -70, -30],
+    ["5507_150_2", -80, -30],
+    ["7000_562_2", -10, -50],
+    ["7000_562_2", -20, -50],
+    ["7000_562_2", -30, -50],
+    ["7000_562_2", -40, -50],
+    ["7000_562_2", -50, -50],
+    ["7000_562_2", -60, -50],
+    ["7000_562_2", -70, -50],
+    ["7000_562_2", -80, -50],
+    ["7831_800_2", 10, -50],
+    ["7831_800_2", 20, -50],
+    ["7831_800_2", 30, -50],
+    ["7831_800_2", 40, -50],
+    ["7831_800_2", 50, -50],
+    ["7831_800_2", 60, -50],
+    ["7831_800_2", 70, -50],
+    ["7831_800_2", 80, -50],
+    ["SB838072AFB18", -10, -70],
+    ["SB838072AFB18", -20, -70],
+    ["SB838072AFB18", -30, -70],
+    ["SB838072AFB18", -40, -70],
+    ["SB838072AFB18", -50, -70],
+    ["SB838072AFB18", -60, -70],
+    ["SB838072AFB18", -70, -70],
+    ["SB838072AFB18", -80, -70],
+    ["WZ-IT-426060-69AA-2-011_0", 10, -70],
+    ["WZ-IT-426060-69AA-2-011_0", 20, -70],
+    ["WZ-IT-426060-69AA-2-011_0", 30, -70],
+    ["WZ-IT-426060-69AA-2-011_0", 40, -70],
+    ["WZ-IT-426060-69AA-2-011_0", 50, -70],
+    ["WZ-IT-426060-69AA-2-011_0", 60, -70],
+    ["WZ-IT-426060-69AA-2-011_0", 70, -70],
+    ["WZ-IT-426060-69AA-2-011_0", 80, -70]
 ];
 function initServerRacks() {
-	const loader = new GLTFLoader();
-	serverRacks.forEach(([modelURL, x, z]) => {
-		loader.load(
-			`https://mystage.interserver.net/images/3d/${modelURL}.glb`,
-			function (gltf) {
-				const model = gltf.scene;
-				const scale = 10;
-				// Set positions based on the serverRacks array
-				const position = new THREE.Vector3(x, 5, z);
-				model.scale.set(scale, scale, scale);
-				model.position.copy(position);
-				scene.add(model);
-				objects.push(model);
-				// No need to store information in the serverRacks array again, as it's already pre-filled
-				renderer.render(scene, camera);
-			}
-		);
-	});
+    const loader = new GLTFLoader();
+    serverRacks.forEach(([modelURL, x, z]) => {
+        loader.load(
+            `https://mystage.interserver.net/images/3d/${modelURL}.glb`,
+            function (gltf) {
+                const model = gltf.scene;
+                const scale = 10;
+                // Set positions based on the serverRacks array
+                const position = new THREE.Vector3(x, 5, z);
+                model.scale.set(scale, scale, scale);
+                model.position.copy(position);
+                scene.add(model);
+                objects.push(model);
+                // No need to store information in the serverRacks array again, as it's already pre-filled
+                renderer.render(scene, camera);
+            }
+        );
+    });
 }
 function init() {
-	// Initialize the scene
-	camera = new THREE.PerspectiveCamera(
-		75,
-		window.innerWidth / window.innerHeight,
-		1,
-		1000
-	); // Set up the camera
-	camera.position.y = PlayerHeight;
-	scene = new THREE.Scene(); // Create the scene
-	scene.background = new THREE.Color(0xffffff);
-	scene.fog = new THREE.Fog(0xffffff, 0, 750);
-	const light = new THREE.HemisphereLight(0xeeeeff, 0x777788, 2.5); // Add hemisphere light for ambient lighting
-	light.position.set(0.5, 1, 0.75);
-	scene.add(light);
-	controls = new PointerLockControls(camera, document.body); // Set up pointer lock controls
-	const blocker = document.getElementById("blocker");
-	const instructions = document.getElementById("instructions");
-	instructions.addEventListener("click", function () {
-		// Event listener for locking controls
-		controls.lock();
-	});
-	controls.addEventListener("lock", function () {
-		// Event listeners for lock and unlock events
-		instructions.style.display = "none";
-		blocker.style.display = "none";
-	});
-	controls.addEventListener("unlock", function () {
-		blocker.style.display = "block";
-		instructions.style.display = "";
-	});
-	scene.add(controls.getObject()); // Add controls to the scene
-	const onKeyDown = function (event) {
-		// Event listeners for keydown and keyup events
-		switch (event.code) {
-			case "ArrowUp":
-			case "KeyW":
-				moveForward = true;
-				break;
-			case "ArrowLeft":
-			case "KeyA":
-				moveLeft = true;
-				break;
-			case "ArrowDown":
-			case "KeyS":
-				moveBackward = true;
-				break;
-			case "ArrowRight":
-			case "KeyD":
-				moveRight = true;
-				break;
-			case "Space":
-				if (canJump === true) velocity.y += 350;
-				canJump = false;
-				break;
-		}
-	};
-	const onKeyUp = function (event) {
-		switch (event.code) {
-			case "ArrowUp":
-			case "KeyW":
-				moveForward = false;
-				break;
-			case "ArrowLeft":
-			case "KeyA":
-				moveLeft = false;
-				break;
-			case "ArrowDown":
-			case "KeyS":
-				moveBackward = false;
-				break;
-			case "ArrowRight":
-			case "KeyD":
-				moveRight = false;
-				break;
-		}
-	};
-	document.addEventListener("keydown", onKeyDown);
-	document.addEventListener("keyup", onKeyUp);
-	raycaster = new THREE.Raycaster( // Initialize Raycaster for object intersection
-		new THREE.Vector3(),
-		new THREE.Vector3(0, -1, 0),
-		0,
-		10
-	);
-	let floorGeometry = new THREE.PlaneGeometry(2000, 2000, 100, 100); // Create the floor
-	floorGeometry.rotateX(-Math.PI / 2);
-	let position = floorGeometry.attributes.position; // Vertex displacement for floor
-	for (let i = 0, l = position.count; i < l; i++) {
-		vertex.fromBufferAttribute(position, i);
-		vertex.x += Math.random() * 20 - 10;
-		vertex.y += Math.random() * 2;
-		vertex.z += Math.random() * 20 - 10;
-		position.setXYZ(i, vertex.x, vertex.y, vertex.z);
-	}
-	floorGeometry = floorGeometry.toNonIndexed(); // Ensure each face has unique vertices
-	position = floorGeometry.attributes.position; // Set vertex colors for the floor
-	const colorsFloor = [];
-	for (let i = 0, l = position.count; i < l; i++) {
-		color.setHSL(
-			Math.random() * 0.3 + 0.5,
-			0.75,
-			Math.random() * 0.25 + 0.75,
-			THREE.SRGBColorSpace
-		);
-		colorsFloor.push(color.r, color.g, color.b);
-	}
-	floorGeometry.setAttribute(
-		"color",
-		new THREE.Float32BufferAttribute(colorsFloor, 3)
-	);
-	const floorMaterial = new THREE.MeshBasicMaterial({ vertexColors: true }); // Create floor mesh
-	const floor = new THREE.Mesh(floorGeometry, floorMaterial);
-	scene.add(floor);
-	initServerRacks(); // Call the initServerRacks function to load the pre-filled server racks
-	// BOX SECTION WAS HERE
-	renderer = new THREE.WebGLRenderer({
-		// Set up the renderer
-		antialias: true
-	});
-	renderer.setPixelRatio(window.devicePixelRatio);
-	renderer.setSize(window.innerWidth, window.innerHeight);
-	document.body.appendChild(renderer.domElement);
-	window.addEventListener("resize", onWindowResize); // Event listener for window resize
+    // Initialize the scene
+    camera = new THREE.PerspectiveCamera(
+        75,
+        window.innerWidth / window.innerHeight,
+        1,
+        1000
+    ); // Set up the camera
+    camera.position.y = PlayerHeight;
+    scene = new THREE.Scene(); // Create the scene
+    scene.background = new THREE.Color(0xffffff);
+    scene.fog = new THREE.Fog(0xffffff, 0, 750);
+    const light = new THREE.HemisphereLight(0xeeeeff, 0x777788, 2.5); // Add hemisphere light for ambient lighting
+    light.position.set(0.5, 1, 0.75);
+    scene.add(light);
+    controls = new PointerLockControls(camera, document.body); // Set up pointer lock controls
+    const blocker = document.getElementById("blocker");
+    const instructions = document.getElementById("instructions");
+    instructions.addEventListener("click", function () {
+        // Event listener for locking controls
+        controls.lock();
+    });
+    controls.addEventListener("lock", function () {
+        // Event listeners for lock and unlock events
+        instructions.style.display = "none";
+        blocker.style.display = "none";
+    });
+    controls.addEventListener("unlock", function () {
+        blocker.style.display = "block";
+        instructions.style.display = "";
+    });
+    scene.add(controls.getObject()); // Add controls to the scene
+    const onKeyDown = function (event) {
+        // Event listeners for keydown and keyup events
+        switch (event.code) {
+            case "ArrowUp":
+            case "KeyW":
+                moveForward = true;
+                break;
+            case "ArrowLeft":
+            case "KeyA":
+                moveLeft = true;
+                break;
+            case "ArrowDown":
+            case "KeyS":
+                moveBackward = true;
+                break;
+            case "ArrowRight":
+            case "KeyD":
+                moveRight = true;
+                break;
+            case "Space":
+                if (canJump === true) velocity.y += 350;
+                canJump = false;
+                break;
+        }
+    };
+    const onKeyUp = function (event) {
+        switch (event.code) {
+            case "ArrowUp":
+            case "KeyW":
+                moveForward = false;
+                break;
+            case "ArrowLeft":
+            case "KeyA":
+                moveLeft = false;
+                break;
+            case "ArrowDown":
+            case "KeyS":
+                moveBackward = false;
+                break;
+            case "ArrowRight":
+            case "KeyD":
+                moveRight = false;
+                break;
+        }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    document.addEventListener("keyup", onKeyUp);
+    raycaster = new THREE.Raycaster( // Initialize Raycaster for object intersection
+        new THREE.Vector3(),
+        new THREE.Vector3(0, -1, 0),
+        0,
+        10
+    );
+    let floorGeometry = new THREE.PlaneGeometry(2000, 2000, 100, 100); // Create the floor
+    floorGeometry.rotateX(-Math.PI / 2);
+    let position = floorGeometry.attributes.position; // Vertex displacement for floor
+    for (let i = 0, l = position.count; i < l; i++) {
+        vertex.fromBufferAttribute(position, i);
+        vertex.x += Math.random() * 20 - 10;
+        vertex.y += Math.random() * 2;
+        vertex.z += Math.random() * 20 - 10;
+        position.setXYZ(i, vertex.x, vertex.y, vertex.z);
+    }
+    floorGeometry = floorGeometry.toNonIndexed(); // Ensure each face has unique vertices
+    position = floorGeometry.attributes.position; // Set vertex colors for the floor
+    const colorsFloor = [];
+    for (let i = 0, l = position.count; i < l; i++) {
+        color.setHSL(
+            Math.random() * 0.3 + 0.5,
+            0.75,
+            Math.random() * 0.25 + 0.75,
+            THREE.SRGBColorSpace
+        );
+        colorsFloor.push(color.r, color.g, color.b);
+    }
+    floorGeometry.setAttribute(
+        "color",
+        new THREE.Float32BufferAttribute(colorsFloor, 3)
+    );
+    const floorMaterial = new THREE.MeshBasicMaterial({ vertexColors: true }); // Create floor mesh
+    const floor = new THREE.Mesh(floorGeometry, floorMaterial);
+    scene.add(floor);
+    initServerRacks(); // Call the initServerRacks function to load the pre-filled server racks
+    // BOX SECTION WAS HERE
+    renderer = new THREE.WebGLRenderer({
+        // Set up the renderer
+        antialias: true
+    });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+    window.addEventListener("resize", onWindowResize); // Event listener for window resize
 }
 function onWindowResize() {
-	camera.aspect = window.innerWidth / window.innerHeight; // Handle window resize
-	camera.updateProjectionMatrix();
-	renderer.setSize(window.innerWidth, window.innerHeight);
+    camera.aspect = window.innerWidth / window.innerHeight; // Handle window resize
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
 }
 function animate() {
-	requestAnimationFrame(animate); // Animation loop
-	const time = performance.now();
-	if (controls.isLocked === true) {
-		raycaster.ray.origin.copy(controls.getObject().position);
-		raycaster.ray.origin.y -= 10;
-		const intersections = raycaster.intersectObjects(objects, false); // Check for intersections with objects
-		const onObject = intersections.length > 0;
-		const delta = (time - prevTime) / 1000;
-		velocity.x -= velocity.x * 10.0 * delta; // Update velocity based on user input
-		velocity.z -= velocity.z * 10.0 * delta;
-		velocity.y -= 9.8 * 100.0 * delta; // 100.0 = mass
-		direction.z = Number(moveForward) - Number(moveBackward);
-		direction.x = Number(moveRight) - Number(moveLeft);
-		direction.normalize(); // Ensure consistent movements in all directions
-		if (moveForward || moveBackward) velocity.z -= direction.z * 400.0 * delta;
-		if (moveLeft || moveRight) velocity.x -= direction.x * 400.0 * delta;
-		if (onObject === true) {
-			velocity.y = Math.max(0, velocity.y);
-			canJump = true;
-		}
-		controls.moveRight(-velocity.x * delta); // Update controls position
-		controls.moveForward(-velocity.z * delta);
-		controls.getObject().position.y += velocity.y * delta;
-		if (controls.getObject().position.y < PlayerHeight) {
-			// New behavior for jumping
-			velocity.y = 0;
-			controls.getObject().position.y = PlayerHeight;
-			canJump = true;
-		}
-	}
-	prevTime = time;
-	renderer.render(scene, camera); // Render the scene
+    requestAnimationFrame(animate); // Animation loop
+    const time = performance.now();
+    if (controls.isLocked === true) {
+        raycaster.ray.origin.copy(controls.getObject().position);
+        raycaster.ray.origin.y -= 10;
+        const intersections = raycaster.intersectObjects(objects, false); // Check for intersections with objects
+        const onObject = intersections.length > 0;
+        const delta = (time - prevTime) / 1000;
+        velocity.x -= velocity.x * 10.0 * delta; // Update velocity based on user input
+        velocity.z -= velocity.z * 10.0 * delta;
+        velocity.y -= 9.8 * 100.0 * delta; // 100.0 = mass
+        direction.z = Number(moveForward) - Number(moveBackward);
+        direction.x = Number(moveRight) - Number(moveLeft);
+        direction.normalize(); // Ensure consistent movements in all directions
+        if (moveForward || moveBackward) velocity.z -= direction.z * 400.0 * delta;
+        if (moveLeft || moveRight) velocity.x -= direction.x * 400.0 * delta;
+        if (onObject === true) {
+            velocity.y = Math.max(0, velocity.y);
+            canJump = true;
+        }
+        controls.moveRight(-velocity.x * delta); // Update controls position
+        controls.moveForward(-velocity.z * delta);
+        controls.getObject().position.y += velocity.y * delta;
+        if (controls.getObject().position.y < PlayerHeight) {
+            // New behavior for jumping
+            velocity.y = 0;
+            controls.getObject().position.y = PlayerHeight;
+            canJump = true;
+        }
+    }
+    prevTime = time;
+    renderer.render(scene, camera); // Render the scene
 }
 init(); // Call the init function to set up the scene
-animate(); // Start the animation loop
-
+animate();
 /* const boxGeometry = new THREE.BoxGeometry(20, 20, 20).toNonIndexed(); // Create objects
 	position = boxGeometry.attributes.position;
 	const colorsBox = [];
