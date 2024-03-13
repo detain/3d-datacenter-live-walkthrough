@@ -1,36 +1,43 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-	<head>
-		<title>DataCenter 3D (Three.js)</title>
-		<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<script type="importmap">
-	{
+<head>
+	<meta charset="UTF-8">
+	<title>CodePen - rendering our server room in three.js (servers)</title>
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<script type="importmap">
+		{
 		"imports": {
 			"three": "https://threejs.org/build/three.module.js",
 				"three/addons/": "https://threejs.org/examples/jsm/"
 		}
 	}
 </script>
-<link rel="stylesheet" href="/css/dc.css">
-	</head>
-	<body>
-<div id="blocker">
-	<div id="instructions">
-		<p style="font-size:36px">
-			Click to enable looking with the mouse.<br />
-			<br>
-			<small>Press Escape to disable mouse look.</small>
-		</p>
-		<p>
-			Move: WASD<br />
-			Jump: SPACE<br />
-			Look: MOUSE<br />
-			Server Model Test: Z<br />
-		</p>
+	<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+	<!-- partial:index.partial.html -->
+	<div id="blocker">
+		<div id="instructions">
+			<p style="font-size:36px">
+				Click to enable looking with the mouse.<br />
+				<br>
+				<small>Press Escape to disable mouse look.</small>
+			</p>
+			<p>
+				Move: WASD<br />
+				Jump: SPACE<br />
+				Look: MOUSE<br />
+				TODO:
+			<ul>
+				<li>Add Pathing to move to a target server/rack</li>
+				<li>Add pathing to draw lines between objects like network ports to servers</li>
+				<li>Add buttons to switch to diff datacenters</li>
+				<li>properly align/rotate all models</li>
+			</ul>
+			</p>
+		</div>
 	</div>
-</div>
-		<script type="module" src="/js/dc.js"></script>
-
-	</body>
+	<!-- partial -->
+	<script type="module" src="./script.js"></script>
+</body>
 </html>
