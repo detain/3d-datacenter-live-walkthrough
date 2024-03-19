@@ -137,6 +137,9 @@ function loadDatacenter() {
 			gui.add( options, 'location', locationNames ).onChange( (value) => {
 				options.locationId = locationName2Id(value)
 				console.log(options.location);
+				clearScene();
+				getRackModels();
+				getServerModels();
 			});
 			getRackModels();
 			getServerModels();
@@ -158,10 +161,10 @@ function locationName2Id(name) {
 function clearScene() {
 	for (const object of objects) {
 		scene.remove(object);
-		scene.traverse(function (child) {
-			if (child.isSkinnedMesh) child.skeleton.dispose();
-		});
 	}
+	scene.traverse(function (child) {
+		if (child.isSkinnedMesh) child.skeleton.dispose();
+	});
 	objects.length = 0;
 }
 
@@ -280,6 +283,7 @@ function displayServers(modelIdx) {
 					position = new THREE.Vector3(-2.5 + -100 + (x * 8), 1 + 0.5 * start, 2.6 + -100 + (z * 10));
 					model.position.copy(position);
 					scene.add(model);					
+					objects.push(model);
 				}
 			}
 		}
