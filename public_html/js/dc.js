@@ -110,7 +110,7 @@ const serverTypes = [
 	//["HP ProLiant ML350 G5", 5],
 	//["HP ProLiant ML370 G5", 5],
 	//["Cisco Catalyst 6506e", 11],
-	["Cisco Catalyst 4510r", 14],
+	["Cisco Catalyst 4510r", 13],
 ];
 
 function loadDatacenter() {
@@ -279,7 +279,7 @@ function displayServers(modelIdx) {
 					start = locations[options.locationId].racks[idxRack].servers[idxServer].start;
 					//console.log("Adding rack[" + x + "," + z + "] server starting at " + start + " model " + modelName + " size " + modelUnits + "U");
 					model = SkeletonUtils.clone(models.servers[modelIdx]);
-					//position = new THREE.Vector3(-100 + (x * 8), 1, -100 + (z * 9));
+					//position = new THREE.Vector3(-100 + (x * 20), 1, -100 + (z * 10));
 					position = new THREE.Vector3(-2.5 + -100 + (x * 8), 1 + 0.5 * start, 2.6 + -100 + (z * 9));
 					model.position.copy(position);
 					scene.add(model);					
