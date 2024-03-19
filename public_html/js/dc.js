@@ -12,7 +12,7 @@ let collisionMovement = false, racksShown = false, showServers = true, locationI
 const objects = [], models = { racks: {}, servers: {} }, locationNames = [];
 const options = {
 	domain: 'mystage.interserver.net',
-	locationId: 1,
+	locationId: 2,
 	location: ''
 };
 const maxRoomServers = 0;
@@ -26,8 +26,8 @@ const loaderGltf = new GLTFLoader();
 const usedRacksSet = new Set();
 const usedServerSet = new Set();
 let usedRacks, usedServers;
-let racks = [[0,1,1,[[0,2],[1,3],[2,4],[3,5],[6,6],[13,7],[14,9],[15,11],[16,13],[17,15],[18,17],[21,19],[25,21]]],[0,2,1,[[1,1],[1,2],[1,4],[1,7],[1,11]]],[0,3,1,[[2,1],[2,2],[2,4],[2,7],[2,11]]],[0,4,1,[[3,1],[3,2],[3,4],[3,7],[3,11]]],[0,5,1,[[4,1],[4,2],[4,4],[4,7],[4,11]]],[0,6,1,[[5,1],[5,2],[5,4],[5,7],[5,11]]],[0,7,1,[[6,1],[6,2],[6,4],[6,7],[6,11]]],[0,8,1,[[7,1],[7,2],[7,4],[7,7],[7,11]]],[0,9,1,[[8,1],[8,2],[8,4],[8,7],[8,11]]],[0,10,1,[[9,1],[9,2],[9,4],[9,7],[9,11]]],[1,1,2,[[0,1],[0,2],[0,4],[0,7],[0,11]]],[1,2,2,[[1,1],[1,2],[1,4],[1,7],[1,11]]],[1,3,2,[[2,1],[2,2],[2,4],[2,7],[2,11]]],[1,4,2,[[3,1],[3,2],[3,4],[3,7],[3,11]]],[1,5,2,[[4,1],[4,2],[4,4],[4,7],[4,11]]],[1,6,2,[[5,1],[5,2],[5,4],[5,7],[5,11]]],[1,7,2,[[6,1],[6,2],[6,4],[6,7],[6,11]]],[1,8,2,[[7,1],[7,2],[7,4],[7,7],[7,11]]],[1,9,2,[[8,1],[8,2],[8,4],[8,7],[8,11]]],[1,10,2,[[9,1],[9,2],[9,4],[9,7],[9,11]]],[2,1,3,[[0,1],[0,2],[0,4],[0,7],[0,11]]],[2,2,3,[[1,1],[1,2],[1,4],[1,7],[1,11]]],[2,3,3,[[2,1],[2,2],[2,4],[2,7],[2,11]]],[2,4,3,[[3,1],[3,2],[3,4],[3,7],[3,11]]],[2,5,3,[[4,1],[4,2],[4,4],[4,7],[4,11]]],[2,6,3,[[5,1],[5,2],[5,4],[5,7],[5,11]]],[2,7,3,[[6,1],[6,2],[6,4],[6,7],[6,11]]],[2,8,3,[[7,1],[7,2],[7,4],[7,7],[7,11]]],[2,9,3,[[8,1],[8,2],[8,4],[8,7],[8,11]]],[2,10,3,[[9,1],[9,2],[9,4],[9,7],[9,11]]],[3,1,4,[[0,1],[0,2],[0,4],[0,7],[0,11]]],[3,2,4,[[1,1],[1,2],[1,4],[1,7],[1,11]]],[3,3,4,[[2,1],[2,2],[2,4],[2,7],[2,11]]],[3,4,4,[[3,1],[3,2],[3,4],[3,7],[3,11]]],[3,5,4,[[4,1],[4,2],[4,4],[4,7],[4,11]]],[3,6,4,[[5,1],[5,2],[5,4],[5,7],[5,11]]],[3,7,4,[[6,1],[6,2],[6,4],[6,7],[6,11]]],[3,8,4,[[7,1],[7,2],[7,4],[7,7],[7,11]]],[3,9,4,[[8,1],[8,2],[8,4],[8,7],[8,11]]],[3,10,4,[[9,1],[9,2],[9,4],[9,7],[9,11]]],[4,1,5,[[0,1],[0,2],[0,4],[0,7],[0,11]]],[4,2,5,[[1,1],[1,2],[1,4],[1,7],[1,11]]],[4,3,5,[[2,1],[2,2],[2,4],[2,7],[2,11]]],[4,4,5,[[3,1],[3,2],[3,4],[3,7],[3,11]]],[4,5,5,[[4,1],[4,2],[4,4],[4,7],[4,11]]],[4,6,5,[[5,1],[5,2],[5,4],[5,7],[5,11]]],[4,7,5,[[6,1],[6,2],[6,4],[6,7],[6,11]]],[4,8,5,[[7,1],[7,2],[7,4],[7,7],[7,11]]],[4,9,5,[[8,1],[8,2],[8,4],[8,7],[8,11]]],[4,10,5,[[9,1],[9,2],[9,4],[9,7],[9,11]]],[5,1,6,[[0,1],[0,2],[0,4],[0,7],[0,11]]],[5,2,6,[[1,1],[1,2],[1,4],[1,7],[1,11]]],[5,3,6,[[2,1],[2,2],[2,4],[2,7],[2,11]]],[5,4,6,[[3,1],[3,2],[3,4],[3,7],[3,11]]],[5,5,6,[[4,1],[4,2],[4,4],[4,7],[4,11]]],[5,6,6,[[5,1],[5,2],[5,4],[5,7],[5,11]]],[5,7,6,[[6,1],[6,2],[6,4],[6,7],[6,11]]],[5,8,6,[[7,1],[7,2],[7,4],[7,7],[7,11]]],[5,9,6,[[8,1],[8,2],[8,4],[8,7],[8,11]]],[5,10,6,[[9,1],[9,2],[9,4],[9,7],[9,11]]],[6,1,7,[[0,1],[0,2],[0,4],[0,7],[0,11]]],[6,2,7,[[1,1],[1,2],[1,4],[1,7],[1,11]]],[6,3,7,[[2,1],[2,2],[2,4],[2,7],[2,11]]],[6,4,7,[[3,1],[3,2],[3,4],[3,7],[3,11]]],[6,5,7,[[4,1],[4,2],[4,4],[4,7],[4,11]]],[6,6,7,[[5,1],[5,2],[5,4],[5,7],[5,11]]],[6,7,7,[[6,1],[6,2],[6,4],[6,7],[6,11]]],[6,8,7,[[7,1],[7,2],[7,4],[7,7],[7,11]]],[6,9,7,[[8,1],[8,2],[8,4],[8,7],[8,11]]],[6,10,7,[[9,1],[9,2],[9,4],[9,7],[9,11]]],[7,1,8,[[0,1],[0,2],[0,4],[0,7],[0,11]]],[7,2,8,[[1,1],[1,2],[1,4],[1,7],[1,11]]],[7,3,8,[[2,1],[2,2],[2,4],[2,7],[2,11]]],[7,4,8,[[3,1],[3,2],[3,4],[3,7],[3,11]]],[7,5,8,[[4,1],[4,2],[4,4],[4,7],[4,11]]],[7,6,8,[[5,1],[5,2],[5,4],[5,7],[5,11]]],[7,7,8,[[6,1],[6,2],[6,4],[6,7],[6,11]]],[7,8,8,[[7,1],[7,2],[7,4],[7,7],[7,11]]],[7,9,8,[[8,1],[8,2],[8,4],[8,7],[8,11]]],[7,10,8,[[9,1],[9,2],[9,4],[9,7],[9,11]]],[8,1,9,[[0,1],[0,2],[0,4],[0,7],[0,11]]],[8,2,9,[[1,1],[1,2],[1,4],[1,7],[1,11]]],[8,3,9,[[2,1],[2,2],[2,4],[2,7],[2,11]]],[8,4,9,[[3,1],[3,2],[3,4],[3,7],[3,11]]],[8,5,9,[[4,1],[4,2],[4,4],[4,7],[4,11]]],[8,6,9,[[5,1],[5,2],[5,4],[5,7],[5,11]]],[8,7,9,[[6,1],[6,2],[6,4],[6,7],[6,11]]],[8,8,9,[[7,1],[7,2],[7,4],[7,7],[7,11]]],[8,9,9,[[8,1],[8,2],[8,4],[8,7],[8,11]]],[8,10,9,[[9,1],[9,2],[9,4],[9,7],[9,11]]],[9,1,10,[[0,1],[0,2],[0,4],[0,7],[0,11]]],[9,2,10,[[1,1],[1,2],[1,4],[1,7],[1,11]]],[9,3,10,[[2,1],[2,2],[2,4],[2,7],[2,11]]],[9,4,10,[[3,1],[3,2],[3,4],[3,7],[3,11]]],[9,5,10,[[4,1],[4,2],[4,4],[4,7],[4,11]]],[9,6,10,[[5,1],[5,2],[5,4],[5,7],[5,11]]],[9,7,10,[[6,1],[6,2],[6,4],[6,7],[6,11]]],[9,8,10,[[7,1],[7,2],[7,4],[7,7],[7,11]]],[9,9,10,[[8,1],[8,2],[8,4],[8,7],[8,11]]],[9,10,10,[[9,1],[9,2],[9,4],[9,7],[9,11]]],[10,1,11,[[0,1],[0,2],[0,4],[0,7],[0,11]]],[10,2,11,[[1,1],[1,2],[1,4],[1,7],[1,11]]],[10,3,11,[[2,1],[2,2],[2,4],[2,7],[2,11]]],[10,4,11,[[3,1],[3,2],[3,4],[3,7],[3,11]]],[10,5,11,[[4,1],[4,2],[4,4],[4,7],[4,11]]],[10,6,11,[[5,1],[5,2],[5,4],[5,7],[5,11]]],[10,7,11,[[6,1],[6,2],[6,4],[6,7],[6,11]]],[10,8,11,[[7,1],[7,2],[7,4],[7,7],[7,11]]],[10,9,11,[[8,1],[8,2],[8,4],[8,7],[8,11]]],[10,10,11,[[9,1],[9,2],[9,4],[9,7],[9,11]]],[11,1,12,[[0,1],[0,2],[0,4],[0,7],[0,11]]],[11,2,12,[[1,1],[1,2],[1,4],[1,7],[1,11]]],[11,3,12,[[2,1],[2,2],[2,4],[2,7],[2,11]]],[11,4,12,[[3,1],[3,2],[3,4],[3,7],[3,11]]],[11,5,12,[[4,1],[4,2],[4,4],[4,7],[4,11]]],[11,6,12,[[5,1],[5,2],[5,4],[5,7],[5,11]]],[11,7,12,[[6,1],[6,2],[6,4],[6,7],[6,11]]],[11,8,12,[[7,1],[7,2],[7,4],[7,7],[7,11]]],[11,9,12,[[8,1],[8,2],[8,4],[8,7],[8,11]]],[11,10,12,[[9,1],[9,2],[9,4],[9,7],[9,11]]],];
 const rackTypes = [
+	'',
 	"1182_096_2",
 	"5307_824_2",
 	"5507_150_2",
@@ -41,8 +41,6 @@ const rackTypes = [
 	"gltf/exported-centered/Server Rack 45 RMU 20x15x84",
 	"gltf/exported-centered/LogDev 42U 4 Post Server Rack 5000 36x24x78",
 	"gltf/exported-centered/42U+cabinet"
-];
-
 // 'gltf/exported-centered/Panduit CS1 Server Rack 42x32x84', // d
 	// 'gltf/exported-centered/Server Rack Shell', // d
 	// 'gltf/exported-centered/KabinPLUS 42U 600 x 1000',  // d
@@ -53,7 +51,9 @@ const rackTypes = [
 	//'gltf/exported-centered/KabinPLUS 42U 800 x 1200',// d
 	// 'gltf/exported-centered/APC+Rack+Cabinet+42U+800x1200', // dark
 	// 'gltf/exported-centered/Fujitsu PrimeCenter M1 42U', // l
+];
 const serverTypes = [
+			['',1],
 	["Barracuda 350 1U", 1],
 	//["Cisco Catalyst 3750G-24", 1],
 	//["Cisco Catalyst 3750G-48", 1],
@@ -69,15 +69,15 @@ const serverTypes = [
 	["IBM system x3530 M4", 1],
 	//["IOGear Miniview Ultra KVM Switch", 1],
 	//["Juniper-EX3300", 1],
-	["Middle Atlantic PD-2020R-NS Rack Power Strip PSU", 1],
-	["pdu_front", 1],
-	["SEDNA 19 1U RACK MOUNTED USB HUB", 1],
+	//["Middle Atlantic PD-2020R-NS Rack Power Strip PSU", 1],
+	//["pdu_front", 1],
+	//["SEDNA 19 1U RACK MOUNTED USB HUB", 1],
 	//["SuperMicro6015X", 1],
 	["TrendNet_TEG-S16Dg_tab_front", 1],
 	["Tripp-lite rack power strip", 1],
 	["Cisco-ASR-1002-no-interfaces", 2],
-	["Cisco+ASR1002-X", 2],
-	["Cisco+ASR9001", 2],
+	//["Cisco+ASR1002-X", 2],
+	//["Cisco+ASR9001", 2],
 	["Cisco HyperFlex HX240c M5", 2],
 	//["Cisco+Nexus+5596UP", 2],
 	//["Cisco UCS C210 M2", 2],
@@ -95,7 +95,7 @@ const serverTypes = [
 	//["SunOracle X2-8L", 2],
 	["SuperMicro 2U Server", 2],
 	["Unisys ES3000 Model 3580R G3", 2],
-	["Cisco 3925 Router", 3],
+	["Cisco 3925 Router", 2],
 	["Cisco 3945 Router", 3],
 	//["Cisco UCS C460 M2", 4],
 	//["Dell PowerEdge R910 4U", 4],
@@ -107,11 +107,12 @@ const serverTypes = [
 	["Sun Microsystems Netra T4 1", 4],
 	["Sun Microsystems SunFire V440", 4],
 	//["Sun Microsystems SunFire V445", 4],
-	["HP ProLiant ML350 G5", 5],
+	//["HP ProLiant ML350 G5", 5],
 	//["HP ProLiant ML370 G5", 5],
 	//["Cisco Catalyst 6506e", 11],
 	["Cisco Catalyst 4510r", 14],
 ];
+
 function loadDatacenter() {
 	fetch('https://'+options.domain+'/ajax_datacenter.php')
 		.then(response => {
@@ -128,7 +129,6 @@ function loadDatacenter() {
 			options.location = locations[options.locationId].name;
 			let locationIdx;
 			// Deal with the JSON data as an object here
-			console.log(data); // For example, you can log it to the console
 			// You can access properties of the object like data.propertyName
 			for (locationIdx in data.locations) {
 				locationNames.push(data.locations[locationIdx].name);
@@ -138,76 +138,23 @@ function loadDatacenter() {
 				options.locationId = locationName2Id(value)
 				console.log(options.location);
 			});
+			getRackModels();
+			getServerModels();
 		})
 		.catch(error => {
 			console.error('There was a problem with the fetch operation:', error);
 		});
 }
+
 function locationName2Id(name) {
 	  let locationIdx;
-		for (locationIdx in data.locations) {
-			if (data.locations[locationIdx].name == name) {
+		for (locationIdx in locations) {
+			if (locations[locationIdx].name == name) {
 				return locationIdx;
 			}
 		}
 }
-function generateRandomRacksLayout(sizeX = 25, sizeY = 25, maxRacks = 0) {
-    const roomLayout = [];
-    // Shuffle rack types to use a different type for each X row
-    const shuffledRackTypes = [...rackTypes];
-    for (let i = shuffledRackTypes.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [shuffledRackTypes[i], shuffledRackTypes[j]] = [shuffledRackTypes[j], shuffledRackTypes[i]];
-    }
-    let currentRackTypeIndex = 0;
-    let totalRacks = 0;
-    for (let y = 1; y <= sizeY; y++) {
-        let hasRackInRow = false;
-        for (let x = 1; x <= sizeX; x++) {
-            if (maxRacks > 0 && totalRacks >= maxRacks) {
-                break;
-            }
-            // Randomly choose whether to add a rack or an empty space
-            const isRack = Math.random() < 0.8; // Adjust the probability as needed
-            if (isRack) {
-                const rackTypeIdx = currentRackTypeIndex % rackTypes.length;
-                const rackType = shuffledRackTypes[rackTypeIdx];
-                // Use the response from generateRandomRackLayout for the Servers array
-                const serversLayout = generateRandomRackLayout(30);
-                // Add the rack to the room layout
-                roomLayout.push([rackTypeIdx, x, y, serversLayout]);
-                currentRackTypeIndex++;
-                hasRackInRow = true;
-                totalRacks++;
-            }
-        }
-        // Skip rows with no racks
-        if (hasRackInRow) {
-            continue;
-        }
-    }
-    return roomLayout;
-}
 
-function generateRandomRackLayout(rackHeight = 42) {
-    const rackLayout = [];
-    for (let i = 0; i < rackHeight; i++) {
-        // Randomly choose to place a server or an empty space
-        const isServer = Math.random() < 0.5;
-        if (isServer) {
-            // Filter server types based on remaining space
-            const validServers = serverTypes.filter(([_, modelUnits]) => modelUnits <= rackHeight - i);
-            if (validServers.length > 0) {
-                // Choose a random server type from the filtered list
-                const randomServerIndex = Math.floor(Math.random() * validServers.length);
-                const [modelName, modelUnits] = validServers[randomServerIndex];
-                rackLayout.push([serverTypes.indexOf(validServers[randomServerIndex]), i + 1]);
-                i += modelUnits - 1; // Adjust for server height
-            }
-        }
-    }
-    return rackLayout;
-}
 function clearScene() {
 	for (const object of objects) {
 		scene.remove(object);
@@ -217,102 +164,129 @@ function clearScene() {
 	}
 	objects.length = 0;
 }
+
 function getRackModels() {
 	let idx, modelName;
-	for (idx = 0; idx < racks.length; idx++) {
-		usedRacksSet.add(racks[idx][0]);
+	usedRacksSet.clear();
+	for (idx in locations[options.locationId].racks) {
+		usedRacksSet.add(locations[options.locationId].racks[idx].type);
 	}
 	usedRacks = Array.from(usedRacksSet);
-	for (idx in usedRacks) {
+	console.log(usedRacks);
+	usedRacks.forEach((idx) => {
 		modelName = rackTypes[idx];
-		//console.log("Loading Rack "+modelName);
-		// Create a closure to capture the current value of idx
-		(function (currentModel) {
-			loaderGltf.load('https://'+options.domain+'/images/3d/racks/' + currentModel + '.glb', function (gltf) {
-					const scale = 10;
-					const rotationAngle = Math.PI / 2; // 90 degrees in radians
-					const model = gltf.scene;
-					if (scale !== false) {
-						model.scale.set(scale, scale, scale);
+		if (typeof models.racks[idx] == 'undefined') {
+			//console.log("Loading Rack "+modelName);
+			// Create a closure to capture the current value of idx
+			(function (modelIdx) {
+				const currentModel = rackTypes[modelIdx];
+				loaderGltf.load('https://'+options.domain+'/images/3d/racks/' + currentModel + '.glb', function (gltf) {
+						const scale = 10;
+						const rotationAngle = Math.PI / 2; // 90 degrees in radians
+						const model = gltf.scene;
+						if (scale !== false) {
+							model.scale.set(scale, scale, scale);
+						}
+						//model.rotation.y = rotationAngle; // Rotate around the Y-axis
+						models.racks[modelIdx] = model;
+						//console.log(models);
+						//console.log("checking racks len "+Object.keys(models.racks).length+" against type len "+rackTypes.length);
+						//console.log("finished loading rack "+currentModel);
+						displayRacks(modelIdx);
 					}
-					//model.rotation.y = rotationAngle; // Rotate around the Y-axis
-					models.racks[currentModel] = model;
-					//console.log(models);
-					//console.log("checking racks len "+Object.keys(models.racks).length+" against type len "+rackTypes.length);
-					//console.log("finished loading rack "+currentModel);
-					displayRacks(currentModel);
-				}
-			);
-		})(modelName);
-	}
+				);
+			})(idx);
+		} else {
+			displayRacks(idx);
+		}
+	});
 	console.log("Got to the end of the loading racks code block");
 }
-function displayRacks(modelName) {
-	let lastX = 0, lastZ = 0, modelIdx = 0, model, position;
-	//console.log('Displaying Racks using '+modelName);
-	racks.forEach(([modelIdx, x, z, servers]) => {
-		if (rackTypes[modelIdx] == modelName) {
+
+function displayRacks(modelIdx) {
+	let x, z, rack, lastX = 0, lastZ = 0, model, position, idxRack;
+	const modelName = rackTypes[modelIdx];
+	console.log('Displaying Racks using idx '+modelIdx+' value '+modelName);
+	for (idxRack in locations[options.locationId].racks) {
+		rack = locations[options.locationId].racks[idxRack];
+		if (locations[options.locationId].racks[idxRack].type == modelIdx) {
+			x = locations[options.locationId].racks[idxRack].x;
+			z = locations[options.locationId].racks[idxRack].y;
 			//console.log("Adding rack at x "+x+" z "+z+" model "+modelName);
-			model = SkeletonUtils.clone(models.racks[modelName]);
+			model = SkeletonUtils.clone(models.racks[modelIdx]);
 			position = new THREE.Vector3(-100 + (x * 10), 1, -100 + (z * 20));
 			model.position.copy(position);
 			scene.add(model);
 			objects.push(model);
 		}
-	});
+	}
 }
+
 function getServerModels() {
 	let idxRack, idxServer, modelName, modelUnits;
-	for (idxRack = 0; idxRack < racks.length; idxRack++) {
-		if (racks[idxRack][3].length > 0) {
-			for (idxServer = 0; idxServer < racks[idxRack][3].length; idxServer++) {
-				usedServerSet.add(racks[idxRack][3][idxServer][0]);
-			}
+	usedServerSet.clear();
+	for (idxRack in locations[options.locationId].racks) {
+		for (idxServer in locations[options.locationId].racks[idxRack].servers) {
+			usedServerSet.add(locations[options.locationId].racks[idxRack].servers[idxServer].type);
 		}
 	}
 	usedServers = Array.from(usedServerSet);
-	for (idxServer in usedServers) {
-		[modelName, modelUnits] = serverTypes[idxServer];
-		//console.log("Loading Server "+modelName);
-		// Create a closure to capture the current value of idx
-		(function (currentModel) {
-			//loaderDae.load('https://'+options.domain+'/images/3d/servers/dae/'+currentModel+'/model.dae', function (collada) {
-			loaderGltf.load('https://'+options.domain+'/images/3d/servers/gltf/exported-centered/' + currentModel + '.glb', function (gltf) {
-					//const scale = 0.26;
-					const scale = 10;				
-					const rotationAngle = Math.PI / 2; // 90 degrees in radians
-					const model = gltf.scene;
-					if (scale !== false) {
-						model.scale.set(scale, scale, scale);
+	usedServers.forEach((idxServer) => {
+		console.log('idx server '+idxServer);
+		if (typeof models.servers[idxServer] == 'undefined') {
+			[modelName, modelUnits] = serverTypes[idxServer];
+			//console.log("Loading Server "+modelName);
+			// Create a closure to capture the current value of idx
+			(function (modelIdx) {
+				let currentModel, currentUnits;
+				[currentModel, currentUnits] = serverTypes[modelIdx];
+				//loaderDae.load('https://'+options.domain+'/images/3d/servers/dae/'+currentModel+'/model.dae', function (collada) {
+				loaderGltf.load('https://'+options.domain+'/images/3d/servers/gltf/exported-centered/' + currentModel + '.glb', function (gltf) {
+						//const scale = 0.26;
+						const scale = 10;				
+						const rotationAngle = Math.PI / 2; // 90 degrees in radians
+						const model = gltf.scene;
+						if (scale !== false) {
+							model.scale.set(scale, scale, scale);
+						}
+						//model.rotation.z = rotationAngle; // Rotate around the Y-axis
+						models.servers[modelIdx] = model;
+						//console.log(gltf);
+						console.log("finished loading server " + currentModel);
+						displayServers(modelIdx);
 					}
-					//model.rotation.z = rotationAngle; // Rotate around the Y-axis
-					models.servers[currentModel] = model;
-					//console.log(gltf);
-					console.log("finished loading server " + currentModel);
-					displayServers(currentModel);
-				}
-			);
-		})(modelName);
-	}
+				);
+			})(idxServer);
+		} else {
+			displayServers(idxServer);
+		}
+	});
 }
-function displayServers(modelName) {
-	let lastX = 0, lastZ = 0, idxRack, idxServer, modelUnits, model, position;
+
+function displayServers(modelIdx) {
+	let x, z, start, idxRack, idxServer, modelName, modelUnits, model, position;
 	console.log("Displaying Servers");
 	if (showServers == true) {
-		racks.forEach(([idxRack, x, z, servers]) => {
-			servers.forEach(([idxServer, start]) => {
-				[modelName, modelUnits] = serverTypes[idxServer];
-				//console.log("Adding rack[" + x + "," + z + "] server starting at " + start + " model " + modelName + " size " + modelUnits + "U");
-				model = SkeletonUtils.clone(models.servers[modelName]);
-				//position = new THREE.Vector3(-100 + (x * 20), 1, -100 + (z * 10));
-				position = new THREE.Vector3(-2.5 + -100 + (x * 10), 1 + 0.5 * start, 2.6 + -100 + (z * 20));
-				model.position.copy(position);
-				scene.add(model);
-			});
-		});
+		[modelName, modelUnits] = serverTypes[modelIdx];
+		for (idxRack in locations[options.locationId].racks) {
+			x = locations[options.locationId].racks[idxRack].x;
+			z = locations[options.locationId].racks[idxRack].y;
+			for (idxServer in locations[options.locationId].racks[idxRack].servers) {
+				if (locations[options.locationId].racks[idxRack].servers[idxServer].type == modelIdx) {
+					start = locations[options.locationId].racks[idxRack].servers[idxServer].start;
+					//console.log("Adding rack[" + x + "," + z + "] server starting at " + start + " model " + modelName + " size " + modelUnits + "U");
+					model = SkeletonUtils.clone(models.servers[modelIdx]);
+					//position = new THREE.Vector3(-100 + (x * 20), 1, -100 + (z * 10));
+					position = new THREE.Vector3(-2.5 + -100 + (x * 10), 1 + 0.5 * start, 2.6 + -100 + (z * 20));
+					model.position.copy(position);
+					scene.add(model);					
+				}
+			}
+		}
 		renderer.render(scene, camera);
 	}
 }
+
 function loadFloor() {
 	const helper = new THREE.GridHelper(500, 50);
 	helper.position.y = 0;
@@ -320,6 +294,7 @@ function loadFloor() {
 	helper.material.transparent = true;
 	scene.add(helper);
 }
+
 function init() {
 	loadDatacenter();
 	//racks = generateRandomRacksLayout(7, 7);
@@ -405,8 +380,6 @@ function init() {
 	document.addEventListener("keyup", onKeyUp);
 	raycaster = new THREE.Raycaster(new THREE.Vector3(), new THREE.Vector3(0, -1, 0), 0, 10); // Initialize Raycaster for object intersection
 	loadFloor();
-	getRackModels();
-	getServerModels();
 	renderer = new THREE.WebGLRenderer({ antialias: true }); // Set up the renderer
 	renderer.setPixelRatio(window.devicePixelRatio);
 	renderer.setSize(window.innerWidth, window.innerHeight);
@@ -415,11 +388,13 @@ function init() {
 	document.body.appendChild(stats.dom);
 	window.addEventListener("resize", onWindowResize); // Event listener for window resize
 }
+
 function onWindowResize() {
 	camera.aspect = window.innerWidth / window.innerHeight; // Handle window resize
 	camera.updateProjectionMatrix();
 	renderer.setSize(window.innerWidth, window.innerHeight);
 }
+
 function animate() {
 	requestAnimationFrame(animate); // Animation loop
 	const time = performance.now();
@@ -454,5 +429,6 @@ function animate() {
 	renderer.render(scene, camera); // Render the scene
 	stats.update();
 }
+
 init();
 animate();
