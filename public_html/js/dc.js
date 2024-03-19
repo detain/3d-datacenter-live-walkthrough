@@ -214,7 +214,7 @@ function displayRacks(modelIdx) {
 			z = locations[options.locationId].racks[idxRack].y;
 			//console.log("Adding rack at x "+x+" z "+z+" model "+modelName);
 			model = SkeletonUtils.clone(models.racks[modelIdx]);
-			position = new THREE.Vector3(-100 + (x * 10), 1, -100 + (z * 20));
+			position = new THREE.Vector3(-100 + (x * 8), 1, -100 + (z * 10));
 			model.position.copy(position);
 			scene.add(model);
 			objects.push(model);
@@ -277,7 +277,7 @@ function displayServers(modelIdx) {
 					//console.log("Adding rack[" + x + "," + z + "] server starting at " + start + " model " + modelName + " size " + modelUnits + "U");
 					model = SkeletonUtils.clone(models.servers[modelIdx]);
 					//position = new THREE.Vector3(-100 + (x * 20), 1, -100 + (z * 10));
-					position = new THREE.Vector3(-2.5 + -100 + (x * 10), 1 + 0.5 * start, 2.6 + -100 + (z * 20));
+					position = new THREE.Vector3(-2.5 + -100 + (x * 8), 1 + 0.5 * start, 2.6 + -100 + (z * 10));
 					model.position.copy(position);
 					scene.add(model);					
 				}
