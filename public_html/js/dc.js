@@ -3,7 +3,6 @@ import { PointerLockControls } from "three/addons/controls/PointerLockControls.j
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 //import { ColladaLoader } from "three/addons/loaders/ColladaLoader.js";
 import * as SkeletonUtils from "three/addons/utils/SkeletonUtils.js";
-//import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
 import GUI from 'https://cdn.jsdelivr.net/npm/lil-gui@0.19/+esm';
 import Stats from "three/addons/libs/stats.module.js";
 let camera, scene, renderer, controls, stats, gui, raycaster, locations = {}; // Declare global variables
@@ -320,9 +319,7 @@ function init() {
 	});
 	scene.add(controls.getObject()); // Add controls to the scene
 	const onKeyDown = function (event) {
-		switch (
-			event.code // Event listeners for keydown and keyup events
-		) {
+		switch (event.code) {
 			case "ArrowUp":
 			case "KeyW":
 				options.moveForward = true;
@@ -342,13 +339,6 @@ function init() {
 			case "Space":
 				if (options.canJump === true) velocity.y += 350;
 				options.canJump = false;
-				break;
-			case "KeyZ":
-				scene.remove(serverObj); // Remove current Collada model from the scene
-				const modelNames = Object.keys(serverModels); // Get a random modelName from serverModels keys
-				const randomModelName =
-					modelNames[Math.floor(Math.random() * modelNames.length)];
-				loadFilesFromServer(randomModelName); // Load and add the new Collada model
 				break;
 		}
 	};
