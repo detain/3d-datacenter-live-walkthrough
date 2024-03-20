@@ -1,31 +1,32 @@
-import * as THREE from "three"; // Import necessary modules from Three.js
+import * as THREE from "three";
 import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 //import { ColladaLoader } from "three/addons/loaders/ColladaLoader.js";
 import * as SkeletonUtils from "three/addons/utils/SkeletonUtils.js";
-import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+//import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+import GUI from 'https://cdn.jsdelivr.net/npm/lil-gui@0.19/+esm';
 import Stats from "three/addons/libs/stats.module.js";
-let camera, scene, renderer, controls, stats, gui, serverObj, raycaster, locations = {}; // Declare global variables
-let moveForward = false, moveBackward = false, moveLeft = false, moveRight = false, canJump = false;
+let camera, scene, renderer, controls, stats, gui, raycaster, locations = {}; // Declare global variables
 let prevTime = performance.now();
-let collisionMovement = false, racksShown = false, showServers = true, locationId = 1;
-const objects = [], models = { racks: {}, servers: {} }, locationNames = [];
+let racksShown = false, showServers = true;
+const objects = [], models = { racks: {}, servers: {} }, locationNames = {};
 const options = {
+	moveForward: false, 
+	moveBackward: false, 
+	moveLeft: false, 
+	moveRight: false, 
+	canJump: false,
+	collisionMovement: true,
 	domain: 'mystage.interserver.net',
-	locationId: 2,
-	location: ''
+	location: 2,
+	PlayerHeight: 15
 };
-const maxRoomServers = 0;
-const PlayerHeight = 15;
 const velocity = new THREE.Vector3();
 const direction = new THREE.Vector3();
 const vertex = new THREE.Vector3();
 const color = new THREE.Color();
 //const loaderDae = new ColladaLoader();
 const loaderGltf = new GLTFLoader();
-const usedRacksSet = new Set();
-const usedServerSet = new Set();
-let usedRacks, usedServers;
 const rackTypes = [
 	'',
 	"1182_096_2",
@@ -123,23 +124,24 @@ function loadDatacenter() {
 		})
 		.then(data => {
 			locations = data.locations;
-			console.log('id:'+options.locationId);
-		  console.log(locations[options.locationId]);
-			console.log(locations[options.locationId].name);
-			options.location = locations[options.locationId].name;
-			let locationIdx;
-			// Deal with the JSON data as an object here
-			// You can access properties of the object like data.propertyName
-			for (locationIdx in data.locations) {
-				locationNames.push(data.locations[locationIdx].name);
+			for (let locationIdx in data.locations) {
+				locationNames[data.locations[locationIdx].name] = Number(locationIdx);
 			}
 			gui = new GUI();	
 			gui.add( options, 'location', locationNames ).onChange( (value) => {
-				options.locationId = locationName2Id(value);
-				console.log(options.location);				
 				clearScene();
 				getRackModels();
 				getServerModels();
+			});
+			const moveFolder = gui.addFolder( 'Movement' );
+			moveFolder.add( options, 'canJump').listen().disable();
+			moveFolder.add( options, 'moveLeft').listen().disable();
+			moveFolder.add( options, 'moveRight').listen().disable();
+			moveFolder.add( options, 'moveForward').listen().disable();
+			moveFolder.add( options, 'moveBackward').listen().disable();
+			moveFolder.add( options, 'collisionMovement');
+			moveFolder.add( options, 'PlayerHeight', 0, 30).onChange((value) => {
+				camera.position.y = value;
 			});
 			getRackModels();
 			getServerModels();
@@ -147,15 +149,6 @@ function loadDatacenter() {
 		.catch(error => {
 			console.error('There was a problem with the fetch operation:', error);
 		});
-}
-
-function locationName2Id(name) {
-	  let locationIdx;
-		for (locationIdx in locations) {
-			if (locations[locationIdx].name == name) {
-				return locationIdx;
-			}
-		}
 }
 
 function clearScene() {
@@ -170,12 +163,14 @@ function clearScene() {
 
 function getRackModels() {
 	let idx, modelName;
+	const usedRacksSet = new Set();
+	let usedRacks;	
 	usedRacksSet.clear();
-	for (idx in locations[options.locationId].racks) {
-		usedRacksSet.add(locations[options.locationId].racks[idx].type);
+	for (idx in locations[options.location].racks) {
+		usedRacksSet.add(locations[options.location].racks[idx].type);
 	}
 	usedRacks = Array.from(usedRacksSet);
-	console.log(usedRacks);
+	//console.log(usedRacks);
 	usedRacks.forEach((idx) => {
 		modelName = rackTypes[idx];
 		if (typeof models.racks[idx] == 'undefined') {
@@ -192,9 +187,7 @@ function getRackModels() {
 						}
 						//model.rotation.y = rotationAngle; // Rotate around the Y-axis
 						models.racks[modelIdx] = model;
-						//console.log(models);
 						//console.log("checking racks len "+Object.keys(models.racks).length+" against type len "+rackTypes.length);
-						//console.log("finished loading rack "+currentModel);
 						displayRacks(modelIdx);
 					}
 				);
@@ -203,18 +196,18 @@ function getRackModels() {
 			displayRacks(idx);
 		}
 	});
-	console.log("Got to the end of the loading racks code block");
+	//console.log("Got to the end of the loading racks code block");
 }
 
 function displayRacks(modelIdx) {
 	let x, z, rack, lastX = 0, lastZ = 0, model, position, idxRack;
 	const modelName = rackTypes[modelIdx];
-	console.log('Displaying Racks using idx '+modelIdx+' value '+modelName);
-	for (idxRack in locations[options.locationId].racks) {
-		rack = locations[options.locationId].racks[idxRack];
-		if (locations[options.locationId].racks[idxRack].type == modelIdx) {
-			x = locations[options.locationId].racks[idxRack].x;
-			z = locations[options.locationId].racks[idxRack].y;
+	//console.log('Displaying Racks using idx '+modelIdx+' value '+modelName);
+	for (idxRack in locations[options.location].racks) {
+		rack = locations[options.location].racks[idxRack];
+		if (locations[options.location].racks[idxRack].type == modelIdx) {
+			x = locations[options.location].racks[idxRack].x;
+			z = locations[options.location].racks[idxRack].y;
 			//console.log("Adding rack at x "+x+" z "+z+" model "+modelName);
 			model = SkeletonUtils.clone(models.racks[modelIdx]);
 			position = new THREE.Vector3(-100 + (x * 8), 1, -100 + (z * 9));
@@ -227,15 +220,17 @@ function displayRacks(modelIdx) {
 
 function getServerModels() {
 	let idxRack, idxServer, modelName, modelUnits;
+	const usedServerSet = new Set();
+	let usedServers;	
 	usedServerSet.clear();
-	for (idxRack in locations[options.locationId].racks) {
-		for (idxServer in locations[options.locationId].racks[idxRack].servers) {
-			usedServerSet.add(locations[options.locationId].racks[idxRack].servers[idxServer].type);
+	for (idxRack in locations[options.location].racks) {
+		for (idxServer in locations[options.location].racks[idxRack].servers) {
+			usedServerSet.add(locations[options.location].racks[idxRack].servers[idxServer].type);
 		}
 	}
 	usedServers = Array.from(usedServerSet);
 	usedServers.forEach((idxServer) => {
-		console.log('idx server '+idxServer);
+		//console.log('idx server '+idxServer);
 		if (typeof models.servers[idxServer] == 'undefined') {
 			[modelName, modelUnits] = serverTypes[idxServer];
 			//console.log("Loading Server "+modelName);
@@ -255,7 +250,7 @@ function getServerModels() {
 						//model.rotation.z = rotationAngle; // Rotate around the Y-axis
 						models.servers[modelIdx] = model;
 						//console.log(gltf);
-						console.log("finished loading server " + currentModel);
+						//console.log("finished loading server " + currentModel);
 						displayServers(modelIdx);
 					}
 				);
@@ -268,15 +263,15 @@ function getServerModels() {
 
 function displayServers(modelIdx) {
 	let x, z, start, idxRack, idxServer, modelName, modelUnits, model, position;
-	console.log("Displaying Servers");
+	//console.log("Displaying Servers");
 	if (showServers == true) {
 		[modelName, modelUnits] = serverTypes[modelIdx];
-		for (idxRack in locations[options.locationId].racks) {
-			x = locations[options.locationId].racks[idxRack].x;
-			z = locations[options.locationId].racks[idxRack].y;
-			for (idxServer in locations[options.locationId].racks[idxRack].servers) {
-				if (locations[options.locationId].racks[idxRack].servers[idxServer].type == modelIdx) {
-					start = locations[options.locationId].racks[idxRack].servers[idxServer].start;
+		for (idxRack in locations[options.location].racks) {
+			x = locations[options.location].racks[idxRack].x;
+			z = locations[options.location].racks[idxRack].y;
+			for (idxServer in locations[options.location].racks[idxRack].servers) {
+				if (locations[options.location].racks[idxRack].servers[idxServer].type == modelIdx) {
+					start = locations[options.location].racks[idxRack].servers[idxServer].start;
 					//console.log("Adding rack[" + x + "," + z + "] server starting at " + start + " model " + modelName + " size " + modelUnits + "U");
 					model = SkeletonUtils.clone(models.servers[modelIdx]);
 					//position = new THREE.Vector3(-100 + (x * 20), 1, -100 + (z * 10));
@@ -301,11 +296,8 @@ function loadFloor() {
 
 function init() {
 	loadDatacenter();
-	//racks = generateRandomRacksLayout(7, 7);
-	// Initialize the scene
 	camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 1, 1000); // Set up the camera
-	camera.position.y = PlayerHeight;
-	
+	camera.position.y = options.PlayerHeight;
 	scene = new THREE.Scene(); // Create the scene
 	scene.background = new THREE.Color(0xffffff);
 	scene.fog = new THREE.Fog(0xffffff, 0, 750);
@@ -333,23 +325,23 @@ function init() {
 		) {
 			case "ArrowUp":
 			case "KeyW":
-				moveForward = true;
+				options.moveForward = true;
 				break;
 			case "ArrowLeft":
 			case "KeyA":
-				moveLeft = true;
+				options.moveLeft = true;
 				break;
 			case "ArrowDown":
 			case "KeyS":
-				moveBackward = true;
+				options.moveBackward = true;
 				break;
 			case "ArrowRight":
 			case "KeyD":
-				moveRight = true;
+				options.moveRight = true;
 				break;
 			case "Space":
-				if (canJump === true) velocity.y += 350;
-				canJump = false;
+				if (options.canJump === true) velocity.y += 350;
+				options.canJump = false;
 				break;
 			case "KeyZ":
 				scene.remove(serverObj); // Remove current Collada model from the scene
@@ -364,19 +356,19 @@ function init() {
 		switch (event.code) {
 			case "ArrowUp":
 			case "KeyW":
-				moveForward = false;
+				options.moveForward = false;
 				break;
 			case "ArrowLeft":
 			case "KeyA":
-				moveLeft = false;
+				options.moveLeft = false;
 				break;
 			case "ArrowDown":
 			case "KeyS":
-				moveBackward = false;
+				options.moveBackward = false;
 				break;
 			case "ArrowRight":
 			case "KeyD":
-				moveRight = false;
+				options.moveRight = false;
 				break;
 		}
 	};
@@ -405,28 +397,28 @@ function animate() {
 	if (controls.isLocked === true) {
 		raycaster.ray.origin.copy(controls.getObject().position);
 		raycaster.ray.origin.y -= 10;
-		const intersections = raycaster.intersectObjects(objects, false); // Check for intersections with objects
+		const intersections = raycaster.intersectObjects(objects, true); // Check for intersections with objects
 		const onObject = intersections.length > 0;
 		const delta = (time - prevTime) / 1000;
 		velocity.x -= velocity.x * 10.0 * delta; // Update velocity based on user input
 		velocity.z -= velocity.z * 10.0 * delta;
 		velocity.y -= 9.8 * 100.0 * delta; // 100.0 = mass
-		direction.z = Number(moveForward) - Number(moveBackward);
-		direction.x = Number(moveRight) - Number(moveLeft);
+		direction.z = Number(options.moveForward) - Number(options.moveBackward);
+		direction.x = Number(options.moveRight) - Number(options.moveLeft);
 		direction.normalize(); // Ensure consistent movements in all directions
-		if (moveForward || moveBackward) velocity.z -= direction.z * 400.0 * delta;
-		if (moveLeft || moveRight) velocity.x -= direction.x * 400.0 * delta;
-		if (collisionMovement == true && onObject === true) {
+		if (options.moveForward || options.moveBackward) velocity.z -= direction.z * 400.0 * delta;
+		if (options.moveLeft || options.moveRight) velocity.x -= direction.x * 400.0 * delta;
+		if (options.collisionMovement == true && onObject === true) {
 			velocity.y = Math.max(0, velocity.y);
-			canJump = true;
+			options.canJump = true;
 		}
 		controls.moveRight(-velocity.x * delta); // Update controls position
 		controls.moveForward(-velocity.z * delta);
 		controls.getObject().position.y += velocity.y * delta;
-		if (controls.getObject().position.y < PlayerHeight) {
+		if (controls.getObject().position.y < options.PlayerHeight) {
 			velocity.y = 0; // New behavior for jumping
-			controls.getObject().position.y = PlayerHeight;
-			canJump = true;
+			controls.getObject().position.y = options.PlayerHeight;
+			options.canJump = true;
 		}
 	}
 	prevTime = time;
