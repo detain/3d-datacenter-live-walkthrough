@@ -19,7 +19,7 @@ import Stats from "three/addons/libs/stats.module.js";
 let camera, scene, renderer, controls, controlObject, stats, gui, locations = {}, maxAnisotropy; // Declare global variables
 let prevTime = performance.now();
 let racksShown = false, showServers = true;
-let objects = {racks: {}, servers: {}, ports: {}, labels: {}}, models = { racks: {}, servers: {} }, locationNames = {};
+let objects = {racks: {}, servers: {}, ports: {}, rackLabels: {}, labels: {}}, models = { racks: {}, servers: {} }, locationNames = {};
 const options = {
 	moveForward: false, 
 	moveBackward: false, 
@@ -341,6 +341,8 @@ function displayRacks(modelIdx) {
                 model.position.set(positionX, 0, positionZ);
                 scene.add(model);
                 objects.racks[rackKey] = model;
+                rack.id = rackKey;
+                displayRackText(rack.name, rack, positionX, positionZ);
             }
         }
     }
@@ -360,14 +362,23 @@ function displayServers(modelIdx) {
                     model.position.set(positionX, positionY, positionZ);
                     scene.add(model);
                     objects.servers[serverId] = model;
-                    displayText(server.hostname, serverId, positionX, positionY, positionZ);
+                    server.id = serverId;
+                    displayServerText(server.hostname, server, positionX, positionY, positionZ);
                 }
             }
         }
     }
 }
 
-function displayText(text, asset, x, y, z) {
+function displayRackText(text, asset, x, z) {
+    displayText(text, asset, x - 3, 19.5, z + 4);
+}
+
+function displayServerText(text, asset, x, y, z) {
+    displayText(text, asset, x + 3.5, y + 0.25, z + 0.2);
+}
+
+function displayText(text, data, x, y, z) {
     // Create a canvas element
     const canvas = document.createElement('canvas');
     const context = canvas.getContext('2d');
@@ -397,10 +408,14 @@ function displayText(text, asset, x, y, z) {
     const material = new THREE.MeshBasicMaterial({ map: texture, side: THREE.DoubleSide });
     // Create the mesh and apply the material
     const plane = new THREE.Mesh(geometry, material);
-    plane.position.set(x + 3.5, y + 0.25, z + 0.2);
+    plane.position.set(x, y, z);
     // Add the plane to the scene
     scene.add(plane);
-    objects.labels[asset] = plane;
+    if (typeof data.hostname != "undefined") {
+        objects.labels[data.hostname] = plane;
+    } else {
+        objects.rackLabels[data.name] = plane;
+    }
 }
 
 function displaySwitches() {
