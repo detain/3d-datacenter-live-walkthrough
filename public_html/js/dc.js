@@ -316,12 +316,11 @@ function getServerModels() {
 	usedServers.forEach((idxServer) => {
 		//console.log('idx server '+idxServer);
 		if (typeof models.servers[idxServer] == 'undefined') {
-			[modelName, modelUnits] = serverTypes[idxServer];
-			//console.log("Loading Server "+modelName);
 			// Create a closure to capture the current value of idx
 			(function (modelIdx) {
 				let currentModel, currentUnits;
 				[currentModel, currentUnits] = serverTypes[modelIdx];
+                //console.log("Loading Server "+currentModel);
 				//loaderDae.load('https://'+options.domain+'/images/3d/servers/dae/'+currentModel+'/model.dae', function (collada) {
 				loaderGltf.load('https://'+options.domain+'/images/3d/servers/gltf/exported-centered/' + currentModel + '.glb', function (gltf) {
 						//const scale = 0.26;
