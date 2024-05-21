@@ -173,11 +173,18 @@ function loadDatacenter() {
 }
 
 function clearScene() {
-    for (const key in Object.keys(objects)) {
-        for (const object of objects[key]) {
-            scene.remove(object);
+    
+    for (let key in objects) {
+      if (objects.hasOwnProperty(key)) {
+        console.log(`Iterating over ${key}`);
+        let innerObject = objects[key];
+        for (let innerKey in innerObject) {
+          if (innerObject.hasOwnProperty(innerKey)) {
+            scene.remove(innerObject[innerKey]);
+          }
         }
-        objects[key].length = 0;
+        objects[key] = {}; 
+      }
     }
 	scene.traverse(function (child) {
 		if (child.isSkinnedMesh) child.skeleton.dispose();
