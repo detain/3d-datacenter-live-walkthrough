@@ -25,10 +25,10 @@ const options = {
     useFirstPerson: false,
     showLabels: true,
     showNetwork: true,
-	moveForward: false, 
-	moveBackward: false, 
-	moveLeft: false, 
-	moveRight: false, 
+	moveForward: false,
+	moveBackward: false,
+	moveLeft: false,
+	moveRight: false,
 	canJump: false,
 	collisionMovement: false,
 	domain: 'mystage.interserver.net',
@@ -136,22 +136,22 @@ function displayDatacenter() {
     clearScene();
     getRackModels();
     getServerModels();
-    displaySwitches();    
-}                
+    displaySwitches();
+}
 
 function displayGui() {
-    gui = new GUI();	
-    gui.add( options, 'location', locationNames).onChange( (value) => { displayDatacenter(); });
+    gui = new GUI();
+    gui.add( options, 'location', locationNames).listen().onChange( (value) => { displayDatacenter(); });
     const displayFolder = gui.addFolder( 'Display' );
     displayFolder.add(options, 'showLabels').onChange( (value) => { displayDatacenter(); });
     displayFolder.add(options, 'showNetwork').onChange( (value) => { displayDatacenter(); });
-    displayFolder.add(options, 'useFirstPerson').onChange( (value) => { 
+    displayFolder.add(options, 'useFirstPerson').onChange( (value) => {
 
-        displayDatacenter(); 
+        displayDatacenter();
     });
     const sizeFolder = gui.addFolder( 'Sizing' );
     sizeFolder.add( options, 'scaleX', 0, 100);
-    sizeFolder.add( options, 'scaleZ', 0, 100);        
+    sizeFolder.add( options, 'scaleZ', 0, 100);
     sizeFolder.open(false);
     const moveFolder = gui.addFolder( 'Movement' );
     moveFolder.add( options, 'canJump').listen().disable();
@@ -168,7 +168,7 @@ function displayGui() {
         camera.position.y = value;
     });
     moveFolder.open(false);
-}        
+}
 function loadDatacenter() {
 	fetch('https://'+options.domain+'/ajax_datacenter.php')
 		.then(response => {
@@ -190,7 +190,7 @@ function loadDatacenter() {
 		});
 }
 
-function clearScene() {    
+function clearScene() {
     for (let key in objects) {
       if (objects.hasOwnProperty(key)) {
         let innerObject = objects[key];
@@ -199,7 +199,7 @@ function clearScene() {
             scene.remove(innerObject[innerKey]);
           }
         }
-        objects[key] = {}; 
+        objects[key] = {};
       }
     }
 	scene.traverse(function (child) {
@@ -253,7 +253,7 @@ function isRackAtPosition(positionX, positionZ) {
 function getRackModels() {
 	let idx, modelName;
 	const usedRacksSet = new Set();
-	let usedRacks;	
+	let usedRacks;
 	usedRacksSet.clear();
 	for (idx in locations[options.location].racks) {
 		usedRacksSet.add(locations[options.location].racks[idx].type);
@@ -281,7 +281,7 @@ function getRackModels() {
                                 //n.material.map.anisotropy = 16;
                             }
                         });
-                    
+
 						//model.rotation.y = rotationAngle; // Rotate around the Y-axis
 						models.racks[modelIdx] = model;
 
@@ -289,7 +289,7 @@ function getRackModels() {
 						const dimensions = new THREE.Vector3();
 						box.getSize(dimensions);
 						console.log('Dimensions:', dimensions.x, dimensions.y, dimensions.z);*/
-					
+
 						//console.log("checking racks len "+Object.keys(models.racks).length+" against type len "+rackTypes.length);
 						displayRacks(modelIdx);
 					}
@@ -305,7 +305,7 @@ function getRackModels() {
 function getServerModels() {
 	let idxRack, idxServer, modelName, modelUnits;
 	const usedServerSet = new Set();
-	let usedServers;	
+	let usedServers;
 	usedServerSet.clear();
 	for (idxRack in locations[options.location].racks) {
 		for (idxServer in locations[options.location].racks[idxRack].servers) {
@@ -325,7 +325,7 @@ function getServerModels() {
 				//loaderDae.load('https://'+options.domain+'/images/3d/servers/dae/'+currentModel+'/model.dae', function (collada) {
 				loaderGltf.load('https://'+options.domain+'/images/3d/servers/gltf/exported-centered/' + currentModel + '.glb', function (gltf) {
 						//const scale = 0.26;
-						const scale = 10;				
+						const scale = 10;
 						const rotationAngle = Math.PI / 2; // 90 degrees in radians
 						const model = gltf.scene;
 						if (scale !== false) {
