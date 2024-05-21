@@ -1,3 +1,14 @@
+/*
+TODO
+* collision prevent+ion / no walking into racks
+* Add Pathing to move to a target server/rack
+* Add pathing to draw lines between objects like network ports to servers
+* properly align/rotate all models
+* mini-map view
+* walls
+* labels on racks/servers
+* highlight object looking at
+*/
 import * as THREE from "three";
 import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
@@ -5,20 +16,23 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import * as SkeletonUtils from "three/addons/utils/SkeletonUtils.js";
 import GUI from 'https://cdn.jsdelivr.net/npm/lil-gui@0.19/+esm';
 import Stats from "three/addons/libs/stats.module.js";
-let camera, scene, renderer, controls, stats, gui, raycaster, locations = {}; // Declare global variables
+let camera, scene, renderer, controls, controlObject, stats, gui, locations = {}, maxAnisotropy; // Declare global variables
 let prevTime = performance.now();
 let racksShown = false, showServers = true;
-const objects = [], models = { racks: {}, servers: {} }, locationNames = {};
+let objects = {racks: {}, servers: {}, ports: {}, labels: {}}, models = { racks: {}, servers: {} }, locationNames = {};
 const options = {
 	moveForward: false, 
 	moveBackward: false, 
 	moveLeft: false, 
 	moveRight: false, 
 	canJump: false,
-	collisionMovement: true,
+	collisionMovement: false,
 	domain: 'mystage.interserver.net',
-	location: 2,
-	PlayerHeight: 15
+	location: 4,
+	PlayerWidth: 3,
+	PlayerHeight: 15,
+	scaleX: 8,  // Scale factor for x position
+	scaleZ: 9,  // Scale factor for z position
 };
 const velocity = new THREE.Vector3();
 const direction = new THREE.Vector3();
@@ -131,19 +145,27 @@ function loadDatacenter() {
 				clearScene();
 				getRackModels();
 				getServerModels();
+                displaySwitches();
 			});
 			const moveFolder = gui.addFolder( 'Movement' );
 			moveFolder.add( options, 'canJump').listen().disable();
-			moveFolder.add( options, 'moveLeft').listen().disable();
+            moveFolder.add(controlObject.position, 'x', -250, 250).listen();
+            moveFolder.add(controlObject.position, 'y', -250, 250).listen();
+            moveFolder.add(controlObject.position, 'z', -250, 250).listen();
+			/*moveFolder.add( options, 'moveLeft').listen().disable();
 			moveFolder.add( options, 'moveRight').listen().disable();
 			moveFolder.add( options, 'moveForward').listen().disable();
-			moveFolder.add( options, 'moveBackward').listen().disable();
+			moveFolder.add( options, 'moveBackward').listen().disable();*/
 			moveFolder.add( options, 'collisionMovement');
+			moveFolder.add( options, 'scaleX', 0, 100);
+			moveFolder.add( options, 'scaleZ', 0, 100);
+			moveFolder.add( options, 'PlayerWidth', 1, 10);
 			moveFolder.add( options, 'PlayerHeight', 0, 30).onChange((value) => {
 				camera.position.y = value;
 			});
 			getRackModels();
 			getServerModels();
+            displaySwitches();
 		})
 		.catch(error => {
 			console.error('There was a problem with the fetch operation:', error);
@@ -151,13 +173,58 @@ function loadDatacenter() {
 }
 
 function clearScene() {
-	for (const object of objects) {
-		scene.remove(object);
-	}
+    for (const key in Object.keys(objects)) {
+        for (const object of objects[key]) {
+            scene.remove(object);
+        }
+        objects[key].length = 0;
+    }
 	scene.traverse(function (child) {
 		if (child.isSkinnedMesh) child.skeleton.dispose();
 	});
-	objects.length = 0;
+}
+
+function convertRackCoordinatesToPosition(x, y) {
+    // Convert x/y coordinates to three.js x/z position for the rack
+    const offsetX = -100; // Offset to center the racks
+    const offsetZ = -100;
+    const positionX = offsetX + (x * options.scaleX);
+    const positionZ = offsetZ + (y * options.scaleZ);
+    const maxX = offsetX + ((x + 1) * options.scaleX);
+    const maxZ = offsetZ + ((y + 1) * options.scaleZ);
+    return { x: positionX, z: positionZ, max_x: maxX, max_z: maxZ };
+}
+
+function convertPositionToRackCoordinates(positionX, positionZ) {
+    const x = Math.floor((positionX + 100) / options.scaleX);
+    const z = Math.floor((positionZ + 100) / options.scaleZ);
+    return { x, z };
+}
+
+function convertServerCoordinatesToPosition(rackX, rackY, start) {
+    // Get the rack position
+    const rackPosition = convertRackCoordinatesToPosition(rackX, rackY);
+
+    // Adjust rack position for the server position
+    const serverPositionX = rackPosition.x - 2.4; // Modify x position for server
+    const serverPositionY = 0.5 * start; // Calculate y position for server
+    const serverPositionZ = rackPosition.z + 2.6; // Modify z position for server
+
+    return { x: serverPositionX, y: serverPositionY, z: serverPositionZ };
+}
+
+function isRackAtPosition(positionX, positionZ) {
+    const rackCoordinates = convertPositionToRackCoordinates(positionX, positionZ);
+    const racks = locations[options.location].racks;
+    for (const rackKey in racks) {
+        if (racks.hasOwnProperty(rackKey)) {
+            const rack = racks[rackKey];
+            if (rack.x == rackCoordinates.x && rack.y == rackCoordinates.z) {
+                return true; // Rack found at the given coordinates
+            }
+        }
+    }
+    return false; // No racks found at the given coordinates
 }
 
 function getRackModels() {
@@ -184,8 +251,22 @@ function getRackModels() {
 						if (scale !== false) {
 							model.scale.set(scale, scale, scale);
 						}
+                        model.traverse((n) => {
+                            if (n.isMesh) {
+                                n.castShadow = true;
+                                n.receiveShadow = true;
+                                //n.material.map.anisotropy = 16;
+                            }
+                        });
+                    
 						//model.rotation.y = rotationAngle; // Rotate around the Y-axis
 						models.racks[modelIdx] = model;
+
+						/* const box = new THREE.Box3().setFromObject(model);
+						const dimensions = new THREE.Vector3();
+						box.getSize(dimensions);
+						console.log('Dimensions:', dimensions.x, dimensions.y, dimensions.z);*/
+					
 						//console.log("checking racks len "+Object.keys(models.racks).length+" against type len "+rackTypes.length);
 						displayRacks(modelIdx);
 					}
@@ -196,25 +277,6 @@ function getRackModels() {
 		}
 	});
 	//console.log("Got to the end of the loading racks code block");
-}
-
-function displayRacks(modelIdx) {
-	let x, z, rack, lastX = 0, lastZ = 0, model, position, idxRack;
-	const modelName = rackTypes[modelIdx];
-	//console.log('Displaying Racks using idx '+modelIdx+' value '+modelName);
-	for (idxRack in locations[options.location].racks) {
-		rack = locations[options.location].racks[idxRack];
-		if (locations[options.location].racks[idxRack].type == modelIdx) {
-			x = locations[options.location].racks[idxRack].x;
-			z = locations[options.location].racks[idxRack].y;
-			//console.log("Adding rack at x "+x+" z "+z+" model "+modelName);
-			model = SkeletonUtils.clone(models.racks[modelIdx]);
-			position = new THREE.Vector3(-100 + (x * 8), 1, -100 + (z * 9));
-			model.position.copy(position);
-			scene.add(model);
-			objects.push(model);
-		}
-	}
 }
 
 function getServerModels() {
@@ -246,6 +308,13 @@ function getServerModels() {
 						if (scale !== false) {
 							model.scale.set(scale, scale, scale);
 						}
+                        model.traverse((n) => {
+                            if (n.isMesh) {
+                                n.castShadow = true;
+                                n.receiveShadow = true;
+                                //n.material.map.anisotropy = 16;
+                            }
+                        });
 						//model.rotation.z = rotationAngle; // Rotate around the Y-axis
 						models.servers[modelIdx] = model;
 						//console.log(gltf);
@@ -260,29 +329,119 @@ function getServerModels() {
 	});
 }
 
+function displayRacks(modelIdx) {
+    const modelName = rackTypes[modelIdx];
+    const racks = locations[options.location].racks;
+    for (const rackKey in racks) {
+        if (racks.hasOwnProperty(rackKey)) {
+            const rack = racks[rackKey];
+            if (rack.type === modelIdx) {
+                const { x: positionX, z: positionZ } = convertRackCoordinatesToPosition(rack.x, rack.y);
+                const model = SkeletonUtils.clone(models.racks[modelIdx]);
+                model.position.set(positionX, 0, positionZ);
+                scene.add(model);
+                objects.racks[rackKey] = model;
+            }
+        }
+    }
+}
+
 function displayServers(modelIdx) {
-	let x, z, start, idxRack, idxServer, modelName, modelUnits, model, position;
-	//console.log("Displaying Servers");
-	if (showServers == true) {
-		[modelName, modelUnits] = serverTypes[modelIdx];
-		for (idxRack in locations[options.location].racks) {
-			x = locations[options.location].racks[idxRack].x;
-			z = locations[options.location].racks[idxRack].y;
-			for (idxServer in locations[options.location].racks[idxRack].servers) {
-				if (locations[options.location].racks[idxRack].servers[idxServer].type == modelIdx) {
-					start = locations[options.location].racks[idxRack].servers[idxServer].start;
-					//console.log("Adding rack[" + x + "," + z + "] server starting at " + start + " model " + modelName + " size " + modelUnits + "U");
-					model = SkeletonUtils.clone(models.servers[modelIdx]);
-					//position = new THREE.Vector3(-100 + (x * 20), 1, -100 + (z * 10));
-					position = new THREE.Vector3(-2.4 + -100 + (x * 8), 1 + 0.5 * start, 2.6 + -100 + (z * 9));
-					model.position.copy(position);
-					scene.add(model);					
-					objects.push(model);
-				}
-			}
-		}
-		renderer.render(scene, camera);
-	}
+    const [modelName, modelUnits] = serverTypes[modelIdx];
+    const racks = locations[options.location].racks;
+    for (const rackKey in racks) {
+        if (racks.hasOwnProperty(rackKey)) {
+            const rack = racks[rackKey];
+            for (const serverId of Object.keys(rack.servers)) {
+                const server = rack.servers[serverId];
+                if (server.type === modelIdx) {
+                    const { x: positionX, y: positionY, z: positionZ } = convertServerCoordinatesToPosition(rack.x, rack.y, server.start);
+                    const model = SkeletonUtils.clone(models.servers[modelIdx]);
+                    model.position.set(positionX, positionY, positionZ);
+                    scene.add(model);
+                    objects.servers[serverId] = model;
+                    displayText(server.hostname, serverId, positionX, positionY, positionZ);
+                }
+            }
+        }
+    }
+}
+
+function displayText(text, asset, x, y, z) {
+    // Create a canvas element
+    const canvas = document.createElement('canvas');
+    const context = canvas.getContext('2d');
+    // Set canvas dimensions
+    canvas.width = 320;
+    canvas.height = 32;
+    // Set the text properties
+    context.font = '20px Arial';
+    context.textAlign = 'center';
+    context.textBaseline = 'middle';
+    // Fill the background with a color (optional)
+    context.fillStyle = 'white';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    // Optional: Outline the text for better visibility
+    context.strokeStyle = 'gray';
+    context.lineWidth = 2;
+    context.strokeText(text, canvas.width / 2, canvas.height / 2);
+    // Draw the text
+    context.fillStyle = 'black';
+    context.lineWidth = 1;
+    context.fillText(text, canvas.width  / 2, canvas.height / 2);
+    // Create a texture from the canvas
+    const texture = new THREE.CanvasTexture(canvas);
+    // Create a plane geometry
+    const geometry = new THREE.PlaneGeometry(2.5,0.25);
+    // Create a material using the texture
+    const material = new THREE.MeshBasicMaterial({ map: texture, side: THREE.DoubleSide });
+    // Create the mesh and apply the material
+    const plane = new THREE.Mesh(geometry, material);
+    plane.position.set(x + 3.5, y + 0.25, z + 0.2);
+    // Add the plane to the scene
+    scene.add(plane);
+    objects.labels[asset] = plane;
+}
+
+function displaySwitches() {
+    const material = new THREE.LineBasicMaterial( { color: 0x0000ff } );
+    const racks = locations[options.location].racks;
+    let startX, endX, positionX, startY, endY, positionY, startZ, endZ, positionZ, ret, points, geometry;
+    for (const rackKey in racks) {
+        if (racks.hasOwnProperty(rackKey)) {
+            const rack = racks[rackKey];
+            for (const switchId of Object.keys(rack.switches)) {
+                const switchData = rack.switches[switchId];
+                const { x: positionX, y: positionY, z: positionZ } = convertServerCoordinatesToPosition(rack.x, rack.y, switchData.start);
+                //displayText(switchData.name, switchData.asset, positionX, positionY, positionZ);
+                const portWidth = Math.ceil(switchData.totalPorts / 2);
+                for (const portId of Object.keys(switchData.ports)) {
+                    const portData = switchData.ports[portId];
+                    startX = portData.justport;
+                    startZ = positionZ;
+                    startY = positionY + 0.3;
+                    if (startX > portWidth) {
+                        startX -= portWidth;
+                        startY -= 0.15;
+                    }
+                    startX = positionX + 0.15 + (0.15 * startX);
+                    ret = convertServerCoordinatesToPosition(locations[portData.datacenter].racks[portData.rack].x, locations[portData.datacenter].racks[portData.rack].y, locations[portData.datacenter].racks[portData.rack].servers[portData.asset].start);
+                    endX = ret.x;
+                    endY = ret.y;
+                    endZ = ret.z;
+                    points = [];
+                    points.push(new THREE.Vector3(startX, startY, startZ));
+                    points.push(new THREE.Vector3(startX, startY, startZ + 1));
+                    points.push(new THREE.Vector3(endX + 1, endY + 0.25, endZ + 1));
+                    points.push(new THREE.Vector3(endX + 1, endY + 0.25, endZ));
+                    geometry = new THREE.BufferGeometry().setFromPoints( points );
+                    const line = new THREE.Line( geometry, material );
+                    scene.add(line);
+                    objects.ports[portId] = line;
+                }
+            }
+        }
+    }
 }
 
 function loadFloor() {
@@ -294,126 +453,168 @@ function loadFloor() {
 }
 
 function init() {
-	loadDatacenter();
-	camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 1, 1000); // Set up the camera
-	camera.position.y = options.PlayerHeight;
-	scene = new THREE.Scene(); // Create the scene
-	scene.background = new THREE.Color(0xffffff);
-	scene.fog = new THREE.Fog(0xffffff, 0, 750);
-	const light = new THREE.HemisphereLight(0xeeeeff, 0x777788, 2.5); // Add hemisphere light for ambient lighting
-	light.position.set(0.5, 1, 0.75);
-	scene.add(light);
-	controls = new PointerLockControls(camera, document.body); // Set up pointer lock controls
-	const blocker = document.getElementById("blocker");
-	const instructions = document.getElementById("instructions");
-	instructions.addEventListener("click", function () {
-		controls.lock(); // Event listener for locking controls
-	});
-	controls.addEventListener("lock", function () {
-		instructions.style.display = "none"; // Event listeners for lock and unlock events
-		blocker.style.display = "none";
-	});
-	controls.addEventListener("unlock", function () {
-		blocker.style.display = "block";
-		instructions.style.display = "";
-	});
-	scene.add(controls.getObject()); // Add controls to the scene
-	const onKeyDown = function (event) {
-		switch (event.code) {
-			case "ArrowUp":
-			case "KeyW":
-				options.moveForward = true;
-				break;
-			case "ArrowLeft":
-			case "KeyA":
-				options.moveLeft = true;
-				break;
-			case "ArrowDown":
-			case "KeyS":
-				options.moveBackward = true;
-				break;
-			case "ArrowRight":
-			case "KeyD":
-				options.moveRight = true;
-				break;
-			case "Space":
-				if (options.canJump === true) velocity.y += 350;
-				options.canJump = false;
-				break;
-		}
-	};
-	const onKeyUp = function (event) {
-		switch (event.code) {
-			case "ArrowUp":
-			case "KeyW":
-				options.moveForward = false;
-				break;
-			case "ArrowLeft":
-			case "KeyA":
-				options.moveLeft = false;
-				break;
-			case "ArrowDown":
-			case "KeyS":
-				options.moveBackward = false;
-				break;
-			case "ArrowRight":
-			case "KeyD":
-				options.moveRight = false;
-				break;
-		}
-	};
-	document.addEventListener("keydown", onKeyDown);
-	document.addEventListener("keyup", onKeyUp);
-	raycaster = new THREE.Raycaster(new THREE.Vector3(), new THREE.Vector3(0, -1, 0), 0, 10); // Initialize Raycaster for object intersection
-	loadFloor();
-	renderer = new THREE.WebGLRenderer({ antialias: true }); // Set up the renderer
-	renderer.setPixelRatio(window.devicePixelRatio);
-	renderer.setSize(window.innerWidth, window.innerHeight);
-	document.body.appendChild(renderer.domElement);
-	stats = new Stats();
-	document.body.appendChild(stats.dom);
-	window.addEventListener("resize", onWindowResize); // Event listener for window resize
+    // Load the datacenter information
+    loadDatacenter();
+
+    // Set up the camera
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 1, 1000);
+    camera.position.y = options.PlayerHeight;
+
+    // Create the scene
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xffffff);
+    scene.fog = new THREE.Fog(0xffffff, 0, 750);
+
+    // Add ambient light
+    const light = new THREE.HemisphereLight(0xeeeeff, 0x777788, 2.5);
+    light.position.set(0.5, 1, 0.75);
+    scene.add(light);
+
+    // Set up pointer lock controls
+    controls = new PointerLockControls(camera, document.body);
+    const blocker = document.getElementById("blocker");
+    const instructions = document.getElementById("instructions");
+
+    // Event listener for clicking to lock controls
+    instructions.addEventListener("click", function () {
+        controls.lock();
+    });
+
+    // Event listeners for lock and unlock events
+    controls.addEventListener("lock", function () {
+        instructions.style.display = "none";
+        blocker.style.display = "none";
+    });
+
+    controls.addEventListener("unlock", function () {
+        blocker.style.display = "block";
+        instructions.style.display = "";
+    });
+    
+    controlObject = controls.getObject();
+
+    // Add controls to the scene
+    scene.add(controlObject);
+
+    // Event listeners for keyboard input
+    document.addEventListener("keydown", onKeyDown);
+    document.addEventListener("keyup", onKeyUp);
+
+    // Load floor
+    loadFloor();
+
+    // Set up the renderer
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+    maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
+
+    // Add stats monitor
+    stats = new Stats();
+    document.body.appendChild(stats.dom);
+
+    // Event listener for window resize
+    window.addEventListener("resize", onWindowResize);
 }
 
-function onWindowResize() {
-	camera.aspect = window.innerWidth / window.innerHeight; // Handle window resize
-	camera.updateProjectionMatrix();
-	renderer.setSize(window.innerWidth, window.innerHeight);
-}
-
+// Animation loop
 function animate() {
-	requestAnimationFrame(animate); // Animation loop
-	const time = performance.now();
-	if (controls.isLocked === true) {
-		raycaster.ray.origin.copy(controls.getObject().position);
-		raycaster.ray.origin.y -= 10;
-		const intersections = raycaster.intersectObjects(objects, true); // Check for intersections with objects
-		const onObject = intersections.length > 0;
-		const delta = (time - prevTime) / 1000;
-		velocity.x -= velocity.x * 10.0 * delta; // Update velocity based on user input
-		velocity.z -= velocity.z * 10.0 * delta;
-		velocity.y -= 9.8 * 100.0 * delta; // 100.0 = mass
-		direction.z = Number(options.moveForward) - Number(options.moveBackward);
-		direction.x = Number(options.moveRight) - Number(options.moveLeft);
-		direction.normalize(); // Ensure consistent movements in all directions
-		if (options.moveForward || options.moveBackward) velocity.z -= direction.z * 400.0 * delta;
-		if (options.moveLeft || options.moveRight) velocity.x -= direction.x * 400.0 * delta;
-		if (options.collisionMovement == true && onObject === true) {
-			velocity.y = Math.max(0, velocity.y);
-			options.canJump = true;
-		}
-		controls.moveRight(-velocity.x * delta); // Update controls position
-		controls.moveForward(-velocity.z * delta);
-		controls.getObject().position.y += velocity.y * delta;
-		if (controls.getObject().position.y < options.PlayerHeight) {
-			velocity.y = 0; // New behavior for jumping
-			controls.getObject().position.y = options.PlayerHeight;
-			options.canJump = true;
-		}
-	}
-	prevTime = time;
-	renderer.render(scene, camera); // Render the scene
-	stats.update();
+    requestAnimationFrame(animate);
+    const time = performance.now();
+
+    // Update controls if locked
+    if (controls.isLocked === true) {
+        updateControls(time);
+    }
+
+    // Render the scene
+    renderer.render(scene, camera);
+
+    // Update stats monitor
+    stats.update();
+}
+
+// Update controls based on user input
+function updateControls(time) {
+    // Calculate time delta
+    const delta = (time - prevTime) / 1000;
+    // Update velocity based on user input
+    velocity.x -= velocity.x * 10.0 * delta;
+    velocity.z -= velocity.z * 10.0 * delta;
+    velocity.y -= 9.8 * 100.0 * delta;
+    direction.z = Number(options.moveForward) - Number(options.moveBackward);
+    direction.x = Number(options.moveRight) - Number(options.moveLeft);
+    direction.normalize();
+    if (options.moveForward || options.moveBackward) velocity.z -= direction.z * 400.0 * delta;
+    if (options.moveLeft || options.moveRight) velocity.x -= direction.x * 400.0 * delta;
+    // Update controls position
+    controls.moveRight(-velocity.x * delta);
+    controls.moveForward(-velocity.z * delta);
+    controlObject.position.y += velocity.y * delta;
+    // Handle jumping
+    if (controlObject.position.y < options.PlayerHeight) {
+        velocity.y = 0;
+        controlObject.position.y = options.PlayerHeight;
+        options.canJump = true;
+    }
+
+    prevTime = time;
+}
+
+// Event handler for keydown
+function onKeyDown(event) {
+    switch (event.code) {
+        case "ArrowUp":
+        case "KeyW":
+            options.moveForward = true;
+            break;
+        case "ArrowLeft":
+        case "KeyA":
+            options.moveLeft = true;
+            break;
+        case "ArrowDown":
+        case "KeyS":
+            options.moveBackward = true;
+            break;
+        case "ArrowRight":
+        case "KeyD":
+            options.moveRight = true;
+            break;
+        case "Space":
+            if (options.canJump === true) velocity.y += 350;
+            options.canJump = false;
+            break;
+    }
+}
+
+// Event handler for keyup
+function onKeyUp(event) {
+    switch (event.code) {
+        case "ArrowUp":
+        case "KeyW":
+            options.moveForward = false;
+            break;
+        case "ArrowLeft":
+        case "KeyA":
+            options.moveLeft = false;
+            break;
+        case "ArrowDown":
+        case "KeyS":
+            options.moveBackward = false;
+            break;
+        case "ArrowRight":
+        case "KeyD":
+            options.moveRight = false;
+            break;
+    }
+}
+
+// Event handler for window resize
+function onWindowResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
 }
 
 init();
