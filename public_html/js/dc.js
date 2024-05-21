@@ -378,7 +378,7 @@ function displayServers(modelIdx) {
 }
 
 function displayRackText(text, asset, x, z) {
-    displayText(text, asset, x - 3, 19.5, z + 4);
+    displayText(text, asset, x - 2.5, 19.5, z + 4);
 }
 
 function displayServerText(text, asset, x, y, z) {
@@ -477,65 +477,51 @@ function loadFloor() {
 function init() {
     // Load the datacenter information
     loadDatacenter();
-
     // Set up the camera
     camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 1, 1000);
     camera.position.y = options.PlayerHeight;
-
     // Create the scene
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0xffffff);
     scene.fog = new THREE.Fog(0xffffff, 0, 750);
-
     // Add ambient light
     const light = new THREE.HemisphereLight(0xeeeeff, 0x777788, 2.5);
     light.position.set(0.5, 1, 0.75);
     scene.add(light);
-
     // Set up pointer lock controls
     controls = new PointerLockControls(camera, document.body);
     const blocker = document.getElementById("blocker");
     const instructions = document.getElementById("instructions");
-
     // Event listener for clicking to lock controls
     instructions.addEventListener("click", function () {
         controls.lock();
     });
-
     // Event listeners for lock and unlock events
     controls.addEventListener("lock", function () {
         instructions.style.display = "none";
         blocker.style.display = "none";
     });
-
     controls.addEventListener("unlock", function () {
         blocker.style.display = "block";
         instructions.style.display = "";
     });
-    
     controlObject = controls.getObject();
-
     // Add controls to the scene
     scene.add(controlObject);
-
     // Event listeners for keyboard input
     document.addEventListener("keydown", onKeyDown);
     document.addEventListener("keyup", onKeyUp);
-
     // Load floor
     loadFloor();
-
     // Set up the renderer
     renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(window.devicePixelRatio);
     renderer.setSize(window.innerWidth, window.innerHeight);
     document.body.appendChild(renderer.domElement);
     maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
-
     // Add stats monitor
     stats = new Stats();
     document.body.appendChild(stats.dom);
-
     // Event listener for window resize
     window.addEventListener("resize", onWindowResize);
 }
@@ -544,15 +530,12 @@ function init() {
 function animate() {
     requestAnimationFrame(animate);
     const time = performance.now();
-
     // Update controls if locked
     if (controls.isLocked === true) {
         updateControls(time);
     }
-
     // Render the scene
     renderer.render(scene, camera);
-
     // Update stats monitor
     stats.update();
 }
