@@ -170,7 +170,7 @@ function displayGui() {
     moveFolder.open(false);
 }
 function loadDatacenter() {
-	fetch('https://'+options.domain+'/ajax_datacenter.php')
+	fetch('https://'+options.domain+'/ajax/datacenter.php')
 		.then(response => {
 			if (!response.ok) {
 				throw new Error('Network response was not ok');
