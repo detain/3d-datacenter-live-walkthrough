@@ -13,8 +13,6 @@ import * as THREE from "three";
 import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
 import { FirstPersonControls } from "three/addons/controls/FirstPersonControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-//import { ColladaLoader } from "three/addons/loaders/ColladaLoader.js";
-import * as SkeletonUtils from "three/addons/utils/SkeletonUtils.js";
 import GUI from 'lil-gui';
 import Stats from "three/addons/libs/stats.module.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
@@ -141,11 +139,6 @@ function displayDatacenter() {
     displaySwitches();
 }
 
-function setLabelsVisible(visible) {
-    for (const obj of objects.labels) obj.visible = visible;
-    for (const obj of objects.rackLabels) obj.visible = visible;
-}
-
 function setNetworkVisible(visible) {
     if (objects.network) objects.network.visible = visible;
 }
@@ -217,38 +210,16 @@ function switchLocation() {
 
 function loadDatacenter() {
     fetchLocation(options.location)
-        .then(() => { displayGui(); displayDatacenter(); })
+        .then(() => {
+            displayGui();
+            displayDatacenter();
+            const loading = document.getElementById('dcLoading');
+            if (loading) loading.style.display = 'none';
+        })
         .catch((error) => console.error('There was a problem with the fetch operation:', error));
 }
 
-function disposeMaterial(material, seen) {
-    if (!material || seen.has(material)) return;
-    seen.add(material);
-    for (const key in material) {
-        const val = material[key];
-        if (val && val.isTexture) val.dispose();
-    }
-    material.dispose();
-}
-
-function disposeObject(obj, seen) {
-    obj.traverse((child) => {
-        if (child.geometry && !seen.has(child.geometry)) {
-            seen.add(child.geometry);
-            child.geometry.dispose();
-        }
-        const mat = child.material;
-        if (Array.isArray(mat)) {
-            mat.forEach((m) => disposeMaterial(m, seen));
-        } else if (mat) {
-            disposeMaterial(mat, seen);
-        }
-        if (child.isSkinnedMesh && child.skeleton) child.skeleton.dispose();
-    });
-}
-
 function clearScene() {
-    const seen = new Set();
     // Instanced model meshes: detach + dispose the per-instance buffer. Their geometry and
     // material are the cached model templates in models.* (shared across rebuilds), so they
     // are kept; InstancedMesh.dispose() only frees the instanceMatrix buffer.

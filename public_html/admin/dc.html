@@ -29,9 +29,12 @@
 		#dcInfo .dc-info-title { font-weight: bold; font-size: 15px; margin-bottom: 4px; word-break: break-all; }
 		#dcInfo a { color: #ffcc00; text-decoration: none; }
 		#dcInfo a:hover { text-decoration: underline; }
+		#dcLoading { position: fixed; inset: 0; z-index: 40; display: flex; align-items: center;
+			justify-content: center; background: rgba(255,255,255,0.88); font: 22px Arial, sans-serif; color: #333; }
 	</style>
 </head>
 <body>
+	<div id="dcLoading">Loading datacenter…</div>
 	<div id="blocker">
 			<div id="instructions">
 			<p style="font-size:36px">
@@ -49,6 +52,6 @@
 	<input id="dcSearch" type="search" placeholder="Search hostname…" autocomplete="off" />
 	<div id="dcSearchResults"></div>
 	<div id="dcInfo"></div>
-	<script type="module" src="/js/dc.js?v=p11"></script>
+	<script type="module" src="/js/dc.js?v=p12"></script>
 </body>
 </html>
