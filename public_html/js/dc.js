@@ -152,7 +152,7 @@ function setNetworkVisible(visible) {
 
 function displayGui() {
     gui = new GUI();
-    gui.add( options, 'location', locationNames).listen().onChange( () => { displayDatacenter(); });
+    gui.add( options, 'location', locationNames).listen().onChange( () => { switchLocation(); });
     const displayFolder = gui.addFolder( 'Display' );
     displayFolder.add(options, 'showLabels'); // honored per-frame by updateLabels()
     displayFolder.add(options, 'showNetwork').onChange( (value) => { setNetworkVisible(value); });
@@ -177,25 +177,48 @@ function displayGui() {
     });
     moveFolder.open(false);
 }
+function mergeLocations(data) {
+    // The response always carries the full locations list (names, for the dropdown); only the
+    // requested location has its racks populated. Keep already-loaded full data; fill in names.
+    for (const idx in data.locations) {
+        const incoming = data.locations[idx];
+        const hasRacks = incoming.racks && Object.keys(incoming.racks).length > 0;
+        if (hasRacks || !locations[idx]) {
+            locations[idx] = incoming;
+        }
+        locationNames[incoming.name] = Number(idx);
+    }
+}
+
+function fetchLocation(locId) {
+    return fetch('https://' + options.domain + '/ajax/datacenter.php?location=' + Number(locId))
+        .then((response) => {
+            if (!response.ok) throw new Error('Network response was not ok');
+            return response.json();
+        })
+        .then((data) => { mergeLocations(data); });
+}
+
+function locationLoaded(locId) {
+    const loc = locations[locId];
+    return !!(loc && loc.racks && Object.keys(loc.racks).length > 0);
+}
+
+function switchLocation() {
+    // Fetch the location's data on demand (cached after first load), then (re)build the scene.
+    if (locationLoaded(options.location)) {
+        displayDatacenter();
+    } else {
+        fetchLocation(options.location)
+            .then(() => displayDatacenter())
+            .catch((error) => console.error('There was a problem loading the location:', error));
+    }
+}
+
 function loadDatacenter() {
-	fetch('https://'+options.domain+'/ajax/datacenter.php')
-		.then(response => {
-			if (!response.ok) {
-				throw new Error('Network response was not ok');
-			}
-			return response.json();
-		})
-		.then(data => {
-			locations = data.locations;
-			for (let locationIdx in data.locations) {
-				locationNames[data.locations[locationIdx].name] = Number(locationIdx);
-			}
-            displayGui();
-            displayDatacenter();
-		})
-		.catch(error => {
-			console.error('There was a problem with the fetch operation:', error);
-		});
+    fetchLocation(options.location)
+        .then(() => { displayGui(); displayDatacenter(); })
+        .catch((error) => console.error('There was a problem with the fetch operation:', error));
 }
 
 function disposeMaterial(material, seen) {
@@ -593,7 +616,11 @@ function displaySwitches() {
                     startY -= 0.15;
                 }
                 startX = positionX + 0.15 + (0.15 * startX);
-                ret = convertServerCoordinatesToPosition(locations[portData.datacenter].racks[portData.rack].x, locations[portData.datacenter].racks[portData.rack].y, locations[portData.datacenter].racks[portData.rack].servers[portData.asset].start);
+                const destLoc = locations[portData.datacenter];
+                const destRack = (destLoc && destLoc.racks) ? destLoc.racks[portData.rack] : null;
+                const destServer = (destRack && destRack.servers) ? destRack.servers[portData.asset] : null;
+                if (!destServer) { continue; } // endpoint not in the loaded location (e.g. cross-DC link)
+                ret = convertServerCoordinatesToPosition(destRack.x, destRack.y, destServer.start);
                 endX = ret.x;
                 endY = ret.y;
                 endZ = ret.z;
