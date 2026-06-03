@@ -21,6 +21,7 @@ let camera, scene, renderer, controls, controlObject, stats, gui, locations = {}
 let prevTime = performance.now();
 let racksShown = false, showServers = true;
 let objects = {instanced: [], network: null, rackLabels: [], labels: []}, models = { racks: {}, servers: {} }, locationNames = {};
+let rackColliders = []; // x/z footprints of placed racks (for collision)
 const options = {
     useFirstPerson: false,
     showLabels: true,
@@ -33,8 +34,8 @@ const options = {
 	collisionMovement: false,
 	domain: 'mystage.interserver.net',
 	location: 4,
-	PlayerWidth: 3,
-	PlayerHeight: 15,
+	heightInches: 70,   // player standing/eye height: 3.5ft (42") .. 8ft (96"), default 5'10"
+	waistInches: 36,    // player waist size -> collision radius: 15" .. 60", default 36"
 	scaleX: 8,  // Scale factor for x position
 	scaleZ: 9,  // Scale factor for z position
 };
@@ -151,10 +152,6 @@ function displayGui() {
     displayFolder.add(options, 'showLabels'); // honored per-frame by updateLabels()
     displayFolder.add(options, 'showNetwork').onChange( (value) => { setNetworkVisible(value); });
     displayFolder.add(options, 'useFirstPerson').onChange( () => { setupControls(); });
-    const sizeFolder = gui.addFolder( 'Sizing' );
-    sizeFolder.add( options, 'scaleX', 0, 100);
-    sizeFolder.add( options, 'scaleZ', 0, 100);
-    sizeFolder.open(false);
     const moveFolder = gui.addFolder( 'Movement' );
     moveFolder.add( options, 'canJump').listen().disable();
     moveFolder.add(camera.position, 'x', -250, 250).listen();
@@ -165,10 +162,10 @@ function displayGui() {
 			moveFolder.add( options, 'moveForward').listen().disable();
 			moveFolder.add( options, 'moveBackward').listen().disable();*/
     moveFolder.add( options, 'collisionMovement');
-    moveFolder.add( options, 'PlayerWidth', 1, 10);
-    moveFolder.add( options, 'PlayerHeight', 0, 30).onChange((value) => {
-        camera.position.y = value;
+    moveFolder.add( options, 'heightInches', 42, 96, 1 ).name( 'height (in)' ).onChange(() => {
+        camera.position.y = eyeHeight();
     });
+    moveFolder.add( options, 'waistInches', 15, 60, 1 ).name( 'waist (in)' );
     moveFolder.open(false);
 }
 function mergeLocations(data) {
@@ -221,6 +218,7 @@ function loadDatacenter() {
 }
 
 function clearScene() {
+    rackColliders = []; // rebuilt as racks are re-placed
     // Instanced model meshes: detach + dispose the per-instance buffer. Their geometry and
     // material are the cached model templates in models.* (shared across rebuilds), so they
     // are kept; InstancedMesh.dispose() only frees the instanceMatrix buffer.
@@ -259,12 +257,6 @@ function convertRackCoordinatesToPosition(x, y) {
     return { x: positionX, z: positionZ, max_x: maxX, max_z: maxZ };
 }
 
-function convertPositionToRackCoordinates(positionX, positionZ) {
-    const x = Math.floor((positionX + 100) / options.scaleX);
-    const z = Math.floor((positionZ + 100) / options.scaleZ);
-    return { x, z };
-}
-
 function convertServerCoordinatesToPosition(rackX, rackY, start) {
     // Get the rack position
     const rackPosition = convertRackCoordinatesToPosition(rackX, rackY);
@@ -277,18 +269,17 @@ function convertServerCoordinatesToPosition(rackX, rackY, start) {
     return { x: serverPositionX, y: serverPositionY, z: serverPositionZ };
 }
 
-function isRackAtPosition(positionX, positionZ) {
-    const rackCoordinates = convertPositionToRackCoordinates(positionX, positionZ);
-    const racks = locations[options.location].racks;
-    for (const rackKey in racks) {
-        if (racks.hasOwnProperty(rackKey)) {
-            const rack = racks[rackKey];
-            if (rack.x == rackCoordinates.x && rack.y == rackCoordinates.z) {
-                return true; // Rack found at the given coordinates
-            }
-        }
+const UNITS_PER_INCH = 15 / 70; // scene units per inch (so 5'10" = 70" maps to the original eye height ~15)
+function eyeHeight() { return options.heightInches * UNITS_PER_INCH; }
+function playerRadius() { return Math.max(0.2, (options.waistInches / (2 * Math.PI)) * UNITS_PER_INCH); }
+
+// Collision: rackColliders holds each rack's x/z footprint (built in buildInstanced). A position
+// (x,z) with radius r collides if it overlaps any footprint -> used to block walking into racks.
+function collidesAt(x, z, r) {
+    for (const c of rackColliders) {
+        if (x + r > c.minX && x - r < c.maxX && z + r > c.minZ && z - r < c.maxZ) return true;
     }
-    return false; // No racks found at the given coordinates
+    return false;
 }
 
 // GLB variant subdirs to try, best-compression first; '' = the full original model.
@@ -369,6 +360,35 @@ function buildInstanced(model, placements, kind) {
         inst.userData.modelBox = model.box;    // model-space bounds (highlight box size)
         scene.add(inst);
         objects.instanced.push(inst);
+    }
+    // Racks are the only collidable furniture. model.box unions EVERY sub-mesh -- including the
+    // flat floor tile under each rack (~2x the rack's width) -- so it is far too wide to collide
+    // against. Build the footprint from only the TALL sub-meshes (the rack body / doors you would
+    // actually walk into), then offset by each placement (= rack centre) for an accurate collider.
+    if (kind === 'rack' && model.parts.length) {
+        const _c = new THREE.Vector3();
+        const partBoxes = model.parts.map((part) => {
+            if (!part.geometry.boundingBox) part.geometry.computeBoundingBox();
+            const gb = part.geometry.boundingBox, pb = new THREE.Box3();
+            for (const X of [gb.min.x, gb.max.x])
+                for (const Y of [gb.min.y, gb.max.y])
+                    for (const Z of [gb.min.z, gb.max.z])
+                        pb.expandByPoint(_c.set(X, Y, Z).applyMatrix4(part.matrix));
+            return pb;
+        });
+        const maxH = Math.max(...partBoxes.map((pb) => pb.max.y - pb.min.y));
+        const fb = new THREE.Box3();
+        for (const pb of partBoxes) {
+            if ((pb.max.y - pb.min.y) >= 0.2 * maxH) fb.union(pb); // skip flat floor tiles / shadows
+        }
+        if (!fb.isEmpty()) {
+            for (const p of placements) {
+                rackColliders.push({
+                    minX: p.x + fb.min.x, maxX: p.x + fb.max.x,
+                    minZ: p.z + fb.min.z, maxZ: p.z + fb.max.z,
+                });
+            }
+        }
     }
 }
 
@@ -590,7 +610,6 @@ function updateLabels() {
 
 // Cable-routing geometry (world units). Racks are ~19 tall; items sit at the rack front
 // (z = rackBase + 2.6). Tune these to taste.
-const CABLE_SIDE = 3;      // x offset from rack base to the side cable channel
 const CABLE_REAR = -2;     // z offset to the rear of the rack (cables exit the back)
 const CABLE_OVERHEAD = 22; // y height of the overhead cable tray (above the racks)
 const CABLE_END = 5;       // how far beyond a rack group's end racks the cables turn out
@@ -710,7 +729,7 @@ function displaySwitches() {
     for (const rackKey of Object.keys(racks)) {
         const rack = racks[rackKey];
         const baseA = convertRackCoordinatesToPosition(rack.x, rack.y);
-        const sideAx = baseA.x + CABLE_SIDE, rearAz = baseA.z + CABLE_REAR;
+        const rearAz = baseA.z + CABLE_REAR;
         const srcGroup = groupOf(rack.x, rack.y);
         const srcEnds = groupEnds(srcGroup);
         for (const switchId of Object.keys(rack.switches)) {
@@ -729,7 +748,7 @@ function displaySwitches() {
                 const destServer = (destRack && destRack.servers) ? destRack.servers[portData.asset] : null;
                 if (!destServer) { continue; } // endpoint not in the loaded location (e.g. cross-DC link)
                 const ret = convertServerCoordinatesToPosition(destRack.x, destRack.y, destServer.start);
-                const ex = ret.x, ey = ret.y, ez = ret.z;
+                const ex = ret.x, ey = ret.y;
                 const cableHex = CABLE_COLORS[(((Number(switchId) || 0) + portData.justport * 3) % CABLE_COLORS.length + CABLE_COLORS.length) % CABLE_COLORS.length];
                 const seed = (((Number(switchId) || 0) * 131 + portData.justport * 17 + 1) >>> 0);
                 const off = {
@@ -742,28 +761,26 @@ function displaySwitches() {
                 const sameGroup = (String(portData.datacenter) === String(options.location))
                     && destGroup.y === srcGroup.y && destGroup.xMin === srcGroup.xMin && destGroup.xMax === srcGroup.xMax;
                 if (sameRack) {
-                    // switch -> server in the SAME rack: short hop via the rack's side channel
+                    // switch -> server in the SAME rack: front port, straight back to the rear
+                    // riser, then across to the server's BACK (no side channel)
                     addCable([
                         [px, py, pz],
                         [px, py, rearAz],
-                        [sideAx, py, rearAz],
-                        [sideAx, ey, rearAz],
-                        [ex, ey, rearAz],
-                        [ex, ey, ez]
+                        [px, ey, rearAz],
+                        [ex, ey, rearAz]
                     ], cableHex, off, seed);
                 } else if (sameGroup) {
-                    // same row/group: up to the row's overhead tray, along it to the destination rack
+                    // same row/group: up to the row's overhead tray, along it, down into the server BACK
                     addCable([
                         [px, py, pz],
                         [px, py, rearAz],
                         [px, CABLE_OVERHEAD, rearAz],
                         [ex, CABLE_OVERHEAD, rearAz],
-                        [ex, ey, rearAz],
-                        [ex, ey, ez]
+                        [ex, ey, rearAz]
                     ], cableHex, off, seed);
                 } else {
                     // different rack group: out the nearest END of the source group, trunk across to
-                    // the nearest END of the destination group, then along that row to the asset
+                    // the nearest END of the destination group, then along that row into the server BACK
                     const destEnds = groupEnds(destGroup);
                     const srcEndX = Math.abs(srcEnds.leftX - ex) <= Math.abs(srcEnds.rightX - ex) ? srcEnds.leftX : srcEnds.rightX;
                     const destEndX = Math.abs(destEnds.leftX - srcEndX) <= Math.abs(destEnds.rightX - srcEndX) ? destEnds.leftX : destEnds.rightX;
@@ -775,8 +792,7 @@ function displaySwitches() {
                         [srcEndX, CABLE_OVERHEAD, destEnds.rowZ],  // trunk across to the destination row
                         [destEndX, CABLE_OVERHEAD, destEnds.rowZ], // along the trunk to the destination group's end
                         [ex, CABLE_OVERHEAD, destEnds.rowZ],       // along the destination row to the asset's rack
-                        [ex, ey, destEnds.rowZ],                   // down at the destination rack
-                        [ex, ey, ez]                               // into the asset
+                        [ex, ey, destEnds.rowZ]                    // down into the server's back
                     ], cableHex, off, seed);
                 }
             }
@@ -1042,7 +1058,7 @@ function init() {
     loadDatacenter();
     // Set up the camera
     camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 1, 1000);
-    camera.position.y = options.PlayerHeight;
+    camera.position.y = eyeHeight();
     // Create the scene
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0xffffff);
@@ -1121,18 +1137,19 @@ function updateControls(time) {
     const prevX = camera.position.x, prevZ = camera.position.z;
     controls.moveRight(-velocity.x * delta);
     controls.moveForward(-velocity.z * delta);
-    // Collision: block walking into a rack cell (opt-in via the Movement > collisionMovement toggle)
-    if (options.collisionMovement && isRackAtPosition(camera.position.x, camera.position.z)) {
-        camera.position.x = prevX;
-        camera.position.z = prevZ;
-        velocity.x = 0;
-        velocity.z = 0;
+    // Collision (opt-in via Movement > collisionMovement): stop at rack footprints, resolved per
+    // axis so you slide along a rack face instead of sticking when walking into it diagonally.
+    if (options.collisionMovement) {
+        const r = playerRadius();
+        if (collidesAt(camera.position.x, prevZ, r)) { camera.position.x = prevX; velocity.x = 0; }
+        if (collidesAt(camera.position.x, camera.position.z, r)) { camera.position.z = prevZ; velocity.z = 0; }
     }
     camera.position.y += velocity.y * delta;
-    // Handle jumping
-    if (camera.position.y < options.PlayerHeight) {
+    // Handle jumping / standing height (eye height derived from the player's height in inches)
+    const floorY = eyeHeight();
+    if (camera.position.y < floorY) {
         velocity.y = 0;
-        camera.position.y = options.PlayerHeight;
+        camera.position.y = floorY;
         options.canJump = true;
     }
 
