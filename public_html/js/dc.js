@@ -21,7 +21,7 @@ import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 let camera, scene, renderer, controls, controlObject, stats, gui, locations = {}, maxAnisotropy; // Declare global variables
 let prevTime = performance.now();
 let racksShown = false, showServers = true;
-let objects = {racks: {}, servers: {}, ports: [], rackLabels: [], labels: []}, models = { racks: {}, servers: {} }, locationNames = {};
+let objects = {instanced: [], network: null, rackLabels: [], labels: []}, models = { racks: {}, servers: {} }, locationNames = {};
 const options = {
     useFirstPerson: false,
     showLabels: true,
@@ -147,7 +147,7 @@ function setLabelsVisible(visible) {
 }
 
 function setNetworkVisible(visible) {
-    for (const obj of objects.ports) obj.visible = visible;
+    if (objects.network) objects.network.visible = visible;
 }
 
 function displayGui() {
@@ -226,25 +226,29 @@ function disposeObject(obj, seen) {
 
 function clearScene() {
     const seen = new Set();
-    // Labels and network lines are created fresh on every build (a new CanvasTexture +
-    // PlaneGeometry per label, a new BufferGeometry per line). The old code only removed
-    // them from the scene and never disposed them, so renderer.info.memory grew on every
-    // rebuild (the clearScene leak). Remove AND dispose them here.
-    for (const bucket of ['rackLabels', 'labels', 'ports']) {
+    // Instanced model meshes: detach + dispose the per-instance buffer. Their geometry and
+    // material are the cached model templates in models.* (shared across rebuilds), so they
+    // are kept; InstancedMesh.dispose() only frees the instanceMatrix buffer.
+    for (const inst of objects.instanced) {
+        scene.remove(inst);
+        inst.dispose();
+    }
+    objects.instanced = [];
+    // Merged network lines: a single LineSegments with its own geometry + material -> dispose.
+    if (objects.network) {
+        scene.remove(objects.network);
+        objects.network.geometry.dispose();
+        objects.network.material.dispose();
+        objects.network = null;
+    }
+    // Labels: a unique CanvasTexture + PlaneGeometry + material per label -> dispose (this
+    // was the original clearScene memory leak; reworked in Phase 5).
+    for (const bucket of ['rackLabels', 'labels']) {
         for (const obj of objects[bucket]) {
             scene.remove(obj);
             disposeObject(obj, seen);
         }
         objects[bucket] = [];
-    }
-    // Rack/server instances are SkeletonUtils.clone()s that share geometry + material with
-    // the cached templates in models.*. Disposing those would free the cached templates and
-    // force a re-upload on the next build, so only detach the clones from the scene.
-    for (const bucket of ['racks', 'servers']) {
-        for (const obj of Object.values(objects[bucket])) {
-            scene.remove(obj);
-        }
-        objects[bucket] = {};
     }
 }
 
@@ -320,6 +324,48 @@ function loadGlbWithFallback(basePath, relName, onLoad) {
     tryNext();
 }
 
+// Phase 4: render each unique model type as InstancedMesh-per-sub-mesh (one draw call per
+// sub-mesh for ALL placements of that type) instead of cloning the whole model per object.
+const _instMatrix = new THREE.Matrix4();
+const _placeMatrix = new THREE.Matrix4();
+
+function extractModelMeshes(root, scale) {
+    // Normalize the loaded model (origin, no rotation, fixed scale) and capture each
+    // sub-mesh's geometry + material + its transform in model space (scale baked in).
+    root.position.set(0, 0, 0);
+    root.rotation.set(0, 0, 0);
+    root.scale.setScalar(scale);
+    root.updateMatrixWorld(true);
+    const parts = [];
+    root.traverse((n) => {
+        if (n.isMesh && n.geometry) {
+            parts.push({ geometry: n.geometry, material: n.material, matrix: n.matrixWorld.clone() });
+        }
+    });
+    return parts;
+}
+
+function buildInstanced(modelParts, placements, kind) {
+    const n = placements.length;
+    if (!modelParts || n === 0) return;
+    const assetIds = placements.map((p) => p.assetId);
+    for (const part of modelParts) {
+        const inst = new THREE.InstancedMesh(part.geometry, part.material, n);
+        for (let k = 0; k < n; k++) {
+            const p = placements[k];
+            _placeMatrix.makeTranslation(p.x, p.y, p.z);
+            _instMatrix.multiplyMatrices(_placeMatrix, part.matrix);
+            inst.setMatrixAt(k, _instMatrix);
+        }
+        inst.instanceMatrix.needsUpdate = true;
+        inst.computeBoundingSphere();
+        inst.userData.kind = kind;          // 'rack' | 'server'
+        inst.userData.assetIds = assetIds;  // instanceId -> rack/server id (Phase 7 picking)
+        scene.add(inst);
+        objects.instanced.push(inst);
+    }
+}
+
 function getRackModels() {
 	let idx, modelName;
 	const usedRacksSet = new Set();
@@ -353,7 +399,7 @@ function getRackModels() {
                         });
 
 						//model.rotation.y = rotationAngle; // Rotate around the Y-axis
-						models.racks[modelIdx] = model;
+						models.racks[modelIdx] = extractModelMeshes(model, 10);
 
 						/* const box = new THREE.Box3().setFromObject(model);
 						const dimensions = new THREE.Vector3();
@@ -408,7 +454,7 @@ function getServerModels() {
                             }
                         });
 						//model.rotation.z = rotationAngle; // Rotate around the Y-axis
-						models.servers[modelIdx] = model;
+						models.servers[modelIdx] = extractModelMeshes(model, 10);
 						//console.log(gltf);
 						//console.log("finished loading server " + currentModel);
 						displayServers(modelIdx);
@@ -422,44 +468,36 @@ function getServerModels() {
 }
 
 function displayRacks(modelIdx) {
-    const modelName = rackTypes[modelIdx];
     const racks = locations[options.location].racks;
-    for (const rackKey in racks) {
-        if (racks.hasOwnProperty(rackKey)) {
-            const rack = racks[rackKey];
-            if (rack.type === modelIdx) {
-                const { x: positionX, z: positionZ } = convertRackCoordinatesToPosition(rack.x, rack.y);
-                const model = SkeletonUtils.clone(models.racks[modelIdx]);
-                model.position.set(positionX, 0, positionZ);
-                scene.add(model);
-                objects.racks[rackKey] = model;
-                rack.id = rackKey;
-                displayRackText(rack.name, rack, positionX, positionZ);
-            }
+    const placements = [];
+    for (const rackKey of Object.keys(racks)) {
+        const rack = racks[rackKey];
+        if (rack.type === modelIdx) {
+            const { x: positionX, z: positionZ } = convertRackCoordinatesToPosition(rack.x, rack.y);
+            rack.id = rackKey;
+            placements.push({ x: positionX, y: 0, z: positionZ, assetId: rackKey });
+            displayRackText(rack.name, rack, positionX, positionZ);
         }
     }
+    buildInstanced(models.racks[modelIdx], placements, 'rack');
 }
 
 function displayServers(modelIdx) {
-    const [modelName, modelUnits] = serverTypes[modelIdx];
     const racks = locations[options.location].racks;
-    for (const rackKey in racks) {
-        if (racks.hasOwnProperty(rackKey)) {
-            const rack = racks[rackKey];
-            for (const serverId of Object.keys(rack.servers)) {
-                const server = rack.servers[serverId];
-                if (server.type === modelIdx) {
-                    const { x: positionX, y: positionY, z: positionZ } = convertServerCoordinatesToPosition(rack.x, rack.y, server.start);
-                    const model = SkeletonUtils.clone(models.servers[modelIdx]);
-                    model.position.set(positionX, positionY, positionZ);
-                    scene.add(model);
-                    objects.servers[serverId] = model;
-                    server.id = serverId;
-                    displayServerText(server.hostname, server, positionX, positionY, positionZ);
-                }
+    const placements = [];
+    for (const rackKey of Object.keys(racks)) {
+        const rack = racks[rackKey];
+        for (const serverId of Object.keys(rack.servers)) {
+            const server = rack.servers[serverId];
+            if (server.type === modelIdx) {
+                const { x: positionX, y: positionY, z: positionZ } = convertServerCoordinatesToPosition(rack.x, rack.y, server.start);
+                server.id = serverId;
+                placements.push({ x: positionX, y: positionY, z: positionZ, assetId: serverId });
+                displayServerText(server.hostname, server, positionX, positionY, positionZ);
             }
         }
     }
+    buildInstanced(models.servers[modelIdx], placements, 'server');
 }
 
 function displayRackText(text, asset, x, z) {
@@ -512,45 +550,46 @@ function displayText(text, data, x, y, z) {
 }
 
 function displaySwitches() {
-    const material = new THREE.LineBasicMaterial( { color: 0x0000ff } );
+    // One merged LineSegments for ALL switchport cabling (was one THREE.Line per port =
+    // thousands of draw calls). Each port is a 4-point polyline -> 3 segments (point pairs).
     const racks = locations[options.location].racks;
-    let startX, endX, positionX, startY, endY, positionY, startZ, endZ, positionZ, ret, points, geometry;
-    for (const rackKey in racks) {
-        if (racks.hasOwnProperty(rackKey)) {
-            const rack = racks[rackKey];
-            for (const switchId of Object.keys(rack.switches)) {
-                const switchData = rack.switches[switchId];
-                const { x: positionX, y: positionY, z: positionZ } = convertServerCoordinatesToPosition(rack.x, rack.y, switchData.start);
-                //displayText(switchData.name, switchData.asset, positionX, positionY, positionZ);
-                const portWidth = Math.ceil(switchData.totalPorts / 2);
-                for (const portId of Object.keys(switchData.ports)) {
-                    const portData = switchData.ports[portId];
-                    startX = portData.justport;
-                    startZ = positionZ;
-                    startY = positionY + 0.3;
-                    if (startX > portWidth) {
-                        startX -= portWidth;
-                        startY -= 0.15;
-                    }
-                    startX = positionX + 0.15 + (0.15 * startX);
-                    ret = convertServerCoordinatesToPosition(locations[portData.datacenter].racks[portData.rack].x, locations[portData.datacenter].racks[portData.rack].y, locations[portData.datacenter].racks[portData.rack].servers[portData.asset].start);
-                    endX = ret.x;
-                    endY = ret.y;
-                    endZ = ret.z;
-                    points = [];
-                    points.push(new THREE.Vector3(startX, startY, startZ));
-                    points.push(new THREE.Vector3(startX, startY, startZ + 1));
-                    points.push(new THREE.Vector3(endX + 1, endY + 0.25, endZ + 1));
-                    points.push(new THREE.Vector3(endX + 1, endY + 0.25, endZ));
-                    geometry = new THREE.BufferGeometry().setFromPoints( points );
-                    const line = new THREE.Line( geometry, material );
-                    line.visible = options.showNetwork;
-                    scene.add(line);
-                    objects.ports.push(line);
+    const positions = [];
+    let startX, startY, startZ, ret, endX, endY, endZ;
+    const seg = (ax, ay, az, bx, by, bz) => { positions.push(ax, ay, az, bx, by, bz); };
+    for (const rackKey of Object.keys(racks)) {
+        const rack = racks[rackKey];
+        for (const switchId of Object.keys(rack.switches)) {
+            const switchData = rack.switches[switchId];
+            const { x: positionX, y: positionY, z: positionZ } = convertServerCoordinatesToPosition(rack.x, rack.y, switchData.start);
+            const portWidth = Math.ceil(switchData.totalPorts / 2);
+            for (const portId of Object.keys(switchData.ports)) {
+                const portData = switchData.ports[portId];
+                startX = portData.justport;
+                startZ = positionZ;
+                startY = positionY + 0.3;
+                if (startX > portWidth) {
+                    startX -= portWidth;
+                    startY -= 0.15;
                 }
+                startX = positionX + 0.15 + (0.15 * startX);
+                ret = convertServerCoordinatesToPosition(locations[portData.datacenter].racks[portData.rack].x, locations[portData.datacenter].racks[portData.rack].y, locations[portData.datacenter].racks[portData.rack].servers[portData.asset].start);
+                endX = ret.x;
+                endY = ret.y;
+                endZ = ret.z;
+                seg(startX, startY, startZ, startX, startY, startZ + 1);
+                seg(startX, startY, startZ + 1, endX + 1, endY + 0.25, endZ + 1);
+                seg(endX + 1, endY + 0.25, endZ + 1, endX + 1, endY + 0.25, endZ);
             }
         }
     }
+    if (positions.length === 0) { objects.network = null; return; }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    const lines = new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({ color: 0x0000ff }));
+    lines.visible = options.showNetwork;
+    lines.frustumCulled = false;
+    scene.add(lines);
+    objects.network = lines;
 }
 
 function loadFloor() {
