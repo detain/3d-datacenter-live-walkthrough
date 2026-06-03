@@ -154,7 +154,7 @@ function displayGui() {
     gui = new GUI();
     gui.add( options, 'location', locationNames).listen().onChange( () => { displayDatacenter(); });
     const displayFolder = gui.addFolder( 'Display' );
-    displayFolder.add(options, 'showLabels').onChange( (value) => { setLabelsVisible(value); });
+    displayFolder.add(options, 'showLabels'); // honored per-frame by updateLabels()
     displayFolder.add(options, 'showNetwork').onChange( (value) => { setNetworkVisible(value); });
     displayFolder.add(options, 'useFirstPerson').onChange( () => { setupControls(); });
     const sizeFolder = gui.addFolder( 'Sizing' );
@@ -241,12 +241,13 @@ function clearScene() {
         objects.network.material.dispose();
         objects.network = null;
     }
-    // Labels: a unique CanvasTexture + PlaneGeometry + material per label -> dispose (this
-    // was the original clearScene memory leak; reworked in Phase 5).
+    // Labels are billboard Sprites: dispose each one's SpriteMaterial + its lazily-built
+    // CanvasTexture. The Sprite geometry is a shared three singleton -- never dispose it.
     for (const bucket of ['rackLabels', 'labels']) {
-        for (const obj of objects[bucket]) {
-            scene.remove(obj);
-            disposeObject(obj, seen);
+        for (const sprite of objects[bucket]) {
+            scene.remove(sprite);
+            if (sprite.material.map) sprite.material.map.dispose();
+            sprite.material.dispose();
         }
         objects[bucket] = [];
     }
@@ -508,44 +509,64 @@ function displayServerText(text, asset, x, y, z) {
     displayText(text, asset, x + 3.5, y + 0.25, z + 0.2);
 }
 
-function displayText(text, data, x, y, z) {
-    // Create a canvas element
+const LABEL_DISTANCE = 40;                                  // draw a label only within this many world units
+const LABEL_DISTANCE_SQ = LABEL_DISTANCE * LABEL_DISTANCE;
+const _labelCamPos = new THREE.Vector3();
+
+function makeLabelTexture(text) {
     const canvas = document.createElement('canvas');
-    const context = canvas.getContext('2d');
-    // Set canvas dimensions
     canvas.width = 320;
     canvas.height = 32;
-    // Set the text properties
+    const context = canvas.getContext('2d');
     context.font = '20px Arial';
     context.textAlign = 'center';
     context.textBaseline = 'middle';
-    // Fill the background with a color (optional)
     context.fillStyle = 'white';
     context.fillRect(0, 0, canvas.width, canvas.height);
-    // Optional: Outline the text for better visibility
     context.strokeStyle = 'gray';
     context.lineWidth = 2;
-    context.strokeText(text, canvas.width / 2, canvas.height / 2);
-    // Draw the text
+    context.strokeText(text, 160, 16);
     context.fillStyle = 'black';
     context.lineWidth = 1;
-    context.fillText(text, canvas.width  / 2, canvas.height / 2);
-    // Create a texture from the canvas
+    context.fillText(text, 160, 16);
     const texture = new THREE.CanvasTexture(canvas);
-    // Create a plane geometry
-    const geometry = new THREE.PlaneGeometry(2.5,0.25);
-    // Create a material using the texture
-    const material = new THREE.MeshBasicMaterial({ map: texture, side: THREE.DoubleSide });
-    // Create the mesh and apply the material
-    const plane = new THREE.Mesh(geometry, material);
-    plane.position.set(x, y, z);
-    plane.visible = options.showLabels;
-    // Add the plane to the scene
-    scene.add(plane);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    return texture;
+}
+
+// Labels are billboarding Sprites (always face the camera). The canvas texture is built
+// LAZILY the first time the label comes within LABEL_DISTANCE; updateLabels() (per frame)
+// distance-culls them so only the nearby handful actually draw. This bounds both label
+// build cost and draw-call count regardless of how big the location is.
+function displayText(text, data, x, y, z) {
+    const sprite = new THREE.Sprite(new THREE.SpriteMaterial());
+    sprite.position.set(x, y, z);
+    sprite.scale.set(2.5, 0.25, 1);
+    sprite.visible = false;
+    sprite.userData.text = text;
+    sprite.userData.drawn = false;
+    scene.add(sprite);
     if (typeof data.hostname != "undefined") {
-        objects.labels.push(plane);
+        objects.labels.push(sprite);
     } else {
-        objects.rackLabels.push(plane);
+        objects.rackLabels.push(sprite);
+    }
+}
+
+function updateLabels() {
+    if (!camera) return;
+    const show = options.showLabels;
+    camera.getWorldPosition(_labelCamPos);
+    for (const arr of [objects.labels, objects.rackLabels]) {
+        for (const sprite of arr) {
+            const near = show && sprite.position.distanceToSquared(_labelCamPos) < LABEL_DISTANCE_SQ;
+            if (near && !sprite.userData.drawn) {
+                sprite.material.map = makeLabelTexture(sprite.userData.text);
+                sprite.material.needsUpdate = true;
+                sprite.userData.drawn = true;
+            }
+            sprite.visible = near;
+        }
     }
 }
 
@@ -697,7 +718,8 @@ function animate() {
             updateControls(time);
         }
     }
-    // Render the scene
+    // Distance-cull + lazily build labels, then render the scene
+    updateLabels();
     renderer.render(scene, camera);
     // Update stats monitor
     stats.update();
@@ -798,6 +820,8 @@ window.DC = {
     get models() { return models; },
     display: displayDatacenter,
     clear: clearScene,
+    cull: updateLabels,
+    tick: function () { updateLabels(); renderer.render(scene, camera); return renderer.info.render.calls; },
 };
 
 init();
