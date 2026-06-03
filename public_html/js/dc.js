@@ -15,12 +15,12 @@ import { FirstPersonControls } from "three/addons/controls/FirstPersonControls.j
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 //import { ColladaLoader } from "three/addons/loaders/ColladaLoader.js";
 import * as SkeletonUtils from "three/addons/utils/SkeletonUtils.js";
-import GUI from 'https://cdn.jsdelivr.net/npm/lil-gui@0.19/+esm';
+import GUI from 'lil-gui';
 import Stats from "three/addons/libs/stats.module.js";
 let camera, scene, renderer, controls, controlObject, stats, gui, locations = {}, maxAnisotropy; // Declare global variables
 let prevTime = performance.now();
 let racksShown = false, showServers = true;
-let objects = {racks: {}, servers: {}, ports: {}, rackLabels: {}, labels: {}}, models = { racks: {}, servers: {} }, locationNames = {};
+let objects = {racks: {}, servers: {}, ports: [], rackLabels: [], labels: []}, models = { racks: {}, servers: {} }, locationNames = {};
 const options = {
     useFirstPerson: false,
     showLabels: true,
@@ -38,7 +38,7 @@ const options = {
 	scaleX: 8,  // Scale factor for x position
 	scaleZ: 9,  // Scale factor for z position
 };
-const clock = new THREE.Clock();
+const timer = new THREE.Timer();
 const velocity = new THREE.Vector3();
 const direction = new THREE.Vector3();
 const vertex = new THREE.Vector3();
@@ -139,16 +139,22 @@ function displayDatacenter() {
     displaySwitches();
 }
 
+function setLabelsVisible(visible) {
+    for (const obj of objects.labels) obj.visible = visible;
+    for (const obj of objects.rackLabels) obj.visible = visible;
+}
+
+function setNetworkVisible(visible) {
+    for (const obj of objects.ports) obj.visible = visible;
+}
+
 function displayGui() {
     gui = new GUI();
-    gui.add( options, 'location', locationNames).listen().onChange( (value) => { displayDatacenter(); });
+    gui.add( options, 'location', locationNames).listen().onChange( () => { displayDatacenter(); });
     const displayFolder = gui.addFolder( 'Display' );
-    displayFolder.add(options, 'showLabels').onChange( (value) => { displayDatacenter(); });
-    displayFolder.add(options, 'showNetwork').onChange( (value) => { displayDatacenter(); });
-    displayFolder.add(options, 'useFirstPerson').onChange( (value) => {
-
-        displayDatacenter();
-    });
+    displayFolder.add(options, 'showLabels').onChange( (value) => { setLabelsVisible(value); });
+    displayFolder.add(options, 'showNetwork').onChange( (value) => { setNetworkVisible(value); });
+    displayFolder.add(options, 'useFirstPerson').onChange( () => { setupControls(); });
     const sizeFolder = gui.addFolder( 'Sizing' );
     sizeFolder.add( options, 'scaleX', 0, 100);
     sizeFolder.add( options, 'scaleZ', 0, 100);
@@ -190,21 +196,54 @@ function loadDatacenter() {
 		});
 }
 
-function clearScene() {
-    for (let key in objects) {
-      if (objects.hasOwnProperty(key)) {
-        let innerObject = objects[key];
-        for (let innerKey in innerObject) {
-          if (innerObject.hasOwnProperty(innerKey)) {
-            scene.remove(innerObject[innerKey]);
-          }
-        }
-        objects[key] = {};
-      }
+function disposeMaterial(material, seen) {
+    if (!material || seen.has(material)) return;
+    seen.add(material);
+    for (const key in material) {
+        const val = material[key];
+        if (val && val.isTexture) val.dispose();
     }
-	scene.traverse(function (child) {
-		if (child.isSkinnedMesh) child.skeleton.dispose();
-	});
+    material.dispose();
+}
+
+function disposeObject(obj, seen) {
+    obj.traverse((child) => {
+        if (child.geometry && !seen.has(child.geometry)) {
+            seen.add(child.geometry);
+            child.geometry.dispose();
+        }
+        const mat = child.material;
+        if (Array.isArray(mat)) {
+            mat.forEach((m) => disposeMaterial(m, seen));
+        } else if (mat) {
+            disposeMaterial(mat, seen);
+        }
+        if (child.isSkinnedMesh && child.skeleton) child.skeleton.dispose();
+    });
+}
+
+function clearScene() {
+    const seen = new Set();
+    // Labels and network lines are created fresh on every build (a new CanvasTexture +
+    // PlaneGeometry per label, a new BufferGeometry per line). The old code only removed
+    // them from the scene and never disposed them, so renderer.info.memory grew on every
+    // rebuild (the clearScene leak). Remove AND dispose them here.
+    for (const bucket of ['rackLabels', 'labels', 'ports']) {
+        for (const obj of objects[bucket]) {
+            scene.remove(obj);
+            disposeObject(obj, seen);
+        }
+        objects[bucket] = [];
+    }
+    // Rack/server instances are SkeletonUtils.clone()s that share geometry + material with
+    // the cached templates in models.*. Disposing those would free the cached templates and
+    // force a re-upload on the next build, so only detach the clones from the scene.
+    for (const bucket of ['racks', 'servers']) {
+        for (const obj of Object.values(objects[bucket])) {
+            scene.remove(obj);
+        }
+        objects[bucket] = {};
+    }
 }
 
 function convertRackCoordinatesToPosition(x, y) {
@@ -250,6 +289,27 @@ function isRackAtPosition(positionX, positionZ) {
     return false; // No racks found at the given coordinates
 }
 
+function optimizedGlbUrl(basePath, relName) {
+    // Insert the "webp-simplify/" subdir before the final path component so both bare
+    // names ("1182_096_2") and nested names ("gltf/exported-centered/Rack") map to their
+    // optimized variant on disk.
+    const slash = relName.lastIndexOf('/');
+    const dir = slash >= 0 ? relName.slice(0, slash + 1) : '';
+    const file = slash >= 0 ? relName.slice(slash + 1) : relName;
+    return basePath + dir + 'webp-simplify/' + file + '.glb';
+}
+
+function loadGlbWithFallback(basePath, relName, onLoad) {
+    const optimized = optimizedGlbUrl(basePath, relName);
+    const plain = basePath + relName + '.glb';
+    loaderGltf.load(optimized, onLoad, undefined, function () {
+        // No webp-simplify variant on disk for this model -- fall back to the full model.
+        loaderGltf.load(plain, onLoad, undefined, function (err) {
+            console.error('Failed to load model: ' + plain, err);
+        });
+    });
+}
+
 function getRackModels() {
 	let idx, modelName;
 	const usedRacksSet = new Set();
@@ -267,7 +327,7 @@ function getRackModels() {
 			// Create a closure to capture the current value of idx
 			(function (modelIdx) {
 				const currentModel = rackTypes[modelIdx];
-				loaderGltf.load('https://'+options.domain+'/images/3d/racks/' + currentModel + '.glb', function (gltf) {
+				loadGlbWithFallback('https://'+options.domain+'/images/3d/racks/', currentModel, function (gltf) {
 						const scale = 10;
 						const rotationAngle = Math.PI / 2; // 90 degrees in radians
 						const model = gltf.scene;
@@ -322,7 +382,7 @@ function getServerModels() {
 				[currentModel, currentUnits] = serverTypes[modelIdx];
                 //console.log("Loading Server "+currentModel);
 				//loaderDae.load('https://'+options.domain+'/images/3d/servers/dae/'+currentModel+'/model.dae', function (collada) {
-				loaderGltf.load('https://'+options.domain+'/images/3d/servers/gltf/exported-centered/' + currentModel + '.glb', function (gltf) {
+				loadGlbWithFallback('https://'+options.domain+'/images/3d/servers/gltf/exported-centered/', currentModel, function (gltf) {
 						//const scale = 0.26;
 						const scale = 10;
 						const rotationAngle = Math.PI / 2; // 90 degrees in radians
@@ -393,16 +453,10 @@ function displayServers(modelIdx) {
 }
 
 function displayRackText(text, asset, x, z) {
-    if (options.showLabels == false) {
-        return;
-    }
     displayText(text, asset, x - 2.5, 19.5, z + 4);
 }
 
 function displayServerText(text, asset, x, y, z) {
-    if (options.showLabels == false) {
-        return;
-    }
     displayText(text, asset, x + 3.5, y + 0.25, z + 0.2);
 }
 
@@ -437,19 +491,17 @@ function displayText(text, data, x, y, z) {
     // Create the mesh and apply the material
     const plane = new THREE.Mesh(geometry, material);
     plane.position.set(x, y, z);
+    plane.visible = options.showLabels;
     // Add the plane to the scene
     scene.add(plane);
     if (typeof data.hostname != "undefined") {
-        objects.labels[data.hostname] = plane;
+        objects.labels.push(plane);
     } else {
-        objects.rackLabels[data.name] = plane;
+        objects.rackLabels.push(plane);
     }
 }
 
 function displaySwitches() {
-    if (options.showNetwork == false) {
-        return;
-    }
     const material = new THREE.LineBasicMaterial( { color: 0x0000ff } );
     const racks = locations[options.location].racks;
     let startX, endX, positionX, startY, endY, positionY, startZ, endZ, positionZ, ret, points, geometry;
@@ -482,8 +534,9 @@ function displaySwitches() {
                     points.push(new THREE.Vector3(endX + 1, endY + 0.25, endZ));
                     geometry = new THREE.BufferGeometry().setFromPoints( points );
                     const line = new THREE.Line( geometry, material );
+                    line.visible = options.showNetwork;
                     scene.add(line);
-                    objects.ports[portId] = line;
+                    objects.ports.push(line);
                 }
             }
         }
@@ -498,19 +551,39 @@ function loadFloor() {
 	scene.add(helper);
 }
 
+let keyHandlersAttached = false;
+
+function attachKeyHandlers() {
+    if (keyHandlersAttached) return;
+    document.addEventListener("keydown", onKeyDown);
+    document.addEventListener("keyup", onKeyUp);
+    keyHandlersAttached = true;
+}
+
+function detachKeyHandlers() {
+    if (!keyHandlersAttached) return;
+    document.removeEventListener("keydown", onKeyDown);
+    document.removeEventListener("keyup", onKeyUp);
+    keyHandlersAttached = false;
+}
+
 function setupControls() {
     const blocker = document.getElementById("blocker");
     const instructions = document.getElementById("instructions");
+    // Tear down any existing controls so first-person <-> pointer-lock can swap in place
+    // instead of rebuilding the whole scene.
+    if (controls && typeof controls.dispose === "function") {
+        controls.dispose();
+    }
     if (options.useFirstPerson == true) {
-        controls = new FirstPersonControls( camera, renderer.domElement );
-        instructions.style.display = "none";
-        blocker.style.display = "none";
+        controls = new FirstPersonControls(camera, renderer.domElement);
+        if (instructions) instructions.style.display = "none";
+        if (blocker) blocker.style.display = "none";
+        detachKeyHandlers();
     } else {
         controls = new PointerLockControls(camera, renderer.domElement);
-        // Event listener for clicking to lock controls
-        instructions.addEventListener("click", function () {
-            controls.lock();
-        });
+        if (blocker) blocker.style.display = "block";
+        if (instructions) instructions.style.display = "";
         // Event listeners for lock and unlock events
         controls.addEventListener("lock", function () {
             instructions.style.display = "none";
@@ -520,9 +593,7 @@ function setupControls() {
             blocker.style.display = "block";
             instructions.style.display = "";
         });
-        // Event listeners for keyboard input
-        document.addEventListener("keydown", onKeyDown);
-        document.addEventListener("keyup", onKeyUp);
+        attachKeyHandlers();
     }
 }
 
@@ -542,11 +613,20 @@ function init() {
     scene.add(light);
     // Set up the renderer
     renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(window.innerWidth, window.innerHeight);
     document.body.appendChild(renderer.domElement);
     maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
     setupControls();
+    // Lock the pointer when the user clicks the instructions overlay. Attached once here
+    // (not in setupControls) so repeated first-person toggles don't stack listeners; it
+    // reads the current `controls` on each click and is a no-op for FirstPersonControls.
+    const instructionsEl = document.getElementById("instructions");
+    if (instructionsEl) {
+        instructionsEl.addEventListener("click", function () {
+            if (controls && typeof controls.lock === "function") controls.lock();
+        });
+    }
     // Load floor
     loadFloor();
     // Add stats monitor
@@ -558,9 +638,9 @@ function init() {
 
 // Animation loop
 function animate() {
-    requestAnimationFrame(animate);
+    timer.update();
     if (options.useFirstPerson == true) {
-        controls.update( clock.getDelta() );
+        controls.update( timer.getDelta() );
     } else {
         const time = performance.now();
         // Update controls if locked
@@ -656,5 +736,20 @@ function onWindowResize() {
     renderer.setSize(window.innerWidth, window.innerHeight);
 }
 
+// --- Phase 1 measurement handle (admin-gated page; getters add zero render work) ---
+window.DC = {
+    get renderer() { return renderer; },
+    get scene() { return scene; },
+    get camera() { return camera; },
+    get controls() { return controls; },
+    get options() { return options; },
+    get locations() { return locations; },
+    get locationNames() { return locationNames; },
+    get objects() { return objects; },
+    get models() { return models; },
+    display: displayDatacenter,
+    clear: clearScene,
+};
+
 init();
-animate();
+renderer.setAnimationLoop(animate);
