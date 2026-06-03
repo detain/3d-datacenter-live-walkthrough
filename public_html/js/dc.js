@@ -16,6 +16,7 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import GUI from 'lil-gui';
 import Stats from "three/addons/libs/stats.module.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
+import * as BufferGeometryUtils from "three/addons/utils/BufferGeometryUtils.js";
 let camera, scene, renderer, controls, controlObject, stats, gui, locations = {}, maxAnisotropy; // Declare global variables
 let prevTime = performance.now();
 let racksShown = false, showServers = true;
@@ -566,51 +567,110 @@ function updateLabels() {
     }
 }
 
+// Cable-routing geometry (world units). Racks are ~19 tall; items sit at the rack front
+// (z = rackBase + 2.6). Tune these to taste.
+const CABLE_SIDE = 3;      // x offset from rack base to the side cable channel
+const CABLE_REAR = -2;     // z offset to the rear of the rack (cables exit the back)
+const CABLE_OVERHEAD = 22; // y height of the overhead cable tray (above the racks)
+const CABLE_RADIUS = 0.07;  // cable thickness in world units (true scale ~0.03; a bit thicker so it reads)
+const CABLE_RADIAL = 6;     // tube cross-section sides (6 = round-looking)
+// Cable colours: random-ish per cable for now (could key off link speed later). Blue-dominant
+// with yellow + green accents, like a real patch field.
+const CABLE_COLORS = [0x2a5bd7, 0x2a5bd7, 0xe2c044, 0x33aa55];
+const _cableColor = new THREE.Color();
+
 function displaySwitches() {
-    // One merged LineSegments for ALL switchport cabling (was one THREE.Line per port =
-    // thousands of draw calls). Each port is a 4-point polyline -> 3 segments (point pairs).
+    // One merged tube mesh for ALL switchport cabling (1 draw call): each cable is a rounded 3D
+    // tube (matte "plastic" cylinder) that follows real structured-cabling routing instead of a
+    // straight line through the air: out the back of the system -> to the rack's side cable
+    // channel -> up to the overhead tray -> across the hall -> down the destination rack's side
+    // -> into the asset. Same-rack links stay short (no trip to the ceiling). Cables sharing a
+    // rack bundle on the shared side channel.
     const racks = locations[options.location].racks;
-    const positions = [];
-    let startX, startY, startZ, ret, endX, endY, endZ;
-    const seg = (ax, ay, az, bx, by, bz) => { positions.push(ax, ay, az, bx, by, bz); };
+    const tubes = [];
+    const addCable = (pts, hex) => {
+        const vecs = [];
+        for (const p of pts) {
+            const v = new THREE.Vector3(p[0], p[1], p[2]);
+            if (vecs.length === 0 || vecs[vecs.length - 1].distanceToSquared(v) > 1e-6) vecs.push(v);
+        }
+        if (vecs.length < 2) return;
+        const curve = new THREE.CatmullRomCurve3(vecs);
+        const tubular = Math.max(8, (vecs.length - 1) * 4);
+        const geo = new THREE.TubeGeometry(curve, tubular, CABLE_RADIUS, CABLE_RADIAL, false);
+        const count = geo.attributes.position.count;
+        const colors = new Float32Array(count * 3);
+        _cableColor.set(hex);
+        for (let i = 0; i < count; i++) {
+            colors[i * 3] = _cableColor.r;
+            colors[i * 3 + 1] = _cableColor.g;
+            colors[i * 3 + 2] = _cableColor.b;
+        }
+        geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        tubes.push(geo);
+    };
     for (const rackKey of Object.keys(racks)) {
         const rack = racks[rackKey];
+        const baseA = convertRackCoordinatesToPosition(rack.x, rack.y);
+        const sideAx = baseA.x + CABLE_SIDE, rearAz = baseA.z + CABLE_REAR;
         for (const switchId of Object.keys(rack.switches)) {
             const switchData = rack.switches[switchId];
             const { x: positionX, y: positionY, z: positionZ } = convertServerCoordinatesToPosition(rack.x, rack.y, switchData.start);
             const portWidth = Math.ceil(switchData.totalPorts / 2);
             for (const portId of Object.keys(switchData.ports)) {
                 const portData = switchData.ports[portId];
-                startX = portData.justport;
-                startZ = positionZ;
-                startY = positionY + 0.3;
-                if (startX > portWidth) {
-                    startX -= portWidth;
-                    startY -= 0.15;
-                }
-                startX = positionX + 0.15 + (0.15 * startX);
+                let px = portData.justport;
+                let py = positionY + 0.3;
+                if (px > portWidth) { px -= portWidth; py -= 0.15; }
+                px = positionX + 0.15 + (0.15 * px);
+                const pz = positionZ;
                 const destLoc = locations[portData.datacenter];
                 const destRack = (destLoc && destLoc.racks) ? destLoc.racks[portData.rack] : null;
                 const destServer = (destRack && destRack.servers) ? destRack.servers[portData.asset] : null;
                 if (!destServer) { continue; } // endpoint not in the loaded location (e.g. cross-DC link)
-                ret = convertServerCoordinatesToPosition(destRack.x, destRack.y, destServer.start);
-                endX = ret.x;
-                endY = ret.y;
-                endZ = ret.z;
-                seg(startX, startY, startZ, startX, startY, startZ + 1);
-                seg(startX, startY, startZ + 1, endX + 1, endY + 0.25, endZ + 1);
-                seg(endX + 1, endY + 0.25, endZ + 1, endX + 1, endY + 0.25, endZ);
+                const ret = convertServerCoordinatesToPosition(destRack.x, destRack.y, destServer.start);
+                const ex = ret.x, ey = ret.y, ez = ret.z;
+                const baseB = convertRackCoordinatesToPosition(destRack.x, destRack.y);
+                // small per-cable lane offset so a rack's cables read as a bundle, not one line
+                const lane = (((portData.justport % 12) - 6) * 0.08);
+                const sAx = sideAx + lane;
+                const sBx = baseB.x + CABLE_SIDE + lane, rearBz = baseB.z + CABLE_REAR;
+                const sameRack = (String(portData.datacenter) === String(options.location)) && (String(portData.rack) === String(rackKey));
+                const cableHex = CABLE_COLORS[(((Number(switchId) || 0) + portData.justport * 3) % CABLE_COLORS.length + CABLE_COLORS.length) % CABLE_COLORS.length];
+                if (sameRack) {
+                    addCable([
+                        [px, py, pz],          // port (front of switch)
+                        [px, py, rearAz],      // out the back
+                        [sAx, py, rearAz],     // to the side cable channel
+                        [sAx, ey, rearAz],     // up/down the side to the asset height
+                        [ex, ey, rearAz],      // across to the asset's column (rear)
+                        [ex, ey, ez]           // into the asset (front)
+                    ], cableHex);
+                } else {
+                    addCable([
+                        [px, py, pz],               // port (front of switch)
+                        [px, py, rearAz],           // out the back
+                        [sAx, py, rearAz],          // to the side cable channel
+                        [sAx, CABLE_OVERHEAD, rearAz], // up the side, past the top, to the overhead tray
+                        [sBx, CABLE_OVERHEAD, rearAz], // overhead run across the hall (x)
+                        [sBx, CABLE_OVERHEAD, rearBz], // overhead run to the destination row (z)
+                        [sBx, ey, rearBz],          // down the destination rack's side
+                        [ex, ey, rearBz],           // across to the asset's column (rear)
+                        [ex, ey, ez]                // into the asset (front)
+                    ], cableHex);
+                }
             }
         }
     }
-    if (positions.length === 0) { objects.network = null; return; }
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    const lines = new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({ color: 0x0000ff }));
-    lines.visible = options.showNetwork;
-    lines.frustumCulled = false;
-    scene.add(lines);
-    objects.network = lines;
+    if (tubes.length === 0) { objects.network = null; return; }
+    const geometry = BufferGeometryUtils.mergeGeometries(tubes, false);
+    tubes.forEach((g) => g.dispose());
+    const material = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0.0 });
+    const cables = new THREE.Mesh(geometry, material);
+    cables.visible = options.showNetwork;
+    cables.frustumCulled = false;
+    scene.add(cables);
+    objects.network = cables;
 }
 
 function loadFloor() {
