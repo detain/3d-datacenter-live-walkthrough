@@ -373,6 +373,7 @@ function buildInstanced(modelParts, placements, kind) {
     const n = placements.length;
     if (!modelParts || n === 0) return;
     const assetIds = placements.map((p) => p.assetId);
+    const assetData = placements.map((p) => p.asset);
     for (const part of modelParts) {
         const inst = new THREE.InstancedMesh(part.geometry, part.material, n);
         for (let k = 0; k < n; k++) {
@@ -383,8 +384,9 @@ function buildInstanced(modelParts, placements, kind) {
         }
         inst.instanceMatrix.needsUpdate = true;
         inst.computeBoundingSphere();
-        inst.userData.kind = kind;          // 'rack' | 'server'
-        inst.userData.assetIds = assetIds;  // instanceId -> rack/server id (Phase 7 picking)
+        inst.userData.kind = kind;           // 'rack' | 'server'
+        inst.userData.assetIds = assetIds;   // instanceId -> rack/server id
+        inst.userData.assetData = assetData; // instanceId -> asset object (hostname/name/id)
         scene.add(inst);
         objects.instanced.push(inst);
     }
@@ -499,7 +501,7 @@ function displayRacks(modelIdx) {
         if (rack.type === modelIdx) {
             const { x: positionX, z: positionZ } = convertRackCoordinatesToPosition(rack.x, rack.y);
             rack.id = rackKey;
-            placements.push({ x: positionX, y: 0, z: positionZ, assetId: rackKey });
+            placements.push({ x: positionX, y: 0, z: positionZ, assetId: rackKey, asset: rack });
             displayRackText(rack.name, rack, positionX, positionZ);
         }
     }
@@ -516,7 +518,7 @@ function displayServers(modelIdx) {
             if (server.type === modelIdx) {
                 const { x: positionX, y: positionY, z: positionZ } = convertServerCoordinatesToPosition(rack.x, rack.y, server.start);
                 server.id = serverId;
-                placements.push({ x: positionX, y: positionY, z: positionZ, assetId: serverId });
+                placements.push({ x: positionX, y: positionY, z: positionZ, assetId: serverId, asset: server });
                 displayServerText(server.hostname, server, positionX, positionY, positionZ);
             }
         }
@@ -694,6 +696,137 @@ function setupControls() {
     }
 }
 
+// ---- Phase 7: interaction (look-highlight, click-to-info, search + fly-to) ----
+const raycaster = new THREE.Raycaster();
+const _centerNdc = new THREE.Vector2(0, 0);   // screen centre = "what you're looking at"
+const _hoverMatrix = new THREE.Matrix4();
+const _hoverPos = new THREE.Vector3();
+let highlightBox = null;
+let hovered = null;                            // { mesh, instanceId, kind, asset }
+let _hlFrame = 0;
+const flyTo = { active: false, t: 0, from: new THREE.Vector3(), to: new THREE.Vector3(), look: new THREE.Vector3() };
+
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function ensureHighlightBox() {
+    if (highlightBox) return;
+    highlightBox = new THREE.LineSegments(
+        new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
+        new THREE.LineBasicMaterial({ color: 0xffcc00 })
+    );
+    highlightBox.visible = false;
+    highlightBox.renderOrder = 999;
+    scene.add(highlightBox);
+}
+
+function raycastInstances(ndc) {
+    if (objects.instanced.length === 0) return null;
+    raycaster.setFromCamera(ndc, camera);
+    const hits = raycaster.intersectObjects(objects.instanced, false);
+    for (const hit of hits) {
+        if (hit.instanceId === undefined || hit.instanceId === null) continue;
+        const ud = hit.object.userData;
+        return { mesh: hit.object, instanceId: hit.instanceId, kind: ud.kind,
+                 asset: ud.assetData ? ud.assetData[hit.instanceId] : null };
+    }
+    return null;
+}
+
+function updateHighlight() {
+    if (!camera) return;
+    ensureHighlightBox();
+    const hit = raycastInstances(_centerNdc);
+    if (!hit) { highlightBox.visible = false; hovered = null; return; }
+    hovered = hit;
+    hit.mesh.getMatrixAt(hit.instanceId, _hoverMatrix);
+    _hoverPos.setFromMatrixPosition(_hoverMatrix);
+    if (hit.kind === 'rack') {
+        highlightBox.scale.set(6, 19, 6);
+        highlightBox.position.set(_hoverPos.x, 9.5, _hoverPos.z);
+    } else {
+        highlightBox.scale.set(5.5, 0.6, 5.5);
+        highlightBox.position.set(_hoverPos.x + 1, _hoverPos.y + 0.25, _hoverPos.z);
+    }
+    highlightBox.visible = true;
+}
+
+function showInfo(hit) {
+    const panel = document.getElementById('dcInfo');
+    if (!panel || !hit || !hit.asset) return;
+    const a = hit.asset;
+    if (hit.kind === 'server') {
+        panel.innerHTML = '<div class="dc-info-title">' + escapeHtml(a.hostname || 'server') + '</div>' +
+            '<a href="/admin/?choice=none.asset_form&id=' + encodeURIComponent(a.id) +
+            '" target="_blank" rel="noopener">View asset #' + escapeHtml(String(a.id)) + ' &rarr;</a>';
+    } else {
+        panel.innerHTML = '<div class="dc-info-title">Rack ' + escapeHtml(a.name || '') + '</div>';
+    }
+    panel.style.display = 'block';
+}
+
+function searchServers(query) {
+    const q = String(query || '').trim().toLowerCase();
+    const out = [];
+    const loc = locations[options.location];
+    if (!q || !loc || !loc.racks) return out;
+    for (const rackKey of Object.keys(loc.racks)) {
+        const servers = loc.racks[rackKey].servers || {};
+        for (const sid of Object.keys(servers)) {
+            const s = servers[sid];
+            if (s.hostname && s.hostname.toLowerCase().includes(q)) {
+                out.push({ id: sid, hostname: s.hostname, rackKey });
+                if (out.length >= 12) return out;
+            }
+        }
+    }
+    return out;
+}
+
+function flyToServer(rackKey, serverId) {
+    const loc = locations[options.location];
+    if (!loc || !loc.racks[rackKey] || !loc.racks[rackKey].servers[serverId]) return;
+    const rack = loc.racks[rackKey];
+    const pos = convertServerCoordinatesToPosition(rack.x, rack.y, rack.servers[serverId].start);
+    flyTo.from.copy(camera.position);
+    flyTo.to.set(pos.x + 8, pos.y + 4, pos.z + 8);
+    flyTo.look.set(pos.x, pos.y, pos.z);
+    flyTo.t = 0;
+    flyTo.active = true;
+}
+
+function updateFlyTo() {
+    if (!flyTo.active) return;
+    flyTo.t = Math.min(1, flyTo.t + 0.012);                 // ~1.4 s glide at 60 fps
+    const e = flyTo.t * flyTo.t * (3 - 2 * flyTo.t);        // smoothstep ease
+    camera.position.lerpVectors(flyTo.from, flyTo.to, e);
+    camera.lookAt(flyTo.look);
+    if (flyTo.t >= 1) flyTo.active = false;
+}
+
+function setupInteraction() {
+    if (renderer && renderer.domElement) {
+        // A click selects whatever the camera is centred on (works in pointer-lock look mode).
+        renderer.domElement.addEventListener('click', () => { if (hovered) showInfo(hovered); });
+    }
+    const searchInput = document.getElementById('dcSearch');
+    const resultsEl = document.getElementById('dcSearchResults');
+    if (searchInput && resultsEl) {
+        searchInput.addEventListener('input', () => {
+            resultsEl.innerHTML = searchServers(searchInput.value).map((r) =>
+                '<div class="dc-res" data-rack="' + escapeHtml(r.rackKey) + '" data-id="' + escapeHtml(r.id) + '">' + escapeHtml(r.hostname) + '</div>'
+            ).join('');
+        });
+        resultsEl.addEventListener('click', (e) => {
+            const el = e.target.closest('.dc-res');
+            if (el) { flyToServer(el.dataset.rack, el.dataset.id); resultsEl.innerHTML = ''; searchInput.blur(); }
+        });
+        // don't let typing in the search box drive WASD movement
+        searchInput.addEventListener('keydown', (e) => e.stopPropagation());
+    }
+}
+
 function init() {
     // Load the datacenter information
     loadDatacenter();
@@ -729,6 +862,8 @@ function init() {
     // Add stats monitor
     stats = new Stats();
     document.body.appendChild(stats.dom);
+    // Wire up Phase 7 interaction (raycast picking + search box)
+    setupInteraction();
     // Event listener for window resize
     window.addEventListener("resize", onWindowResize);
 }
@@ -745,6 +880,9 @@ function animate() {
             updateControls(time);
         }
     }
+    // Phase 7: glide toward a search fly-to target, then highlight what we're looking at (throttled)
+    updateFlyTo();
+    if ((_hlFrame++ % 4) === 0) updateHighlight();
     // Distance-cull + lazily build labels, then render the scene
     updateLabels();
     renderer.render(scene, camera);
@@ -766,8 +904,16 @@ function updateControls(time) {
     if (options.moveForward || options.moveBackward) velocity.z -= direction.z * 400.0 * delta;
     if (options.moveLeft || options.moveRight) velocity.x -= direction.x * 400.0 * delta;
     // Update controls position
+    const prevX = camera.position.x, prevZ = camera.position.z;
     controls.moveRight(-velocity.x * delta);
     controls.moveForward(-velocity.z * delta);
+    // Collision: block walking into a rack cell (opt-in via the Movement > collisionMovement toggle)
+    if (options.collisionMovement && isRackAtPosition(camera.position.x, camera.position.z)) {
+        camera.position.x = prevX;
+        camera.position.z = prevZ;
+        velocity.x = 0;
+        velocity.z = 0;
+    }
     camera.position.y += velocity.y * delta;
     // Handle jumping
     if (camera.position.y < options.PlayerHeight) {
@@ -848,7 +994,11 @@ window.DC = {
     display: displayDatacenter,
     clear: clearScene,
     cull: updateLabels,
-    tick: function () { updateLabels(); renderer.render(scene, camera); return renderer.info.render.calls; },
+    tick: function () { updateFlyTo(); updateHighlight(); updateLabels(); renderer.render(scene, camera); return renderer.info.render.calls; },
+    pick: function () { return raycastInstances(_centerNdc); },
+    info: showInfo,
+    search: searchServers,
+    flyToServer: flyToServer,
 };
 
 init();
