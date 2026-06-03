@@ -31,6 +31,10 @@
 		#dcInfo a:hover { text-decoration: underline; }
 		#dcLoading { position: fixed; inset: 0; z-index: 40; display: flex; align-items: center;
 			justify-content: center; background: rgba(255,255,255,0.88); font: 22px Arial, sans-serif; color: #333; }
+		#dcViews { position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%); z-index: 31; display: flex; gap: 6px; }
+		#dcViews button { padding: 7px 13px; border: 1px solid #888; border-radius: 5px; cursor: pointer;
+			background: rgba(255,255,255,0.93); font: 13px Arial, sans-serif; color: #222; }
+		#dcViews button:hover { background: #ffe9a8; }
 	</style>
 </head>
 <body>
@@ -52,6 +56,13 @@
 	<input id="dcSearch" type="search" placeholder="Search hostname…" autocomplete="off" />
 	<div id="dcSearchResults"></div>
 	<div id="dcInfo"></div>
-	<script type="module" src="/js/dc.js?v=p15"></script>
+	<div id="dcViews">
+		<button data-view="overview">Overview</button>
+		<button data-view="top">Top-down</button>
+		<button data-view="aisle">Aisle</button>
+		<button data-view="labels">Labels</button>
+		<button data-view="cables">Cables</button>
+	</div>
+	<script type="module" src="/js/dc.js?v=p23"></script>
 </body>
 </html>

@@ -326,27 +326,33 @@ const _instMatrix = new THREE.Matrix4();
 const _placeMatrix = new THREE.Matrix4();
 
 function extractModelMeshes(root, scale) {
-    // Normalize the loaded model (origin, no rotation, fixed scale) and capture each
-    // sub-mesh's geometry + material + its transform in model space (scale baked in).
+    // Normalize the loaded model (origin, no rotation, fixed scale) and capture each sub-mesh's
+    // geometry + material + its transform in model space, plus the whole model's bounding box
+    // (used to size/centre the look-highlight box to the real item, e.g. its 1U/2U/3U height).
     root.position.set(0, 0, 0);
     root.rotation.set(0, 0, 0);
     root.scale.setScalar(scale);
     root.updateMatrixWorld(true);
     const parts = [];
+    const box = new THREE.Box3();
+    const _b = new THREE.Box3();
     root.traverse((n) => {
         if (n.isMesh && n.geometry) {
             parts.push({ geometry: n.geometry, material: n.material, matrix: n.matrixWorld.clone() });
+            if (!n.geometry.boundingBox) n.geometry.computeBoundingBox();
+            _b.copy(n.geometry.boundingBox).applyMatrix4(n.matrixWorld);
+            box.union(_b);
         }
     });
-    return parts;
+    return { parts, box };
 }
 
-function buildInstanced(modelParts, placements, kind) {
+function buildInstanced(model, placements, kind) {
     const n = placements.length;
-    if (!modelParts || n === 0) return;
+    if (!model || !model.parts || n === 0) return;
     const assetIds = placements.map((p) => p.assetId);
     const assetData = placements.map((p) => p.asset);
-    for (const part of modelParts) {
+    for (const part of model.parts) {
         const inst = new THREE.InstancedMesh(part.geometry, part.material, n);
         for (let k = 0; k < n; k++) {
             const p = placements[k];
@@ -359,6 +365,8 @@ function buildInstanced(modelParts, placements, kind) {
         inst.userData.kind = kind;           // 'rack' | 'server'
         inst.userData.assetIds = assetIds;   // instanceId -> rack/server id
         inst.userData.assetData = assetData; // instanceId -> asset object (hostname/name/id)
+        inst.userData.placements = placements; // instanceId -> {x,y,z} placement (highlight box)
+        inst.userData.modelBox = model.box;    // model-space bounds (highlight box size)
         scene.add(inst);
         objects.instanced.push(inst);
     }
@@ -511,23 +519,36 @@ const LABEL_DISTANCE_SQ = LABEL_DISTANCE * LABEL_DISTANCE;
 const _labelCamPos = new THREE.Vector3();
 
 function makeLabelTexture(text) {
+    const scale = 3; // supersample the label canvas so the text stays crisp up close
+    const w = 320 * scale, h = 32 * scale;
+    const fontFamily = 'Verdana, "Segoe UI", Arial, sans-serif';
     const canvas = document.createElement('canvas');
-    canvas.width = 320;
-    canvas.height = 32;
+    canvas.width = w;
+    canvas.height = h;
     const context = canvas.getContext('2d');
-    context.font = '20px Arial';
     context.textAlign = 'center';
     context.textBaseline = 'middle';
+    if ('letterSpacing' in context) context.letterSpacing = (1.5 * scale) + 'px';
+    // fit the hostname within the label width (shrink the font for very long names so nothing clips)
+    let fontSize = 18 * scale;
+    context.font = fontSize + 'px ' + fontFamily;
+    const maxW = w - 12 * scale;
+    const measured = context.measureText(text).width;
+    if (measured > maxW) {
+        fontSize = Math.max(8 * scale, fontSize * maxW / measured);
+        context.font = fontSize + 'px ' + fontFamily;
+    }
     context.fillStyle = 'white';
-    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.fillRect(0, 0, w, h);
     context.strokeStyle = 'gray';
-    context.lineWidth = 2;
-    context.strokeText(text, 160, 16);
+    context.lineWidth = 2 * scale;
+    context.strokeText(text, w / 2, h / 2);
     context.fillStyle = 'black';
-    context.lineWidth = 1;
-    context.fillText(text, 160, 16);
+    context.lineWidth = 1 * scale;
+    context.fillText(text, w / 2, h / 2);
     const texture = new THREE.CanvasTexture(canvas);
     texture.colorSpace = THREE.SRGBColorSpace;
+    texture.anisotropy = maxAnisotropy || 1; // sharpen at oblique viewing angles
     return texture;
 }
 
@@ -572,31 +593,93 @@ function updateLabels() {
 const CABLE_SIDE = 3;      // x offset from rack base to the side cable channel
 const CABLE_REAR = -2;     // z offset to the rear of the rack (cables exit the back)
 const CABLE_OVERHEAD = 22; // y height of the overhead cable tray (above the racks)
-const CABLE_RADIUS = 0.07;  // cable thickness in world units (true scale ~0.03; a bit thicker so it reads)
+const CABLE_END = 5;       // how far beyond a rack group's end racks the cables turn out
+const CABLE_SPREAD = 1.1;  // per-cable offset so bundled cables sit beside each other, not on one line
+const CABLE_RADIUS = 0.05;  // cable thickness in world units (true scale ~0.03; a touch thicker so it reads)
 const CABLE_RADIAL = 6;     // tube cross-section sides (6 = round-looking)
 // Cable colours: random-ish per cable for now (could key off link speed later). Blue-dominant
 // with yellow + green accents, like a real patch field.
-const CABLE_COLORS = [0x2a5bd7, 0x2a5bd7, 0xe2c044, 0x33aa55];
+const CABLE_COLORS = [ // 60% blue, 30% yellow, 10% green
+    0x2a5bd7, 0x2a5bd7, 0x2a5bd7, 0x2a5bd7, 0x2a5bd7, 0x2a5bd7,
+    0xe2c044, 0xe2c044, 0xe2c044,
+    0x33aa55,
+];
 const _cableColor = new THREE.Color();
+const _cdir1 = new THREE.Vector3();
+const _cdir2 = new THREE.Vector3();
+
+function makeRng(seed) {
+    // deterministic per-cable RNG (so sag is varied but stable across rebuilds)
+    let s = (seed >>> 0) || 1;
+    return () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s / 4294967296; };
+}
+
+function pushCableSag(out, a, b, rng) {
+    // long, mostly-horizontal runs bow down in a FEW humps (1-2 usually, 4 max) at random
+    // positions and depths, like a draped cable bundle -- not an even repeating scallop.
+    const horiz = Math.hypot(b.x - a.x, b.z - a.z);
+    if (horiz <= 9 || Math.abs(b.y - a.y) > 1.6) return;
+    let n = Math.min(4, 1 + Math.floor(horiz / 34)); // longer runs allow more humps
+    if (n > 1 && rng() < 0.45) n -= 1;               // often drop one -> mostly 1-2 humps
+    const dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+    let prevT = 0;
+    for (let i = 0; i < n; i++) {
+        const lo = i / n, hi = (i + 1) / n;
+        const t = lo + (0.25 + rng() * 0.5) * (hi - lo);                       // jittered hump position
+        if (i > 0) {
+            const tt = (prevT + t) / 2;                                       // tie point (back up) between humps
+            out.push(new THREE.Vector3(a.x + dx * tt, a.y + dy * tt, a.z + dz * tt));
+        }
+        const depth = Math.min(2.8, (horiz / n) * 0.14) * (0.55 + rng() * 0.8); // varied depth
+        out.push(new THREE.Vector3(a.x + dx * t, a.y + dy * t - depth, a.z + dz * t));
+        prevT = t;
+    }
+}
+
+function cableCurvePoints(corners, rng) {
+    // Mostly-straight runs with only a small rounded fillet at each bend (the cable arcs just a
+    // little at corners) + a few random sag humps on long spans, rather than one big bowing spline.
+    const FILLET = 1.6;
+    const out = [corners[0].clone()];
+    for (let i = 1; i < corners.length - 1; i++) {
+        const prev = corners[i - 1], cur = corners[i], next = corners[i + 1];
+        _cdir1.subVectors(cur, prev); const lin = _cdir1.length(); _cdir1.normalize();
+        _cdir2.subVectors(next, cur); const lout = _cdir2.length(); _cdir2.normalize();
+        const fin = Math.min(FILLET, lin * 0.45), fout = Math.min(FILLET, lout * 0.45);
+        const approach = cur.clone().addScaledVector(_cdir1, -fin);
+        pushCableSag(out, out[out.length - 1], approach, rng);
+        out.push(approach);                                  // end of the straight run
+        out.push(cur.clone().addScaledVector(_cdir2, fout)); // start of the next run (rounds the corner)
+    }
+    pushCableSag(out, out[out.length - 1], corners[corners.length - 1], rng);
+    out.push(corners[corners.length - 1].clone());
+    return out;
+}
 
 function displaySwitches() {
     // One merged tube mesh for ALL switchport cabling (1 draw call): each cable is a rounded 3D
-    // tube (matte "plastic" cylinder) that follows real structured-cabling routing instead of a
-    // straight line through the air: out the back of the system -> to the rack's side cable
-    // channel -> up to the overhead tray -> across the hall -> down the destination rack's side
-    // -> into the asset. Same-rack links stay short (no trip to the ceiling). Cables sharing a
-    // rack bundle on the shared side channel.
+    // tube (matte "plastic" cylinder) routed like real structured cabling. Racks form groups
+    // (contiguous runs within a row). A cable goes out the back -> up to its row's overhead tray
+    // -> along to the nearest END of its group -> trunk across to the destination group's nearest
+    // end -> along that row to the asset. Same-rack links stay short; same-group links run along
+    // the shared row tray without leaving the group.
     const racks = locations[options.location].racks;
     const tubes = [];
-    const addCable = (pts, hex) => {
+    const addCable = (pts, hex, off, seed) => {
         const vecs = [];
-        for (const p of pts) {
-            const v = new THREE.Vector3(p[0], p[1], p[2]);
+        for (let k = 0; k < pts.length; k++) {
+            const p = pts[k];
+            let x = p[0], y = p[1], z = p[2];
+            // offset the middle of the route (not the exact port/asset ends) so bundled cables spread
+            if (off && k > 0 && k < pts.length - 1) { x += off.x; y += off.y; z += off.z; }
+            const v = new THREE.Vector3(x, y, z);
             if (vecs.length === 0 || vecs[vecs.length - 1].distanceToSquared(v) > 1e-6) vecs.push(v);
         }
         if (vecs.length < 2) return;
-        const curve = new THREE.CatmullRomCurve3(vecs);
-        const tubular = Math.max(8, (vecs.length - 1) * 4);
+        let len = 0;
+        for (let i = 1; i < vecs.length; i++) len += vecs[i - 1].distanceTo(vecs[i]);
+        const curve = new THREE.CatmullRomCurve3(cableCurvePoints(vecs, makeRng(seed || 1)));
+        const tubular = Math.min(220, Math.max(10, Math.round(len / 2.2)));
         const geo = new THREE.TubeGeometry(curve, tubular, CABLE_RADIUS, CABLE_RADIAL, false);
         const count = geo.attributes.position.count;
         const colors = new Float32Array(count * 3);
@@ -609,10 +692,27 @@ function displaySwitches() {
         geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
         tubes.push(geo);
     };
+    // Group racks into contiguous runs within each row (rack.y); a group's "ends" are its
+    // leftmost / rightmost racks (plus CABLE_END), and its row tray runs along the rear at z=rowZ.
+    const rows = {};
+    for (const k of Object.keys(racks)) { const r = racks[k]; (rows[r.y] = rows[r.y] || new Set()).add(r.x); }
+    const groupOf = (gx, gy) => {
+        const set = rows[gy];
+        let xMin = gx, xMax = gx;
+        if (set) { while (set.has(xMin - 1)) xMin--; while (set.has(xMax + 1)) xMax++; }
+        return { y: gy, xMin, xMax };
+    };
+    const groupEnds = (g) => {
+        const left = convertRackCoordinatesToPosition(g.xMin, g.y);
+        const right = convertRackCoordinatesToPosition(g.xMax, g.y);
+        return { leftX: left.x - CABLE_END, rightX: right.x + CABLE_END, rowZ: left.z + CABLE_REAR };
+    };
     for (const rackKey of Object.keys(racks)) {
         const rack = racks[rackKey];
         const baseA = convertRackCoordinatesToPosition(rack.x, rack.y);
         const sideAx = baseA.x + CABLE_SIDE, rearAz = baseA.z + CABLE_REAR;
+        const srcGroup = groupOf(rack.x, rack.y);
+        const srcEnds = groupEnds(srcGroup);
         for (const switchId of Object.keys(rack.switches)) {
             const switchData = rack.switches[switchId];
             const { x: positionX, y: positionY, z: positionZ } = convertServerCoordinatesToPosition(rack.x, rack.y, switchData.start);
@@ -630,34 +730,54 @@ function displaySwitches() {
                 if (!destServer) { continue; } // endpoint not in the loaded location (e.g. cross-DC link)
                 const ret = convertServerCoordinatesToPosition(destRack.x, destRack.y, destServer.start);
                 const ex = ret.x, ey = ret.y, ez = ret.z;
-                const baseB = convertRackCoordinatesToPosition(destRack.x, destRack.y);
-                // small per-cable lane offset so a rack's cables read as a bundle, not one line
-                const lane = (((portData.justport % 12) - 6) * 0.08);
-                const sAx = sideAx + lane;
-                const sBx = baseB.x + CABLE_SIDE + lane, rearBz = baseB.z + CABLE_REAR;
-                const sameRack = (String(portData.datacenter) === String(options.location)) && (String(portData.rack) === String(rackKey));
                 const cableHex = CABLE_COLORS[(((Number(switchId) || 0) + portData.justport * 3) % CABLE_COLORS.length + CABLE_COLORS.length) % CABLE_COLORS.length];
+                const seed = (((Number(switchId) || 0) * 131 + portData.justport * 17 + 1) >>> 0);
+                const off = {
+                    x: (((seed * 53) % 1000) / 1000 - 0.5) * CABLE_SPREAD,
+                    y: (((seed * 29) % 1000) / 1000 - 0.5) * CABLE_SPREAD * 0.6,
+                    z: (((seed * 97) % 1000) / 1000 - 0.5) * CABLE_SPREAD,
+                };
+                const sameRack = (String(portData.datacenter) === String(options.location)) && (String(portData.rack) === String(rackKey));
+                const destGroup = groupOf(destRack.x, destRack.y);
+                const sameGroup = (String(portData.datacenter) === String(options.location))
+                    && destGroup.y === srcGroup.y && destGroup.xMin === srcGroup.xMin && destGroup.xMax === srcGroup.xMax;
                 if (sameRack) {
+                    // switch -> server in the SAME rack: short hop via the rack's side channel
                     addCable([
-                        [px, py, pz],          // port (front of switch)
-                        [px, py, rearAz],      // out the back
-                        [sAx, py, rearAz],     // to the side cable channel
-                        [sAx, ey, rearAz],     // up/down the side to the asset height
-                        [ex, ey, rearAz],      // across to the asset's column (rear)
-                        [ex, ey, ez]           // into the asset (front)
-                    ], cableHex);
+                        [px, py, pz],
+                        [px, py, rearAz],
+                        [sideAx, py, rearAz],
+                        [sideAx, ey, rearAz],
+                        [ex, ey, rearAz],
+                        [ex, ey, ez]
+                    ], cableHex, off, seed);
+                } else if (sameGroup) {
+                    // same row/group: up to the row's overhead tray, along it to the destination rack
+                    addCable([
+                        [px, py, pz],
+                        [px, py, rearAz],
+                        [px, CABLE_OVERHEAD, rearAz],
+                        [ex, CABLE_OVERHEAD, rearAz],
+                        [ex, ey, rearAz],
+                        [ex, ey, ez]
+                    ], cableHex, off, seed);
                 } else {
+                    // different rack group: out the nearest END of the source group, trunk across to
+                    // the nearest END of the destination group, then along that row to the asset
+                    const destEnds = groupEnds(destGroup);
+                    const srcEndX = Math.abs(srcEnds.leftX - ex) <= Math.abs(srcEnds.rightX - ex) ? srcEnds.leftX : srcEnds.rightX;
+                    const destEndX = Math.abs(destEnds.leftX - srcEndX) <= Math.abs(destEnds.rightX - srcEndX) ? destEnds.leftX : destEnds.rightX;
                     addCable([
-                        [px, py, pz],               // port (front of switch)
-                        [px, py, rearAz],           // out the back
-                        [sAx, py, rearAz],          // to the side cable channel
-                        [sAx, CABLE_OVERHEAD, rearAz], // up the side, past the top, to the overhead tray
-                        [sBx, CABLE_OVERHEAD, rearAz], // overhead run across the hall (x)
-                        [sBx, CABLE_OVERHEAD, rearBz], // overhead run to the destination row (z)
-                        [sBx, ey, rearBz],          // down the destination rack's side
-                        [ex, ey, rearBz],           // across to the asset's column (rear)
-                        [ex, ey, ez]                // into the asset (front)
-                    ], cableHex);
+                        [px, py, pz],
+                        [px, py, rearAz],
+                        [px, CABLE_OVERHEAD, rearAz],              // up to the row tray
+                        [srcEndX, CABLE_OVERHEAD, rearAz],         // along the row to the chosen end
+                        [srcEndX, CABLE_OVERHEAD, destEnds.rowZ],  // trunk across to the destination row
+                        [destEndX, CABLE_OVERHEAD, destEnds.rowZ], // along the trunk to the destination group's end
+                        [ex, CABLE_OVERHEAD, destEnds.rowZ],       // along the destination row to the asset's rack
+                        [ex, ey, destEnds.rowZ],                   // down at the destination rack
+                        [ex, ey, ez]                               // into the asset
+                    ], cableHex, off, seed);
                 }
             }
         }
@@ -665,7 +785,8 @@ function displaySwitches() {
     if (tubes.length === 0) { objects.network = null; return; }
     const geometry = BufferGeometryUtils.mergeGeometries(tubes, false);
     tubes.forEach((g) => g.dispose());
-    const material = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.85, metalness: 0.0 });
+    // matte plastic base + a clearcoat layer for a slight gloss / rounded depth on the cables
+    const material = new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: 0.6, metalness: 0.0, clearcoat: 0.6, clearcoatRoughness: 0.25 });
     const cables = new THREE.Mesh(geometry, material);
     cables.visible = options.showNetwork;
     cables.frustumCulled = false;
@@ -732,6 +853,7 @@ const raycaster = new THREE.Raycaster();
 const _centerNdc = new THREE.Vector2(0, 0);   // screen centre = "what you're looking at"
 const _hoverMatrix = new THREE.Matrix4();
 const _hoverPos = new THREE.Vector3();
+const _hoverSize = new THREE.Vector3();
 let highlightBox = null;
 let hovered = null;                            // { mesh, instanceId, kind, asset }
 let _hlFrame = 0;
@@ -771,14 +893,19 @@ function updateHighlight() {
     const hit = raycastInstances(_centerNdc);
     if (!hit) { highlightBox.visible = false; hovered = null; return; }
     hovered = hit;
-    hit.mesh.getMatrixAt(hit.instanceId, _hoverMatrix);
-    _hoverPos.setFromMatrixPosition(_hoverMatrix);
-    if (hit.kind === 'rack') {
-        highlightBox.scale.set(6, 19, 6);
-        highlightBox.position.set(_hoverPos.x, 9.5, _hoverPos.z);
+    const ud = hit.mesh.userData;
+    const pl = ud.placements && ud.placements[hit.instanceId];
+    if (pl && ud.modelBox && !ud.modelBox.isEmpty()) {
+        // size + centre the box to the actual model bounds (matches the item's 1U/2U/3U footprint)
+        ud.modelBox.getCenter(_hoverPos);
+        ud.modelBox.getSize(_hoverSize);
+        highlightBox.scale.set(_hoverSize.x + 0.25, _hoverSize.y + 0.12, _hoverSize.z + 0.25);
+        highlightBox.position.set(_hoverPos.x + pl.x, _hoverPos.y + pl.y, _hoverPos.z + pl.z);
     } else {
-        highlightBox.scale.set(5.5, 0.6, 5.5);
-        highlightBox.position.set(_hoverPos.x + 1, _hoverPos.y + 0.25, _hoverPos.z);
+        hit.mesh.getMatrixAt(hit.instanceId, _hoverMatrix);
+        _hoverPos.setFromMatrixPosition(_hoverMatrix);
+        highlightBox.scale.set(6, hit.kind === 'rack' ? 19 : 1, 6);
+        highlightBox.position.copy(_hoverPos);
     }
     highlightBox.visible = true;
 }
@@ -836,11 +963,63 @@ function updateFlyTo() {
     if (flyTo.t >= 1) flyTo.active = false;
 }
 
+function sceneBounds() {
+    const loc = locations[options.location];
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    if (loc && loc.racks) {
+        for (const k of Object.keys(loc.racks)) {
+            const p = convertRackCoordinatesToPosition(loc.racks[k].x, loc.racks[k].y);
+            if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+            if (p.z < minZ) minZ = p.z; if (p.z > maxZ) maxZ = p.z;
+        }
+    }
+    if (!isFinite(minX)) { minX = maxX = minZ = maxZ = 0; }
+    return { cx: (minX + maxX) / 2, cz: (minZ + maxZ) / 2, w: maxX - minX, d: maxZ - minZ, minX, maxX, minZ, maxZ };
+}
+
+function viewPreset(name) {
+    const b = sceneBounds();
+    const span = Math.max(b.w, b.d, 40);
+    if (name === 'top') return { pos: [b.cx, span * 0.8 + 25, b.cz + 4], look: [b.cx, 0, b.cz] };
+    if (name === 'overview') return { pos: [b.maxX + span * 0.3, span * 0.5, b.maxZ + span * 0.4], look: [b.cx, 8, b.cz] };
+    if (name === 'aisle') return { pos: [b.cx, 14, b.maxZ + 6], look: [b.cx, 12, b.minZ - 5] };
+    if (name === 'cables') return { pos: [b.minX - 14, 30, b.cz + 8], look: [b.cx, 17, b.cz] };
+    if (name === 'labels') {
+        const racks = locations[options.location].racks;
+        let best = null, bestD = Infinity;
+        for (const k of Object.keys(racks)) {
+            const p = convertRackCoordinatesToPosition(racks[k].x, racks[k].y);
+            const d = (p.x - b.cx) * (p.x - b.cx) + (p.z - b.cz) * (p.z - b.cz);
+            if (d < bestD) { bestD = d; best = p; }
+        }
+        if (best) return { pos: [best.x + 1.1, 13, best.z + 10], look: [best.x + 1.1, 13, best.z + 2.8] };
+    }
+    return { pos: [b.cx, 18, b.maxZ + 22], look: [b.cx, 10, b.cz] };
+}
+
+function setView(name) {
+    const v = viewPreset(name);
+    flyTo.from.copy(camera.position);
+    flyTo.to.set(v.pos[0], v.pos[1], v.pos[2]);
+    flyTo.look.set(v.look[0], v.look[1], v.look[2]);
+    flyTo.t = 0;
+    flyTo.active = true;
+    if (controls && controls.isLocked) controls.unlock();
+    const bl = document.getElementById('blocker'); if (bl) bl.style.display = 'none';
+}
+
 function setupInteraction() {
     if (renderer && renderer.domElement) {
-        // A click selects whatever the camera is centred on (works in pointer-lock look mode).
-        renderer.domElement.addEventListener('click', () => { if (hovered) showInfo(hovered); });
+        // Click to start walking (pointer lock); while walking, a click selects what you're looking at.
+        renderer.domElement.addEventListener('click', () => {
+            if (controls && !options.useFirstPerson && controls.isLocked === false) controls.lock();
+            else if (hovered) showInfo(hovered);
+        });
     }
+    // Preset "show-off" camera views
+    document.querySelectorAll('#dcViews button[data-view]').forEach((btn) => {
+        btn.addEventListener('click', () => setView(btn.dataset.view));
+    });
     const searchInput = document.getElementById('dcSearch');
     const resultsEl = document.getElementById('dcSearchResults');
     if (searchInput && resultsEl) {
@@ -872,6 +1051,10 @@ function init() {
     const light = new THREE.HemisphereLight(0xeeeeff, 0x777788, 2.5);
     light.position.set(0.5, 1, 0.75);
     scene.add(light);
+    // soft directional light so cables (and racks) get specular highlights / depth, not flat ambient
+    const sun = new THREE.DirectionalLight(0xffffff, 1.1);
+    sun.position.set(60, 120, 40);
+    scene.add(sun);
     // Set up the renderer
     renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
