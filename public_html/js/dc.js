@@ -17,6 +17,7 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import * as SkeletonUtils from "three/addons/utils/SkeletonUtils.js";
 import GUI from 'lil-gui';
 import Stats from "three/addons/libs/stats.module.js";
+import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 let camera, scene, renderer, controls, controlObject, stats, gui, locations = {}, maxAnisotropy; // Declare global variables
 let prevTime = performance.now();
 let racksShown = false, showServers = true;
@@ -45,6 +46,7 @@ const vertex = new THREE.Vector3();
 const color = new THREE.Color();
 //const loaderDae = new ColladaLoader();
 const loaderGltf = new GLTFLoader();
+loaderGltf.setMeshoptDecoder(MeshoptDecoder); // decode EXT_meshopt_compression GLBs
 const rackTypes = [
 	'',
 	"1182_096_2",
@@ -289,25 +291,33 @@ function isRackAtPosition(positionX, positionZ) {
     return false; // No racks found at the given coordinates
 }
 
-function optimizedGlbUrl(basePath, relName) {
-    // Insert the "webp-simplify/" subdir before the final path component so both bare
-    // names ("1182_096_2") and nested names ("gltf/exported-centered/Rack") map to their
-    // optimized variant on disk.
+// GLB variant subdirs to try, best-compression first; '' = the full original model.
+// meshopt:       geometry quantized + EXT_meshopt_compression (decoded by MeshoptDecoder)
+// webp-simplify: decimated geometry + webp textures
+// Both mirror the model's own path, so the same name resolves across all three.
+const GLB_VARIANTS = ['meshopt', 'webp-simplify', ''];
+
+function glbVariantUrl(basePath, relName, variant) {
+    if (!variant) return basePath + relName + '.glb';
+    // Insert the variant subdir before the final path component so both bare names
+    // ("1182_096_2") and nested names ("gltf/exported-centered/Rack") resolve.
     const slash = relName.lastIndexOf('/');
     const dir = slash >= 0 ? relName.slice(0, slash + 1) : '';
     const file = slash >= 0 ? relName.slice(slash + 1) : relName;
-    return basePath + dir + 'webp-simplify/' + file + '.glb';
+    return basePath + dir + variant + '/' + file + '.glb';
 }
 
 function loadGlbWithFallback(basePath, relName, onLoad) {
-    const optimized = optimizedGlbUrl(basePath, relName);
-    const plain = basePath + relName + '.glb';
-    loaderGltf.load(optimized, onLoad, undefined, function () {
-        // No webp-simplify variant on disk for this model -- fall back to the full model.
-        loaderGltf.load(plain, onLoad, undefined, function (err) {
-            console.error('Failed to load model: ' + plain, err);
-        });
-    });
+    let i = 0;
+    const tryNext = () => {
+        const url = glbVariantUrl(basePath, relName, GLB_VARIANTS[i]);
+        const isLast = i === GLB_VARIANTS.length - 1;
+        i += 1;
+        loaderGltf.load(url, onLoad, undefined, isLast
+            ? (err) => console.error('Failed to load model (all variants): ' + url, err)
+            : tryNext);
+    };
+    tryNext();
 }
 
 function getRackModels() {
