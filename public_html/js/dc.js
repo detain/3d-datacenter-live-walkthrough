@@ -834,39 +834,35 @@ function displaySwitches() {
                 const destGroup = groupOf(destRack.x, destRack.y);
                 const sameGroup = (String(portData.datacenter) === String(options.location))
                     && destGroup.y === srcGroup.y && destGroup.xMin === srcGroup.xMin && destGroup.xMax === srcGroup.xMax;
-                if (sameRack) {
-                    // switch -> server in the SAME rack: front port, straight back to the rear
-                    // riser, then across to the server's BACK (no side channel)
+                // Switch end: come out the FRONT port, up the rack face, and over the top to the rear
+                // tray (so switch patches route around the front, not straight back through the box).
+                const switchStart = [
+                    [px, py, pz],                 // front port
+                    [px, py, pz + 2.5],           // out the front a bit
+                    [px, 19.5, pz + 2.5],         // up the front of the rack
+                    [px, CABLE_OVERHEAD, rearAz], // over the top to the rear overhead tray
+                ];
+                if (sameRack || sameGroup) {
+                    // along the overhead to the server's column, then drop BEHIND it and come straight in
                     addCable([
-                        [px, py, pz],
-                        [px, py, rearAz],
-                        [px, ey, rearAz],
-                        [ex, ey, rearAz]
-                    ], cableHex, off, seed);
-                } else if (sameGroup) {
-                    // same row/group: up to the row's overhead tray, along it, down into the server BACK
-                    addCable([
-                        [px, py, pz],
-                        [px, py, rearAz],
-                        [px, CABLE_OVERHEAD, rearAz],
+                        ...switchStart,
                         [ex, CABLE_OVERHEAD, rearAz],
-                        [ex, ey, rearAz]
+                        [ex, ey, rearAz - 3.5],   // back a bit more behind the system
+                        [ex, ey, rearAz],         // straight in to its back
                     ], cableHex, off, seed);
                 } else {
-                    // different rack group: out the nearest END of the source group, trunk across to
-                    // the nearest END of the destination group, then along that row into the server BACK
+                    // different rack group: trunk across via the row ends, then into the server's BACK
                     const destEnds = groupEnds(destGroup);
                     const srcEndX = Math.abs(srcEnds.leftX - ex) <= Math.abs(srcEnds.rightX - ex) ? srcEnds.leftX : srcEnds.rightX;
                     const destEndX = Math.abs(destEnds.leftX - srcEndX) <= Math.abs(destEnds.rightX - srcEndX) ? destEnds.leftX : destEnds.rightX;
                     addCable([
-                        [px, py, pz],
-                        [px, py, rearAz],
-                        [px, CABLE_OVERHEAD, rearAz],              // up to the row tray
+                        ...switchStart,
                         [srcEndX, CABLE_OVERHEAD, rearAz],         // along the row to the chosen end
                         [srcEndX, CABLE_OVERHEAD, destEnds.rowZ],  // trunk across to the destination row
                         [destEndX, CABLE_OVERHEAD, destEnds.rowZ], // along the trunk to the destination group's end
                         [ex, CABLE_OVERHEAD, destEnds.rowZ],       // along the destination row to the asset's rack
-                        [ex, ey, destEnds.rowZ]                    // down into the server's back
+                        [ex, ey, destEnds.rowZ - 3.5],             // back a bit more behind the system
+                        [ex, ey, destEnds.rowZ],                   // straight in to its back
                     ], cableHex, off, seed);
                 }
             }
@@ -1006,6 +1002,25 @@ function makeSignTexture(text) {
 	g.fillText(text, w / 2, h / 2 + 2);
 	const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAnisotropy || 1; return t;
 }
+const WIN_SZ = 72 * UNITS_PER_INCH; // 6 ft privacy-glass windows
+// Exterior detailing for a building: a door + dark "privacy glass" windows on the front + sides.
+// Visible from outside (dark glass hides what's behind); the current building's solid walls still
+// occlude the interior from outdoors.
+function addBuildingExterior(parent, px, pz, w, d, H) {
+	const glass = new THREE.MeshPhysicalMaterial({ color: 0x0e1622, metalness: 0.0, roughness: 0.06, transparent: true, opacity: 0.62, reflectivity: 0.7, envMapIntensity: 2.2, side: THREE.DoubleSide });
+	const fz = pz + d / 2, ddx = px - w * 0.20;
+	const frame = new THREE.Mesh(new THREE.BoxGeometry(8.5, 17.5, 0.6), new THREE.MeshStandardMaterial({ color: 0x6b5a44, roughness: 0.75 })); frame.position.set(ddx, 8.9, fz + 0.25); parent.add(frame);
+	const door = new THREE.Mesh(new THREE.BoxGeometry(7.5, 16.5, 0.4), new THREE.MeshStandardMaterial({ color: 0x4a3c2c, roughness: 0.7 })); door.position.set(ddx, 8.4, fz + 0.45); parent.add(door);
+	const knob = new THREE.Mesh(new THREE.SphereGeometry(0.35, 10, 10), new THREE.MeshStandardMaterial({ color: 0xd9c46a, metalness: 0.8, roughness: 0.3 })); knob.position.set(ddx + 2.8, 8.4, fz + 0.7); parent.add(knob);
+	const wy = H * 0.5;
+	for (let wx = px - w / 2 + 14; wx <= px + w / 2 - 14; wx += WIN_SZ + 10) {
+		if (Math.abs(wx - ddx) < WIN_SZ) continue;
+		const win = new THREE.Mesh(new THREE.PlaneGeometry(WIN_SZ, WIN_SZ), glass); win.position.set(wx, wy, fz + 0.12); parent.add(win);
+	}
+	for (const sx of [px - w / 2, px + w / 2]) for (const sz of [pz - d * 0.22, pz + d * 0.22]) {
+		const win = new THREE.Mesh(new THREE.PlaneGeometry(WIN_SZ, WIN_SZ), glass); win.rotation.y = Math.PI / 2; win.position.set(sx + (sx > px ? 0.12 : -0.12), wy, sz); parent.add(win);
+	}
+}
 function buildCommunity() {
 	const ids = Object.keys(locationNames).map((n) => Number(locationNames[n])).filter((id) => locationLoaded(id));
 	ids.sort((a, b) => locName(a).localeCompare(locName(b)));
@@ -1030,6 +1045,7 @@ function buildCommunity() {
 		const roof = new THREE.Mesh(new THREE.BoxGeometry(f.w + 4, 1.5, f.d + 4), roofMat); roof.position.set(px, H + 0.75, pz); grp.add(roof);
 		const sign = new THREE.Mesh(new THREE.PlaneGeometry(Math.min(f.w * 0.7, 46), 11), new THREE.MeshBasicMaterial({ map: makeSignTexture(locName(id)) }));
 		sign.position.set(px, H * 0.66, pz + f.d / 2 + 0.4); grp.add(sign);
+		addBuildingExterior(grp, px, pz, f.w, f.d, H);
 	}
 	scene.add(grp); objects.community = grp;
 }
@@ -1172,6 +1188,7 @@ function buildRoom() {
 	floorTex.repeat.set(Math.max(1, Math.round(W / (4 * tu))), Math.max(1, Math.round(D / (4 * tu))));
 	const floor = new THREE.Mesh(new THREE.PlaneGeometry(W, D), new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.9 }));
 	floor.rotation.x = -Math.PI / 2; floor.position.set(cx, 0, cz); group.add(floor);
+	addBuildingExterior(walls, cx, cz, W, D, ROOM_CEIL_Y); // exterior door + windows on this building too
 
 	walls.visible = options.showWalls;
 	ceiling.visible = options.showCeiling;
@@ -1419,12 +1436,11 @@ function viewPreset(name) {
 
 function setView(name, keepBlocker) {
     const v = viewPreset(name);
-    // Overhead/exterior views look at the layout from above/outside the room shell, where the walls
-    // and ceiling would just block the view -> hide them for those; interior views honor the toggles.
+    // The current building keeps its walls/ceiling in every view (so it looks like the others in the
+    // community); use the GUI ceiling toggle for a roof-off peek inside.
     if (objects.room) {
-        const exterior = (name === 'top' || name === 'overview');
-        objects.room.walls.visible = exterior ? false : options.showWalls;
-        objects.room.ceiling.visible = exterior ? false : options.showCeiling;
+        objects.room.walls.visible = options.showWalls;
+        objects.room.ceiling.visible = options.showCeiling;
     }
     flyTo.from.copy(camera.position);
     flyTo.to.set(v.pos[0], v.pos[1], v.pos[2]);
