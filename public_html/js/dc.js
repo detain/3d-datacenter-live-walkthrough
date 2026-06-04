@@ -20,12 +20,14 @@ import * as BufferGeometryUtils from "three/addons/utils/BufferGeometryUtils.js"
 let camera, scene, renderer, controls, controlObject, stats, gui, locations = {}, maxAnisotropy; // Declare global variables
 let prevTime = performance.now();
 let racksShown = false, showServers = true;
-let objects = {instanced: [], network: null, rackLabels: [], labels: []}, models = { racks: {}, servers: {} }, locationNames = {};
+let objects = {instanced: [], network: null, rackLabels: [], labels: [], room: null}, models = { racks: {}, servers: {} }, locationNames = {};
 let rackColliders = []; // x/z footprints of placed racks (for collision)
 const options = {
     useFirstPerson: false,
     showLabels: true,
     showNetwork: true,
+    showWalls: true,    // room walls (built from the rack-layout bounds)
+    showCeiling: true,  // ceiling + fluorescent fixtures + HVAC ducts
 	moveForward: false,
 	moveBackward: false,
 	moveLeft: false,
@@ -136,6 +138,7 @@ const serverTypes = [
 
 function displayDatacenter() {
     clearScene();
+    buildRoom();
     getRackModels();
     getServerModels();
     displaySwitches();
@@ -151,6 +154,8 @@ function displayGui() {
     const displayFolder = gui.addFolder( 'Display' );
     displayFolder.add(options, 'showLabels'); // honored per-frame by updateLabels()
     displayFolder.add(options, 'showNetwork').onChange( (value) => { setNetworkVisible(value); });
+    displayFolder.add(options, 'showWalls').name('walls').onChange((v) => { if (objects.room) objects.room.walls.visible = v; });
+    displayFolder.add(options, 'showCeiling').name('ceiling').onChange((v) => { if (objects.room) objects.room.ceiling.visible = v; });
     displayFolder.add(options, 'useFirstPerson').onChange( () => { setupControls(); });
     const moveFolder = gui.addFolder( 'Movement' );
     moveFolder.add( options, 'canJump').listen().disable();
@@ -162,10 +167,12 @@ function displayGui() {
 			moveFolder.add( options, 'moveForward').listen().disable();
 			moveFolder.add( options, 'moveBackward').listen().disable();*/
     moveFolder.add( options, 'collisionMovement');
-    moveFolder.add( options, 'heightInches', 42, 96, 1 ).name( 'height (in)' ).onChange(() => {
-        camera.position.y = eyeHeight();
-    });
-    moveFolder.add( options, 'waistInches', 15, 60, 1 ).name( 'waist (in)' );
+    // height shown as feet+inches (e.g. 5' 10"), waist as plain inches (e.g. 36") via dropdowns,
+    // since lil-gui number sliders can't reformat their numeric readout.
+    const heightChoices = {}; for (let i = 42; i <= 96; i++) heightChoices[`${Math.floor(i / 12)}' ${i % 12}"`] = i;
+    const waistChoices = {}; for (let i = 15; i <= 60; i++) waistChoices[`${i}"`] = i;
+    moveFolder.add( options, 'heightInches', heightChoices ).name( 'height' ).onChange(() => { camera.position.y = eyeHeight(); });
+    moveFolder.add( options, 'waistInches', waistChoices ).name( 'waist' );
     moveFolder.open(false);
 }
 function mergeLocations(data) {
@@ -243,6 +250,19 @@ function clearScene() {
             sprite.material.dispose();
         }
         objects[bucket] = [];
+    }
+    // Room shell (walls / ceiling / fluorescent fixtures / ducts): a Group of plain meshes whose
+    // geometries + materials are built fresh per location, so dispose them all on rebuild.
+    if (objects.room) {
+        scene.remove(objects.room.group);
+        objects.room.group.traverse((n) => {
+            if (n.isMesh) {
+                n.geometry.dispose();
+                if (Array.isArray(n.material)) n.material.forEach((m) => m.dispose());
+                else n.material.dispose();
+            }
+        });
+        objects.room = null;
     }
 }
 
@@ -818,6 +838,77 @@ function loadFloor() {
 	scene.add(helper);
 }
 
+// Room shell built around the racks. We have no real room dimensions in the data, so derive them
+// from the rack-layout bounds + a margin. Produces 4 walls + a ceiling, with fluorescent strip
+// fixtures and HVAC ducts along the top. Walls and ceiling are independently toggleable.
+const ROOM_MARGIN = 14;   // gap from the outermost rack footprints to the walls
+const ROOM_CEIL_Y = 30;   // ceiling height (~11.7 ft at this scene scale; racks are ~20 / ~7.8 ft)
+function buildRoom() {
+	const racksObj = (locations[options.location] || {}).racks || {};
+	let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+	for (const k in racksObj) {
+		const r = racksObj[k];
+		const p = convertRackCoordinatesToPosition(r.x, r.y);
+		minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+		minZ = Math.min(minZ, p.z); maxZ = Math.max(maxZ, p.z);
+	}
+	if (!isFinite(minX)) return; // no racks in this location -> no room
+	// push the walls out past the rack footprints (+/-4) by the margin
+	minX -= 4 + ROOM_MARGIN; maxX += 4 + ROOM_MARGIN;
+	minZ -= 4 + ROOM_MARGIN; maxZ += 4 + ROOM_MARGIN;
+	const W = maxX - minX, D = maxZ - minZ, cx = (minX + maxX) / 2, cz = (minZ + maxZ) / 2;
+
+	const group = new THREE.Group();
+	const walls = new THREE.Group();
+	const ceiling = new THREE.Group();
+	group.add(walls); group.add(ceiling);
+
+	const wallMat = new THREE.MeshStandardMaterial({ color: 0xc4c8d0, roughness: 0.95, metalness: 0.0, side: THREE.DoubleSide });
+	const ceilMat = new THREE.MeshStandardMaterial({ color: 0xb0b4bc, roughness: 0.95, metalness: 0.0, side: THREE.DoubleSide });
+
+	// 4 walls (full-height vertical planes), one per side
+	const wN = new THREE.Mesh(new THREE.PlaneGeometry(W, ROOM_CEIL_Y), wallMat); wN.position.set(cx, ROOM_CEIL_Y / 2, minZ); walls.add(wN);
+	const wS = new THREE.Mesh(new THREE.PlaneGeometry(W, ROOM_CEIL_Y), wallMat); wS.position.set(cx, ROOM_CEIL_Y / 2, maxZ); walls.add(wS);
+	const wW = new THREE.Mesh(new THREE.PlaneGeometry(D, ROOM_CEIL_Y), wallMat); wW.rotation.y = Math.PI / 2; wW.position.set(minX, ROOM_CEIL_Y / 2, cz); walls.add(wW);
+	const wE = new THREE.Mesh(new THREE.PlaneGeometry(D, ROOM_CEIL_Y), wallMat); wE.rotation.y = Math.PI / 2; wE.position.set(maxX, ROOM_CEIL_Y / 2, cz); walls.add(wE);
+
+	// ceiling (horizontal plane, facing down into the room)
+	const ceil = new THREE.Mesh(new THREE.PlaneGeometry(W, D), ceilMat); ceil.rotation.x = Math.PI / 2; ceil.position.set(cx, ROOM_CEIL_Y, cz); ceiling.add(ceil);
+
+	// fluorescent strip fixtures: parallel rows spanning the room in x, just below the ceiling.
+	// Merge all housings into one mesh and all lenses into one -> 2 draw calls for every fixture.
+	const housings = [], lenses = [];
+	const fixLenX = W - 2 * ROOM_MARGIN;
+	const fixW = Math.max(0.85, 4 * UNITS_PER_INCH); // ~4" wide strip
+	const rows = Math.max(1, Math.round(D / 14));
+	for (let i = 0; i < rows; i++) {
+		const z = minZ + (D * (i + 0.5) / rows);
+		const hg = new THREE.BoxGeometry(fixLenX, 0.5, fixW + 0.5); hg.translate(cx, ROOM_CEIL_Y - 0.5, z); housings.push(hg);
+		const lg = new THREE.BoxGeometry(fixLenX - 0.6, 0.25, fixW);  lg.translate(cx, ROOM_CEIL_Y - 0.78, z); lenses.push(lg);
+	}
+	const housingMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(housings), new THREE.MeshStandardMaterial({ color: 0x3a3d44, roughness: 0.6, metalness: 0.3 }));
+	housings.forEach((g) => g.dispose());
+	const lensMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(lenses), new THREE.MeshBasicMaterial({ color: 0xfdfff0 })); // unlit -> always reads as a lit tube
+	lenses.forEach((g) => g.dispose());
+	ceiling.add(housingMesh); ceiling.add(lensMesh);
+
+	// HVAC ducts: big galvanized rectangular runs along the two long sides, up near the ceiling.
+	// Low metalness (no env map in the scene, so high metalness would render near-black).
+	const ducts = [];
+	const ductLen = W - 2 * ROOM_MARGIN, ductW = 6, ductH = 4, ductY = ROOM_CEIL_Y - 3;
+	for (const zside of [minZ + ROOM_MARGIN * 0.7, maxZ - ROOM_MARGIN * 0.7]) {
+		const dg = new THREE.BoxGeometry(ductLen, ductH, ductW); dg.translate(cx, ductY, zside); ducts.push(dg);
+	}
+	const ductMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(ducts), new THREE.MeshStandardMaterial({ color: 0xb8bcc2, roughness: 0.5, metalness: 0.15 }));
+	ducts.forEach((g) => g.dispose());
+	ceiling.add(ductMesh);
+
+	walls.visible = options.showWalls;
+	ceiling.visible = options.showCeiling;
+	scene.add(group);
+	objects.room = { group, walls, ceiling };
+}
+
 let keyHandlersAttached = false;
 
 function attachKeyHandlers() {
@@ -1015,6 +1106,13 @@ function viewPreset(name) {
 
 function setView(name) {
     const v = viewPreset(name);
+    // Overhead/exterior views look at the layout from above/outside the room shell, where the walls
+    // and ceiling would just block the view -> hide them for those; interior views honor the toggles.
+    if (objects.room) {
+        const exterior = (name === 'top' || name === 'overview');
+        objects.room.walls.visible = exterior ? false : options.showWalls;
+        objects.room.ceiling.visible = exterior ? false : options.showCeiling;
+    }
     flyTo.from.copy(camera.position);
     flyTo.to.set(v.pos[0], v.pos[1], v.pos[2]);
     flyTo.look.set(v.look[0], v.look[1], v.look[2]);
