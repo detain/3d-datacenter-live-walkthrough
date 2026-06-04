@@ -231,8 +231,14 @@ function buildLocationButtons() {
     entries.sort((a, b) => a.name.localeCompare(b.name));
     for (const { name, id } of entries) {
         const btn = document.createElement('button');
-        btn.textContent = name;
+        // collapsed label = the bit before the first space or dash (e.g. "DFW1", "TEB3");
+        // the full name shows only on hover (CSS swaps the two spans).
+        const short = name.split(/[\s-]+/)[0] || name;
+        const sEl = document.createElement('span'); sEl.className = 'dc-loc-short'; sEl.textContent = short;
+        const fEl = document.createElement('span'); fEl.className = 'dc-loc-full'; fEl.textContent = name;
+        btn.appendChild(sEl); btn.appendChild(fEl);
         btn.dataset.loc = id;
+        btn.title = name;
         if (id === Number(options.location)) btn.classList.add('active');
         btn.addEventListener('click', () => {
             if (Number(options.location) === id) return;
@@ -675,11 +681,11 @@ const CABLE_SPREAD = 1.1;  // per-cable offset so bundled cables sit beside each
 const CABLE_RADIUS = 0.05;  // cable thickness in world units (true scale ~0.03; a touch thicker so it reads)
 const CABLE_RADIAL = 6;     // tube cross-section sides (6 = round-looking)
 // Cable colours: random-ish per cable for now (could key off link speed later). Blue-dominant
-// with yellow + green accents, like a real patch field.
-const CABLE_COLORS = [ // 60% blue, 30% yellow, 10% green
-    0x2a5bd7, 0x2a5bd7, 0x2a5bd7, 0x2a5bd7, 0x2a5bd7, 0x2a5bd7,
-    0xe2c044, 0xe2c044, 0xe2c044,
-    0x33aa55,
+// with blue + orange accents, like a real patch field.
+const CABLE_COLORS = [ // 60% yellow, 20% blue, 20% orange
+    0xe2c044, 0xe2c044, 0xe2c044, 0xe2c044, 0xe2c044, 0xe2c044,
+    0x2a5bd7, 0x2a5bd7,
+    0xe8771a, 0xe8771a,
 ];
 const _cableColor = new THREE.Color();
 const _cdir1 = new THREE.Vector3();
@@ -1109,12 +1115,34 @@ function buildRoom() {
 	roomSpawn = { x: cx, z: maxZ - ROOM_MARGIN * 0.5, lookX: cx, lookZ: cz };
 }
 
-// Drop the player at a safe spot inside the walls, facing into the room.
+// Drop the player at a safe spot inside the walls, facing the racks. If the default spot is blocked
+// (it can land in a rack on some layouts), scan the open perimeter margin for a clear spot so we
+// never spawn stuck inside a rack.
 function spawnInside() {
     if (!roomSpawn || !camera) return;
-    camera.position.set(roomSpawn.x, eyeHeight(), roomSpawn.z);
+    const r = playerRadius();
+    let sx = roomSpawn.x, sz = roomSpawn.z;
+    if (collidesAt(sx, sz, r)) { const o = findOpenSpawn(r); if (o) { sx = o.x; sz = o.z; } }
+    camera.position.set(sx, eyeHeight(), sz);
     camera.lookAt(roomSpawn.lookX, eyeHeight(), roomSpawn.lookZ);
     velocity.set(0, 0, 0);
+}
+
+// Scan the open margin band around the racks for the first spot a player of radius r fits.
+function findOpenSpawn(r) {
+    if (!roomBounds) return null;
+    const m = ROOM_MARGIN, step = 4;
+    for (const z of [roomBounds.maxZ - m * 0.5, roomBounds.minZ + m * 0.5]) {  // along the z walls
+        for (let x = roomBounds.minX + m; x <= roomBounds.maxX - m; x += step) {
+            if (!collidesAt(x, z, r)) return { x, z };
+        }
+    }
+    for (const x of [roomBounds.maxX - m * 0.5, roomBounds.minX + m * 0.5]) {  // along the x walls
+        for (let z = roomBounds.minZ + m; z <= roomBounds.maxZ - m; z += step) {
+            if (!collidesAt(x, z, r)) return { x, z };
+        }
+    }
+    return { x: (roomBounds.minX + roomBounds.maxX) / 2, z: (roomBounds.minZ + roomBounds.maxZ) / 2 };
 }
 
 let keyHandlersAttached = false;
@@ -1158,9 +1186,11 @@ function setupControls() {
             flyTo.active = false;
             velocity.set(0, 0, 0);
             prevTime = performance.now();
-            // if locked from an exterior demo view (outside the walls or up high), drop back inside
+            // if locked from a demo view that left us outside the walls, up high, or INSIDE a rack
+            // (e.g. the close-up label view), drop back to a clear spot facing the racks
             const p = camera.position;
-            if (!roomBounds || p.x < roomBounds.minX || p.x > roomBounds.maxX || p.z < roomBounds.minZ || p.z > roomBounds.maxZ || p.y > 24) spawnInside();
+            const outside = !roomBounds || p.x < roomBounds.minX || p.x > roomBounds.maxX || p.z < roomBounds.minZ || p.z > roomBounds.maxZ || p.y > 24;
+            if (outside || collidesAt(p.x, p.z, playerRadius())) spawnInside();
         });
         controls.addEventListener("unlock", function () {
             blocker.style.display = "block";
@@ -1336,6 +1366,8 @@ function setView(name, keepBlocker) {
     flyTo.active = true;
     if (controls && controls.isLocked) controls.unlock();
     if (!keepBlocker) { const bl = document.getElementById('blocker'); if (bl) bl.style.display = 'none'; }
+    // highlight the matching preset button so the idle demo shows which view it's currently on
+    document.querySelectorAll('#dcViews button[data-view]').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
 }
 
 // When the pointer-lock prompt is showing (user not engaged) and the tab is visible, slowly cycle
