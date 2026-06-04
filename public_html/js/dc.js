@@ -31,6 +31,7 @@ const options = {
     showNetwork: true,
     showWalls: true,    // room walls (built from the rack-layout bounds)
     showCeiling: true,  // ceiling + fluorescent fixtures + HVAC ducts
+    faultyLights: 1,    // number of fixtures that flicker (0..20; 1 = a corner one)
 	moveForward: false,
 	moveBackward: false,
 	moveLeft: false,
@@ -161,6 +162,7 @@ function displayGui() {
     displayFolder.add(options, 'showNetwork').onChange( (value) => { setNetworkVisible(value); });
     displayFolder.add(options, 'showWalls').name('walls').onChange((v) => { if (objects.room) objects.room.walls.visible = v; });
     displayFolder.add(options, 'showCeiling').name('ceiling').onChange((v) => { if (objects.room) objects.room.ceiling.visible = v; });
+    displayFolder.add(options, 'faultyLights', 0, 20, 1).name('faulty lights').onFinishChange(() => displayDatacenter());
     displayFolder.add(options, 'useFirstPerson').onChange( () => { setupControls(); });
     const moveFolder = gui.addFolder( 'Movement' );
     moveFolder.add( options, 'canJump').listen().disable();
@@ -213,12 +215,12 @@ function locationLoaded(locId) {
 function switchLocation() {
     const el = document.getElementById('dcLocations');
     if (el) el.querySelectorAll('button').forEach((b) => b.classList.toggle('active', Number(b.dataset.loc) === Number(options.location)));
-    // Fetch the location's data on demand (cached after first load), then (re)build the scene.
+    // Fly out of the current building and down into the new one (data is already loaded up front).
     if (locationLoaded(options.location)) {
-        displayDatacenter();
+        flyTransition(options.location);
     } else {
         fetchLocation(options.location)
-            .then(() => displayDatacenter())
+            .then(() => flyTransition(options.location))
             .catch((error) => console.error('There was a problem loading the location:', error));
     }
 }
@@ -1002,23 +1004,81 @@ function makeSignTexture(text) {
 	g.fillText(text, w / 2, h / 2 + 2);
 	const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAnisotropy || 1; return t;
 }
-const WIN_SZ = 72 * UNITS_PER_INCH; // 6 ft privacy-glass windows
-// Exterior detailing for a building: a door + dark "privacy glass" windows on the front + sides.
-// Visible from outside (dark glass hides what's behind); the current building's solid walls still
-// occlude the interior from outdoors.
+const WIN_SZ = 96 * UNITS_PER_INCH;     // 8 ft windows
+const WIN_BOTTOM = 18 * UNITS_PER_INCH; // sill ~1.5 ft off the ground
+const MULLION = 3 * UNITS_PER_INCH;     // 3" matte-black metal frame between adjacent windows
+// Exterior detailing: a long ribbon of 8' "privacy glass" windows (dark from outside) with
+// matte-black mullions between them, plus a door near the middle of the front ribbon.
 function addBuildingExterior(parent, px, pz, w, d, H) {
-	const glass = new THREE.MeshPhysicalMaterial({ color: 0x0e1622, metalness: 0.0, roughness: 0.06, transparent: true, opacity: 0.62, reflectivity: 0.7, envMapIntensity: 2.2, side: THREE.DoubleSide });
-	const fz = pz + d / 2, ddx = px - w * 0.20;
+	const glass = makeGlassMaterial();
+	const mullMat = new THREE.MeshStandardMaterial({ color: 0x0a0a0a, roughness: 0.95, metalness: 0.25 });
+	const winY = WIN_BOTTOM + WIN_SZ / 2, pitch = WIN_SZ + MULLION;
+	// ribbon of windows centred on a wall. side 'z' = front/back (vary x); side 'x' = sides (vary z).
+	const ribbon = (centreAlong, fixed, avail, side, withDoor) => {
+		const count = Math.max(1, Math.floor(avail / pitch));
+		const start = centreAlong - (count * pitch - MULLION) / 2 + WIN_SZ / 2;
+		const doorIdx = withDoor ? Math.floor(count / 2) : -1;
+		for (let i = 0; i < count; i++) {
+			const a = start + i * pitch;
+			if (i !== doorIdx) {
+				const win = new THREE.Mesh(new THREE.PlaneGeometry(WIN_SZ, WIN_SZ), glass);
+				if (side === 'x') { win.rotation.y = Math.PI / 2; win.position.set(fixed, winY, a); } else win.position.set(a, winY, fixed);
+				parent.add(win);
+			}
+			if (i < count - 1) {
+				const m = new THREE.Mesh(side === 'x' ? new THREE.BoxGeometry(0.5, WIN_SZ, MULLION) : new THREE.BoxGeometry(MULLION, WIN_SZ, 0.5), mullMat);
+				if (side === 'x') m.position.set(fixed, winY, a + pitch / 2); else m.position.set(a + pitch / 2, winY, fixed);
+				parent.add(m);
+			}
+		}
+		return { doorAt: start + (doorIdx < 0 ? 0 : doorIdx) * pitch };
+	};
+	const fz = pz + d / 2;
+	const ddx = ribbon(px, fz + 0.12, w - 8, 'z', true).doorAt;  // front ribbon + a centred door
 	const frame = new THREE.Mesh(new THREE.BoxGeometry(8.5, 17.5, 0.6), new THREE.MeshStandardMaterial({ color: 0x6b5a44, roughness: 0.75 })); frame.position.set(ddx, 8.9, fz + 0.25); parent.add(frame);
 	const door = new THREE.Mesh(new THREE.BoxGeometry(7.5, 16.5, 0.4), new THREE.MeshStandardMaterial({ color: 0x4a3c2c, roughness: 0.7 })); door.position.set(ddx, 8.4, fz + 0.45); parent.add(door);
 	const knob = new THREE.Mesh(new THREE.SphereGeometry(0.35, 10, 10), new THREE.MeshStandardMaterial({ color: 0xd9c46a, metalness: 0.8, roughness: 0.3 })); knob.position.set(ddx + 2.8, 8.4, fz + 0.7); parent.add(knob);
-	const wy = H * 0.5;
-	for (let wx = px - w / 2 + 14; wx <= px + w / 2 - 14; wx += WIN_SZ + 10) {
-		if (Math.abs(wx - ddx) < WIN_SZ) continue;
-		const win = new THREE.Mesh(new THREE.PlaneGeometry(WIN_SZ, WIN_SZ), glass); win.position.set(wx, wy, fz + 0.12); parent.add(win);
+	ribbon(pz, px + w / 2 + 0.12, d - 8, 'x', false);            // right side ribbon
+	ribbon(pz, px - w / 2 - 0.12, d - 8, 'x', false);            // left side ribbon
+}
+// Slightly-tinted glass: clear enough to read as a regular window from inside (you see out), with a
+// light sheen + reflection that gives it a glassy/reflective look from outside.
+function makeGlassMaterial() {
+	return new THREE.MeshPhysicalMaterial({ color: 0x9fb6c4, metalness: 0.0, roughness: 0.05, transparent: true, opacity: 0.26, reflectivity: 0.6, envMapIntensity: 1.5, clearcoat: 0.6, clearcoatRoughness: 0.05, side: THREE.DoubleSide });
+}
+// A wall with a real ribbon of 8' windows: solid below the sill + above the head, a glass band (with
+// matte-black mullions) between -> see-through from inside, reflective from outside. axis 'x' spans x
+// (z = fixed); 'z' spans z (x = fixed). doorC = door centre along the wall, or null.
+function windowWall(parent, axis, fixed, c0, c1, H, wallMat, glass, mullMat, doorC) {
+	const len = c1 - c0, cen = (c0 + c1) / 2, th = 0.4;
+	const sill = WIN_BOTTOM, head = WIN_BOTTOM + WIN_SZ, DOOR_H = 17.5;
+	const wall = (w, h, along, y) => { const g = axis === 'x' ? new THREE.BoxGeometry(w, h, th) : new THREE.BoxGeometry(th, h, w); const m = new THREE.Mesh(g, wallMat); axis === 'x' ? m.position.set(along, y, fixed) : m.position.set(fixed, y, along); parent.add(m); };
+	wall(len, H - head, cen, (head + H) / 2);                        // top strip (above the windows)
+	if (doorC == null) { wall(len, sill, cen, sill / 2); }           // bottom strip (below the windows)
+	else {
+		const dw = 9, lL = (doorC - dw / 2) - c0, rL = c1 - (doorC + dw / 2);
+		if (lL > 1) wall(lL, sill, c0 + lL / 2, sill / 2);
+		if (rL > 1) wall(rL, sill, c1 - rL / 2, sill / 2);
+		wall(dw, head - DOOR_H, doorC, (DOOR_H + head) / 2);         // panel above the door
+		const dg = axis === 'x' ? new THREE.BoxGeometry(dw, DOOR_H, 0.5) : new THREE.BoxGeometry(0.5, DOOR_H, dw);
+		const dm = new THREE.Mesh(dg, new THREE.MeshStandardMaterial({ color: 0x4a3c2c, roughness: 0.7 }));
+		axis === 'x' ? dm.position.set(doorC, DOOR_H / 2, fixed) : dm.position.set(fixed, DOOR_H / 2, doorC); parent.add(dm);
+		const kb = new THREE.Mesh(new THREE.SphereGeometry(0.35, 10, 10), new THREE.MeshStandardMaterial({ color: 0xd9c46a, metalness: 0.8, roughness: 0.3 }));
+		axis === 'x' ? kb.position.set(doorC + 3, 9, fixed) : kb.position.set(fixed, 9, doorC + 3); parent.add(kb);
 	}
-	for (const sx of [px - w / 2, px + w / 2]) for (const sz of [pz - d * 0.22, pz + d * 0.22]) {
-		const win = new THREE.Mesh(new THREE.PlaneGeometry(WIN_SZ, WIN_SZ), glass); win.rotation.y = Math.PI / 2; win.position.set(sx + (sx > px ? 0.12 : -0.12), wy, sz); parent.add(win);
+	const pitch = WIN_SZ + MULLION, count = Math.max(1, Math.floor(len / pitch));
+	const start = cen - (count * pitch - MULLION) / 2 + WIN_SZ / 2, midY = (sill + head) / 2;
+	for (let i = 0; i < count; i++) {
+		const a = start + i * pitch;
+		if (doorC == null || Math.abs(a - doorC) >= WIN_SZ * 0.55) {
+			const gm = new THREE.Mesh(new THREE.PlaneGeometry(WIN_SZ, WIN_SZ), glass);
+			if (axis === 'z') gm.rotation.y = Math.PI / 2;
+			axis === 'x' ? gm.position.set(a, midY, fixed) : gm.position.set(fixed, midY, a); parent.add(gm);
+		}
+		if (i < count - 1) {
+			const mg = axis === 'x' ? new THREE.BoxGeometry(MULLION, WIN_SZ, 0.5) : new THREE.BoxGeometry(0.5, WIN_SZ, MULLION);
+			const mm = new THREE.Mesh(mg, mullMat); axis === 'x' ? mm.position.set(a + pitch / 2, midY, fixed) : mm.position.set(fixed, midY, a + pitch / 2); parent.add(mm);
+		}
 	}
 }
 function buildCommunity() {
@@ -1074,59 +1134,59 @@ function buildRoom() {
 	ceilTex.repeat.set(Math.max(1, Math.round(W / CEIL_TILE)), Math.max(1, Math.round(D / CEIL_TILE)));
 	const ceilMat = new THREE.MeshStandardMaterial({ map: ceilTex, color: 0xffffff, roughness: 0.95, metalness: 0.0, emissive: 0x2a2a2a, side: THREE.DoubleSide });
 
-	// 4 walls (full-height vertical planes), one per side
-	const wN = new THREE.Mesh(new THREE.PlaneGeometry(W, ROOM_CEIL_Y), wallMat); wN.position.set(cx, ROOM_CEIL_Y / 2, minZ); walls.add(wN);
-	const wS = new THREE.Mesh(new THREE.PlaneGeometry(W, ROOM_CEIL_Y), wallMat); wS.position.set(cx, ROOM_CEIL_Y / 2, maxZ); walls.add(wS);
-	const wW = new THREE.Mesh(new THREE.PlaneGeometry(D, ROOM_CEIL_Y), wallMat); wW.rotation.y = Math.PI / 2; wW.position.set(minX, ROOM_CEIL_Y / 2, cz); walls.add(wW);
-	const wE = new THREE.Mesh(new THREE.PlaneGeometry(D, ROOM_CEIL_Y), wallMat); wE.rotation.y = Math.PI / 2; wE.position.set(maxX, ROOM_CEIL_Y / 2, cz); walls.add(wE);
+	// 4 window-walls (solid strips + a see-through glass ribbon), the front one with a door
+	const glass = makeGlassMaterial();
+	const mullMat = new THREE.MeshStandardMaterial({ color: 0x0a0a0a, roughness: 0.95, metalness: 0.25 });
+	windowWall(walls, 'x', minZ, minX, maxX, ROOM_CEIL_Y, wallMat, glass, mullMat, null); // back
+	windowWall(walls, 'x', maxZ, minX, maxX, ROOM_CEIL_Y, wallMat, glass, mullMat, cx);   // front + door
+	windowWall(walls, 'z', minX, minZ, maxZ, ROOM_CEIL_Y, wallMat, glass, mullMat, null); // left
+	windowWall(walls, 'z', maxX, minZ, maxZ, ROOM_CEIL_Y, wallMat, glass, mullMat, null); // right
 
 	// ceiling (horizontal plane, facing down into the room)
 	const ceil = new THREE.Mesh(new THREE.PlaneGeometry(W, D), ceilMat); ceil.rotation.x = Math.PI / 2; ceil.position.set(cx, ROOM_CEIL_Y, cz); ceiling.add(ceil);
 
-	// Fluorescent fixtures: rows of troffers across the room. Each fixture holds 4 parallel bulbs,
-	// and each bulb run is broken into 4-ft segments with a 1" gap, so the runs look segmented.
-	// Housings merged into one mesh, bulbs into one (unlit -> always read as bright lit tubes).
-	const housings = [], bulbs = [];
+	// Fluorescent fixtures: a grid of 4-ft troffers (each 4 parallel bulbs) across the ceiling.
+	// Non-faulty bulbs are merged into one mesh; the "faulty" ones (options.faultyLights) are built
+	// as their own meshes so maybeFlicker() can blink each like a dying tube -- 1 faulty sits in a
+	// corner slot, more are scattered. Housings (the dark frames) stay as merged full rows.
+	const housings = [], bulbs = [], faultyMeshes = [];
 	const fixLenX = W - 2 * ROOM_MARGIN;
 	const fixStartX = cx - fixLenX / 2, fixEndX = cx + fixLenX / 2;
-	const BULB_LEN = 48 * UNITS_PER_INCH;   // 4 ft bulb segment
-	const BULB_GAP = 1 * UNITS_PER_INCH;    // 1" break between segments
-	const BULB_W = 3 * UNITS_PER_INCH;      // ~3" tube
+	const BULB_LEN = 48 * UNITS_PER_INCH, BULB_GAP = 1 * UNITS_PER_INCH, BULB_W = 3 * UNITS_PER_INCH;
 	const bulbDz = [-1.65, -0.55, 0.55, 1.65]; // 4 bulbs across the ~4.4-wide fixture
 	const fixRows = Math.max(1, Math.round(D / 18));
 	const bulbY = ROOM_CEIL_Y - 0.95, housingY = ROOM_CEIL_Y - 0.6;
+	// enumerate every troffer slot (a 4-ft, 4-bulb fixture position), row-major
+	const slots = [];
 	for (let i = 0; i < fixRows; i++) {
 		const z = minZ + (D * (i + 0.5) / fixRows);
 		const hg = new THREE.BoxGeometry(fixLenX + 0.5, 0.7, 4.4); hg.translate(cx, housingY, z); housings.push(hg);
-		for (const dz of bulbDz) {
-			for (let sx = fixStartX; sx < fixEndX - 0.05; sx += BULB_LEN + BULB_GAP) {
-				const segLen = Math.min(BULB_LEN, fixEndX - sx);
-				const bg = new THREE.BoxGeometry(segLen, 0.28, BULB_W); bg.translate(sx + segLen / 2, bulbY, z + dz); bulbs.push(bg);
-			}
+		for (let sx = fixStartX; sx < fixEndX - 0.05; sx += BULB_LEN + BULB_GAP) {
+			const len = Math.min(BULB_LEN, fixEndX - sx);
+			slots.push({ x: sx + len / 2, len, z });
 		}
 	}
+	// pick faulty slots: a corner slot first (last row, last segment), the rest random
+	const nFaulty = Math.max(0, Math.min(20, Math.round(options.faultyLights || 0)));
+	const faultyIdx = new Set();
+	if (nFaulty >= 1 && slots.length) {
+		faultyIdx.add(slots.length - 1);
+		let guard = 0;
+		while (faultyIdx.size < nFaulty && faultyIdx.size < slots.length && guard++ < 800) faultyIdx.add(Math.floor(Math.random() * slots.length));
+	}
+	slots.forEach((s, idx) => {
+		const segs = [];
+		for (const dz of bulbDz) { const bg = new THREE.BoxGeometry(s.len, 0.28, BULB_W); bg.translate(s.x, bulbY, s.z + dz); segs.push(bg); }
+		if (faultyIdx.has(idx)) {
+			const m = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(segs), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+			segs.forEach((g) => g.dispose()); m.userData = {}; ceiling.add(m); faultyMeshes.push(m);
+		} else {
+			for (const g of segs) bulbs.push(g);
+		}
+	});
 	const housingMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(housings), new THREE.MeshStandardMaterial({ color: 0x2c2f35, roughness: 0.6, metalness: 0.3 }));
-	housings.forEach((g) => g.dispose());
-	const bulbMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(bulbs), new THREE.MeshBasicMaterial({ color: 0xffffff })); // pure-white unlit tubes
-	bulbs.forEach((g) => g.dispose());
-	ceiling.add(housingMesh); ceiling.add(bulbMesh);
-
-	// One small fixture near a corner that "fails": its own mesh so animate's maybeFlicker() can
-	// blink it off/on independently of the grid (like a dying fluorescent tube).
-	const flickSegs = 2, flickZ = minZ + 4, flickX0 = fixStartX + 5;
-	const flickBulbs = [];
-	for (const dz of bulbDz) {
-		for (let s = 0; s < flickSegs; s++) {
-			const sx = flickX0 + s * (BULB_LEN + BULB_GAP);
-			const bg = new THREE.BoxGeometry(BULB_LEN, 0.28, BULB_W); bg.translate(sx + BULB_LEN / 2, bulbY, flickZ + dz); flickBulbs.push(bg);
-		}
-	}
-	const flickRun = flickSegs * (BULB_LEN + BULB_GAP);
-	const flickHg = new THREE.BoxGeometry(flickRun + 0.5, 0.7, 4.4); flickHg.translate(flickX0 + flickRun / 2 - BULB_GAP / 2, housingY, flickZ);
-	ceiling.add(new THREE.Mesh(flickHg, new THREE.MeshStandardMaterial({ color: 0x2c2f35, roughness: 0.6, metalness: 0.3 })));
-	const flickMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(flickBulbs), new THREE.MeshBasicMaterial({ color: 0xffffff }));
-	flickBulbs.forEach((g) => g.dispose());
-	ceiling.add(flickMesh);
+	housings.forEach((g) => g.dispose()); ceiling.add(housingMesh);
+	if (bulbs.length) { const bulbMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(bulbs), new THREE.MeshBasicMaterial({ color: 0xffffff })); bulbs.forEach((g) => g.dispose()); ceiling.add(bulbMesh); }
 
 	// HVAC ductwork + pipes hung just below the ceiling -- a few runs in different spots, mixed
 	// rectangular ducts + round pipes. Galvanized steel: high metalness reflecting the env map.
@@ -1188,12 +1248,11 @@ function buildRoom() {
 	floorTex.repeat.set(Math.max(1, Math.round(W / (4 * tu))), Math.max(1, Math.round(D / (4 * tu))));
 	const floor = new THREE.Mesh(new THREE.PlaneGeometry(W, D), new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.9 }));
 	floor.rotation.x = -Math.PI / 2; floor.position.set(cx, 0, cz); group.add(floor);
-	addBuildingExterior(walls, cx, cz, W, D, ROOM_CEIL_Y); // exterior door + windows on this building too
 
 	walls.visible = options.showWalls;
 	ceiling.visible = options.showCeiling;
 	scene.add(group);
-	objects.room = { group, walls, ceiling, flicker: flickMesh };
+	objects.room = { group, walls, ceiling, faulty: faultyMeshes };
 	// wall colliders + a safe spawn spot (open margin near the maxZ wall, looking into the room)
 	roomBounds = { minX, maxX, minZ, maxZ };
 	roomSpawn = { x: cx, z: maxZ - ROOM_MARGIN * 0.5, lookX: cx, lookZ: cz };
@@ -1393,11 +1452,32 @@ function flyToServer(rackKey, serverId) {
 
 function updateFlyTo() {
     if (!flyTo.active) return;
-    flyTo.t = Math.min(1, flyTo.t + 0.012);                 // ~1.4 s glide at 60 fps
+    flyTo.t = Math.min(1, flyTo.t + (flyTo.speed || 0.012)); // ~1.4 s glide at 60 fps
     const e = flyTo.t * flyTo.t * (3 - 2 * flyTo.t);        // smoothstep ease
     camera.position.lerpVectors(flyTo.from, flyTo.to, e);
     camera.lookAt(flyTo.look);
-    if (flyTo.t >= 1) flyTo.active = false;
+    if (flyTo.t >= 1) { flyTo.active = false; const cb = flyTo.onDone; flyTo.onDone = null; if (cb) cb(); }
+}
+
+// Changing locations: float up out of the current building, rebuild for the new one, then descend
+// into it -- a quick (~3s) transition instead of an instant jump.
+function flyTransition(toLoc) {
+    const oldCx = roomBounds ? (roomBounds.minX + roomBounds.maxX) / 2 : camera.position.x;
+    const oldCz = roomBounds ? (roomBounds.minZ + roomBounds.maxZ) / 2 : camera.position.z;
+    flyTo.from.copy(camera.position);
+    flyTo.to.set(oldCx, 175, oldCz);
+    flyTo.look.set(oldCx, 0, oldCz);
+    flyTo.t = 0; flyTo.speed = 0.016; flyTo.active = true;   // phase 1: rise out (~1.1s)
+    flyTo.onDone = () => {
+        options.location = toLoc;
+        displayDatacenter();                                 // rebuild the new location (spawns inside)
+        const s = roomSpawn || { x: 0, z: 0, lookX: 0, lookZ: 0 };
+        camera.position.set(s.x, 175, s.z);                  // start high above the new building...
+        flyTo.from.copy(camera.position);
+        flyTo.to.set(s.x, eyeHeight(), s.z);
+        flyTo.look.set(s.lookX, eyeHeight(), s.lookZ);
+        flyTo.t = 0; flyTo.speed = 0.012; flyTo.active = true; flyTo.onDone = null; // phase 2: descend in
+    };
 }
 
 function sceneBounds() {
@@ -1447,6 +1527,7 @@ function setView(name, keepBlocker) {
     flyTo.look.set(v.look[0], v.look[1], v.look[2]);
     flyTo.t = 0;
     flyTo.active = true;
+    flyTo.onDone = null; flyTo.speed = 0.012; // not a location transition
     if (controls && controls.isLocked) controls.unlock();
     if (!keepBlocker) { const bl = document.getElementById('blocker'); if (bl) bl.style.display = 'none'; }
     // highlight the matching preset button so the idle demo shows which view it's currently on
@@ -1460,7 +1541,7 @@ const IDLE_VIEWS = ['overview', 'aisle', 'labels', 'cables', 'top'];
 const IDLE_VIEW_MS = 5000;
 let idleLastSwitch = performance.now(), idleViewIdx = -1;
 function maybeCycleIdleView() {
-    if (options.useFirstPerson || !controls || controls.isLocked || document.hidden) { idleLastSwitch = performance.now(); return; }
+    if (options.useFirstPerson || !controls || controls.isLocked || document.hidden || flyTo.active) { idleLastSwitch = performance.now(); return; }
     const bl = document.getElementById('blocker');
     if (!bl || bl.style.display === 'none') { idleLastSwitch = performance.now(); return; }
     if (performance.now() - idleLastSwitch >= IDLE_VIEW_MS) {
@@ -1470,18 +1551,21 @@ function maybeCycleIdleView() {
     }
 }
 
-// The corner "failing" fixture (objects.room.flicker): mostly on, but every few seconds it stutters
-// off/on for a moment like a dying fluorescent tube. Toggles only that one bulb mesh's visibility.
-let flickNext = performance.now() + 4000, flickBurstEnd = 0, flickToggleAt = 0;
+// Each "faulty" fixture (objects.room.faulty) flickers on its own clock: mostly lit, but every few
+// seconds it stutters off/on for a moment like a dying fluorescent tube.
 function maybeFlicker() {
-    const f = objects.room && objects.room.flicker;
-    if (!f) return;
+    const arr = objects.room && objects.room.faulty;
+    if (!arr || !arr.length) return;
     const t = performance.now();
-    if (t < flickBurstEnd) {
-        if (t >= flickToggleAt) { f.visible = Math.random() < 0.55; flickToggleAt = t + 45 + Math.random() * 95; }
-    } else {
-        f.visible = true; // normal: lit
-        if (t >= flickNext) { flickBurstEnd = t + 250 + Math.random() * 700; flickNext = flickBurstEnd + 2500 + Math.random() * 6500; flickToggleAt = 0; }
+    for (const f of arr) {
+        const s = f.userData;
+        if (s.next === undefined) { s.next = t + 1500 + Math.random() * 5000; s.burstEnd = 0; s.toggleAt = 0; }
+        if (t < s.burstEnd) {
+            if (t >= s.toggleAt) { f.visible = Math.random() < 0.55; s.toggleAt = t + 45 + Math.random() * 95; }
+        } else {
+            f.visible = true; // normal: lit
+            if (t >= s.next) { s.burstEnd = t + 250 + Math.random() * 700; s.next = s.burstEnd + 2500 + Math.random() * 7000; s.toggleAt = 0; }
+        }
     }
 }
 
@@ -1533,10 +1617,12 @@ function init() {
     const sun = new THREE.DirectionalLight(0xffffff, 1.1);
     sun.position.set(60, 120, 40);
     scene.add(sun);
-    // a visible sun disc up in the sky (the directional light above is its illumination)
-    const sunDisc = new THREE.Mesh(new THREE.SphereGeometry(22, 24, 16), new THREE.MeshBasicMaterial({ color: 0xfff2bf }));
-    sunDisc.position.set(360, 360, 240);
-    scene.add(sunDisc);
+    // a big, glowing sun up in the sky (the directional light above is its illumination)
+    const sunPos = new THREE.Vector3(560, 430, 360);
+    const sunCore = new THREE.Mesh(new THREE.SphereGeometry(42, 28, 20), new THREE.MeshBasicMaterial({ color: 0xfff4c8 }));
+    sunCore.position.copy(sunPos); sunCore.frustumCulled = false; scene.add(sunCore);
+    const sunGlow = new THREE.Mesh(new THREE.SphereGeometry(80, 28, 20), new THREE.MeshBasicMaterial({ color: 0xffeeaa, transparent: true, opacity: 0.32, depthWrite: false }));
+    sunGlow.position.copy(sunPos); sunGlow.frustumCulled = false; scene.add(sunGlow);
     // flat ambient fill -> overall brighter room + lifts dark undersides the hemisphere misses
     scene.add(new THREE.AmbientLight(0xfff6ec, 0.5));
     // Set up the renderer
