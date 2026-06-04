@@ -36,8 +36,8 @@ const options = {
 	moveLeft: false,
 	moveRight: false,
 	canJump: false,
-	collisionMovement: false,
-	domain: 'mystage.interserver.net',
+	collisionMovement: true,
+	domain: 'my.interserver.net',
 	location: 4,
 	heightInches: 70,   // player standing/eye height: 3.5ft (42") .. 8ft (96"), default 5'10"
 	waistInches: 36,    // player waist size -> collision radius: 15" .. 60", default 36"
