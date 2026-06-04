@@ -17,6 +17,7 @@ import GUI from 'lil-gui';
 import Stats from "three/addons/libs/stats.module.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import * as BufferGeometryUtils from "three/addons/utils/BufferGeometryUtils.js";
+import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 let camera, scene, renderer, controls, controlObject, stats, gui, locations = {}, maxAnisotropy; // Declare global variables
 let prevTime = performance.now();
 let racksShown = false, showServers = true;
@@ -363,6 +364,7 @@ function buildInstanced(model, placements, kind) {
     if (!model || !model.parts || n === 0) return;
     const assetIds = placements.map((p) => p.assetId);
     const assetData = placements.map((p) => p.asset);
+    const created = [];
     for (const part of model.parts) {
         const inst = new THREE.InstancedMesh(part.geometry, part.material, n);
         for (let k = 0; k < n; k++) {
@@ -380,6 +382,7 @@ function buildInstanced(model, placements, kind) {
         inst.userData.modelBox = model.box;    // model-space bounds (highlight box size)
         scene.add(inst);
         objects.instanced.push(inst);
+        created.push(inst);
     }
     // Racks are the only collidable furniture. model.box unions EVERY sub-mesh -- including the
     // flat floor tile under each rack (~2x the rack's width) -- so it is far too wide to collide
@@ -402,6 +405,7 @@ function buildInstanced(model, placements, kind) {
             if ((pb.max.y - pb.min.y) >= 0.2 * maxH) fb.union(pb); // skip flat floor tiles / shadows
         }
         if (!fb.isEmpty()) {
+            for (const inst of created) inst.userData.footBox = fb; // tight highlight box (excludes the wide floor tile)
             for (const p of placements) {
                 rackColliders.push({
                     minX: p.x + fb.min.x, maxX: p.x + fb.max.x,
@@ -875,18 +879,38 @@ function loadFloor() {
 // fixtures and HVAC ducts along the top. Walls and ceiling are independently toggleable.
 const ROOM_MARGIN = 14;     // gap from the outermost rack footprints to the walls
 const ROOM_CEIL_Y = 38.5;   // ceiling height (~15 ft at this scene scale; racks are ~20 / ~7.8 ft)
-const CEIL_TILE = 24 * UNITS_PER_INCH; // 2 ft drop-ceiling tiles
+const CEIL_TILE = 36 * UNITS_PER_INCH; // 3 ft drop-ceiling tiles
 
 // White drop-ceiling tile: a square panel with a slight recessed gap (the grid) around each edge,
 // so when repeated it reads as a suspended tile ceiling.
 function makeCeilingTexture() {
 	const px = 128, c = document.createElement('canvas'); c.width = c.height = px;
 	const g = c.getContext('2d');
-	g.fillStyle = '#f2f2ee'; g.fillRect(0, 0, px, px);       // white-ish panel
-	g.fillStyle = '#d6d6d0'; const gap = 6;                  // slight recessed gap between tiles
+	g.fillStyle = '#fbfbfa'; g.fillRect(0, 0, px, px);       // white panel
+	g.fillStyle = '#cdcdc8'; const gap = 5;                  // slight recessed gap (the grid) between tiles
 	g.fillRect(0, 0, px, gap); g.fillRect(0, 0, gap, px); g.fillRect(0, px - gap, px, gap); g.fillRect(px - gap, 0, gap, px);
-	for (let i = 0; i < 140; i++) { g.fillStyle = Math.random() < 0.5 ? '#e8e8e2' : '#ececE6'; g.fillRect(Math.random() * px, Math.random() * px, 1, 1); } // faint fibreboard speckle
+	for (let i = 0; i < 120; i++) { g.fillStyle = Math.random() < 0.5 ? '#f3f3f1' : '#f6f6f4'; g.fillRect(Math.random() * px, Math.random() * px, 1, 1); } // very faint fibreboard speckle
 	const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAnisotropy || 1; return t;
+}
+
+// "Lost cat" flyer for the bulletin board.
+function makeLostCatTexture() {
+	const w = 300, h = 380, c = document.createElement('canvas'); c.width = w; c.height = h;
+	const g = c.getContext('2d');
+	g.fillStyle = '#fdfdf6'; g.fillRect(0, 0, w, h);
+	g.strokeStyle = '#ccccc4'; g.lineWidth = 2; g.strokeRect(4, 4, w - 8, h - 8);
+	g.textAlign = 'center';
+	g.fillStyle = '#b00000'; g.font = 'bold 46px Arial'; g.fillText('LOST CAT', w / 2, 58);
+	// simple cat face
+	g.fillStyle = '#7a7a7a'; g.strokeStyle = '#444';
+	g.beginPath(); g.moveTo(w / 2 - 56, 150); g.lineTo(w / 2 - 30, 96); g.lineTo(w / 2 - 8, 150); g.closePath(); g.fill();
+	g.beginPath(); g.moveTo(w / 2 + 56, 150); g.lineTo(w / 2 + 30, 96); g.lineTo(w / 2 + 8, 150); g.closePath(); g.fill();
+	g.beginPath(); g.arc(w / 2, 178, 58, 0, Math.PI * 2); g.fill();
+	g.fillStyle = '#fff'; g.beginPath(); g.arc(w / 2 - 22, 172, 10, 0, 7); g.arc(w / 2 + 22, 172, 10, 0, 7); g.fill();
+	g.fillStyle = '#222'; g.beginPath(); g.arc(w / 2 - 22, 173, 4.5, 0, 7); g.arc(w / 2 + 22, 173, 4.5, 0, 7); g.fill();
+	g.fillStyle = '#333'; g.font = '21px Arial'; g.fillText('Have you seen Mittens?', w / 2, 280);
+	g.font = '16px Arial'; g.fillText('Last seen near Rack B12', w / 2, 312); g.fillText('Reward! Call x4477', w / 2, 338);
+	const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAnisotropy || 1; return t;
 }
 function buildRoom() {
 	const racksObj = (locations[options.location] || {}).racks || {};
@@ -950,34 +974,74 @@ function buildRoom() {
 	bulbs.forEach((g) => g.dispose());
 	ceiling.add(housingMesh); ceiling.add(bulbMesh);
 
-	// HVAC ductwork + pipes hung in the open space below the ceiling -- a few runs in different
-	// spots, mixed rectangular ducts + round pipes, to fill the tall overhead volume.
-	// Low metalness (no env map in the scene, so high metalness would render near-black).
+	// One small fixture near a corner that "fails": its own mesh so animate's maybeFlicker() can
+	// blink it off/on independently of the grid (like a dying fluorescent tube).
+	const flickSegs = 2, flickZ = minZ + 4, flickX0 = fixStartX + 5;
+	const flickBulbs = [];
+	for (const dz of bulbDz) {
+		for (let s = 0; s < flickSegs; s++) {
+			const sx = flickX0 + s * (BULB_LEN + BULB_GAP);
+			const bg = new THREE.BoxGeometry(BULB_LEN, 0.28, BULB_W); bg.translate(sx + BULB_LEN / 2, bulbY, flickZ + dz); flickBulbs.push(bg);
+		}
+	}
+	const flickRun = flickSegs * (BULB_LEN + BULB_GAP);
+	const flickHg = new THREE.BoxGeometry(flickRun + 0.5, 0.7, 4.4); flickHg.translate(flickX0 + flickRun / 2 - BULB_GAP / 2, housingY, flickZ);
+	ceiling.add(new THREE.Mesh(flickHg, new THREE.MeshStandardMaterial({ color: 0x2c2f35, roughness: 0.6, metalness: 0.3 })));
+	const flickMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(flickBulbs), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+	flickBulbs.forEach((g) => g.dispose());
+	ceiling.add(flickMesh);
+
+	// HVAC ductwork + pipes hung just below the ceiling -- a few runs in different spots, mixed
+	// rectangular ducts + round pipes. Galvanized steel: high metalness reflecting the env map.
 	const runX = W - 2 * ROOM_MARGIN, runZ = D - 2 * ROOM_MARGIN;
 	const ducts = [];
 	for (const r of [
-		{ z: minZ + ROOM_MARGIN * 0.8, y: ROOM_CEIL_Y - 5, w: 6, h: 4.5 },   // along x by the near wall
-		{ z: maxZ - ROOM_MARGIN * 0.8, y: ROOM_CEIL_Y - 5, w: 6, h: 4.5 },   // along x by the far wall
-		{ z: cz, y: ROOM_CEIL_Y - 8, w: 5, h: 3.5 },                          // a lower central run
+		{ z: minZ + ROOM_MARGIN * 0.8, y: ROOM_CEIL_Y - 3, w: 6, h: 4.5 },   // along x by the near wall
+		{ z: maxZ - ROOM_MARGIN * 0.8, y: ROOM_CEIL_Y - 3, w: 6, h: 4.5 },   // along x by the far wall
+		{ z: cz, y: ROOM_CEIL_Y - 4.5, w: 5, h: 3.5 },                        // a central run
 	]) { const dg = new THREE.BoxGeometry(runX, r.h, r.w); dg.translate(cx, r.y, r.z); ducts.push(dg); }
 	for (const xline of [cx - W * 0.26, cx + W * 0.22]) {                     // a couple of cross runs along z
-		const dg = new THREE.BoxGeometry(4.5, 3.2, runZ); dg.translate(xline, ROOM_CEIL_Y - 10.5, cz); ducts.push(dg);
+		const dg = new THREE.BoxGeometry(4.5, 3.2, runZ); dg.translate(xline, ROOM_CEIL_Y - 6, cz); ducts.push(dg);
 	}
-	const ductMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(ducts), new THREE.MeshStandardMaterial({ color: 0xb8bcc2, roughness: 0.5, metalness: 0.15 }));
+	const ductMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(ducts), new THREE.MeshStandardMaterial({ color: 0xc8ccd2, roughness: 0.38, metalness: 0.72 }));
 	ducts.forEach((g) => g.dispose());
 	ceiling.add(ductMesh);
 	const pipes = [];
-	for (const p of [{ z: cz - D * 0.32, y: ROOM_CEIL_Y - 3.5, r: 1.1 }, { z: cz + D * 0.34, y: ROOM_CEIL_Y - 3.5, r: 0.8 }]) {
-		const pg = new THREE.CylinderGeometry(p.r, p.r, runX, 12); pg.rotateZ(Math.PI / 2); pg.translate(cx, p.y, p.z); pipes.push(pg);
+	for (const p of [{ z: cz - D * 0.32, y: ROOM_CEIL_Y - 2.5, r: 1.1 }, { z: cz + D * 0.34, y: ROOM_CEIL_Y - 2.5, r: 0.8 }]) {
+		const pg = new THREE.CylinderGeometry(p.r, p.r, runX, 14); pg.rotateZ(Math.PI / 2); pg.translate(cx, p.y, p.z); pipes.push(pg);
 	}
-	const pipeMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(pipes), new THREE.MeshStandardMaterial({ color: 0xa9adb4, roughness: 0.4, metalness: 0.25 }));
+	const pipeMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(pipes), new THREE.MeshStandardMaterial({ color: 0xbcc0c6, roughness: 0.3, metalness: 0.8 }));
 	pipes.forEach((g) => g.dispose());
 	ceiling.add(pipeMesh);
+
+	// --- wall detailing so the big blank planes have edges + things to read against ---
+	const trimMat = new THREE.MeshStandardMaterial({ color: 0x4a4a52, roughness: 0.8 });
+	const bb = [new THREE.BoxGeometry(W, 1.2, 0.4), new THREE.BoxGeometry(W, 1.2, 0.4), new THREE.BoxGeometry(0.4, 1.2, D), new THREE.BoxGeometry(0.4, 1.2, D)];
+	bb[0].translate(cx, 0.6, minZ + 0.25); bb[1].translate(cx, 0.6, maxZ - 0.25); bb[2].translate(minX + 0.25, 0.6, cz); bb[3].translate(maxX - 0.25, 0.6, cz);
+	const baseMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(bb), trimMat); bb.forEach((g) => g.dispose()); walls.add(baseMesh);
+	// a door on the near (minZ) wall
+	const doorX = cx - W * 0.28;
+	const frame = new THREE.Mesh(new THREE.BoxGeometry(10, 19, 0.6), new THREE.MeshStandardMaterial({ color: 0x8a7a60, roughness: 0.7 })); frame.position.set(doorX, 9.5, minZ + 0.3); walls.add(frame);
+	const door = new THREE.Mesh(new THREE.BoxGeometry(9, 18, 0.3), new THREE.MeshStandardMaterial({ color: 0x5b4a36, roughness: 0.65 })); door.position.set(doorX, 9, minZ + 0.55); walls.add(door);
+	const knob = new THREE.Mesh(new THREE.SphereGeometry(0.4, 12, 12), new THREE.MeshStandardMaterial({ color: 0xd9c46a, metalness: 0.8, roughness: 0.3 })); knob.position.set(doorX + 3.6, 9, minZ + 0.8); walls.add(knob);
+	// fire extinguisher on the maxX wall
+	const feX = maxX - 0.9, feZ = cz + D * 0.2;
+	const feBody = new THREE.Mesh(new THREE.CylinderGeometry(0.85, 0.85, 3, 16), new THREE.MeshStandardMaterial({ color: 0xc41f1f, roughness: 0.4, metalness: 0.2 })); feBody.position.set(feX, 7, feZ); walls.add(feBody);
+	const feTop = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.5, 0.9, 12), new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.6 })); feTop.position.set(feX, 8.8, feZ); walls.add(feTop);
+	// wall phone on the minX wall
+	const phX = minX + 0.5, phZ = cz - D * 0.18;
+	const phBody = new THREE.Mesh(new THREE.BoxGeometry(0.6, 2.4, 1.6), new THREE.MeshStandardMaterial({ color: 0x2b2b30, roughness: 0.6 })); phBody.position.set(phX, 11, phZ); walls.add(phBody);
+	const phHandset = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.5, 2.1), new THREE.MeshStandardMaterial({ color: 0x161618, roughness: 0.6 })); phHandset.position.set(phX + 0.5, 12.5, phZ); walls.add(phHandset);
+	// bulletin board with a "lost cat" flyer on the far (maxZ) wall
+	const bdX = cx + W * 0.27;
+	const board = new THREE.Mesh(new THREE.BoxGeometry(11, 8, 0.4), new THREE.MeshStandardMaterial({ color: 0x8d6a44, roughness: 0.85 })); board.position.set(bdX, 12, maxZ - 0.3); walls.add(board);
+	const flyer = new THREE.Mesh(new THREE.PlaneGeometry(3.4, 4.3), new THREE.MeshBasicMaterial({ map: makeLostCatTexture() })); flyer.rotation.y = Math.PI; flyer.position.set(bdX, 12.2, maxZ - 0.55); walls.add(flyer);
+	const pin = new THREE.Mesh(new THREE.SphereGeometry(0.18, 8, 8), new THREE.MeshStandardMaterial({ color: 0xcc2222 })); pin.position.set(bdX, 14.1, maxZ - 0.6); walls.add(pin);
 
 	walls.visible = options.showWalls;
 	ceiling.visible = options.showCeiling;
 	scene.add(group);
-	objects.room = { group, walls, ceiling };
+	objects.room = { group, walls, ceiling, flicker: flickMesh };
 }
 
 let keyHandlersAttached = false;
@@ -1073,10 +1137,11 @@ function updateHighlight() {
     hovered = hit;
     const ud = hit.mesh.userData;
     const pl = ud.placements && ud.placements[hit.instanceId];
-    if (pl && ud.modelBox && !ud.modelBox.isEmpty()) {
-        // size + centre the box to the actual model bounds (matches the item's 1U/2U/3U footprint)
-        ud.modelBox.getCenter(_hoverPos);
-        ud.modelBox.getSize(_hoverSize);
+    const hlBox = ud.footBox || ud.modelBox; // racks: tight tall-parts box, not the wide floor tile
+    if (pl && hlBox && !hlBox.isEmpty()) {
+        // size + centre the box to the real model bounds (matches the item's 1U/2U/3U footprint)
+        hlBox.getCenter(_hoverPos);
+        hlBox.getSize(_hoverSize);
         highlightBox.scale.set(_hoverSize.x + 0.25, _hoverSize.y + 0.12, _hoverSize.z + 0.25);
         highlightBox.position.set(_hoverPos.x + pl.x, _hoverPos.y + pl.y, _hoverPos.z + pl.z);
     } else {
@@ -1210,6 +1275,21 @@ function maybeCycleIdleView() {
     }
 }
 
+// The corner "failing" fixture (objects.room.flicker): mostly on, but every few seconds it stutters
+// off/on for a moment like a dying fluorescent tube. Toggles only that one bulb mesh's visibility.
+let flickNext = performance.now() + 4000, flickBurstEnd = 0, flickToggleAt = 0;
+function maybeFlicker() {
+    const f = objects.room && objects.room.flicker;
+    if (!f) return;
+    const t = performance.now();
+    if (t < flickBurstEnd) {
+        if (t >= flickToggleAt) { f.visible = Math.random() < 0.55; flickToggleAt = t + 45 + Math.random() * 95; }
+    } else {
+        f.visible = true; // normal: lit
+        if (t >= flickNext) { flickBurstEnd = t + 250 + Math.random() * 700; flickNext = flickBurstEnd + 2500 + Math.random() * 6500; flickToggleAt = 0; }
+    }
+}
+
 function setupInteraction() {
     if (renderer && renderer.domElement) {
         // Click to start walking (pointer lock); while walking, a click selects what you're looking at.
@@ -1266,6 +1346,11 @@ function init() {
     renderer.setSize(window.innerWidth, window.innerHeight);
     document.body.appendChild(renderer.domElement);
     maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
+    // Neutral image-based environment so metallic surfaces (galvanized ducts/pipes, cable sheen)
+    // reflect something instead of rendering black. Subtle intensity so it doesn't wash the racks.
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    scene.environmentIntensity = 0.45;
     setupControls();
     // Lock the pointer when the user clicks the instructions overlay. Attached once here
     // (not in setupControls) so repeated first-person toggles don't stack listeners; it
@@ -1301,6 +1386,7 @@ function animate() {
     }
     // Idle: auto-cycle the preset views while the "click to enable" prompt is up
     maybeCycleIdleView();
+    maybeFlicker();
     // Phase 7: glide toward a search fly-to target, then highlight what we're looking at (throttled)
     updateFlyTo();
     if ((_hlFrame++ % 4) === 0) updateHighlight();
