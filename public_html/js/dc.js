@@ -173,7 +173,7 @@ function displayGui() {
     const waistChoices = {}; for (let i = 15; i <= 60; i++) waistChoices[`${i}"`] = i;
     moveFolder.add( options, 'heightInches', heightChoices ).name( 'height' ).onChange(() => { camera.position.y = eyeHeight(); });
     moveFolder.add( options, 'waistInches', waistChoices ).name( 'waist' );
-    moveFolder.open(false);
+    moveFolder.open(); // expanded on load
 }
 function mergeLocations(data) {
     // The response always carries the full locations list (names, for the dropdown); only the
@@ -241,13 +241,13 @@ function clearScene() {
         objects.network.material.dispose();
         objects.network = null;
     }
-    // Labels are billboard Sprites: dispose each one's SpriteMaterial + its lazily-built
-    // CanvasTexture. The Sprite geometry is a shared three singleton -- never dispose it.
+    // Labels are flat quads sharing LABEL_GEO: dispose each one's material + its lazily-built
+    // CanvasTexture map, but never the shared geometry.
     for (const bucket of ['rackLabels', 'labels']) {
-        for (const sprite of objects[bucket]) {
-            scene.remove(sprite);
-            if (sprite.material.map) sprite.material.map.dispose();
-            sprite.material.dispose();
+        for (const label of objects[bucket]) {
+            scene.remove(label);
+            if (label.material.map) label.material.map.dispose();
+            label.material.dispose();
         }
         objects[bucket] = [];
     }
@@ -258,8 +258,8 @@ function clearScene() {
         objects.room.group.traverse((n) => {
             if (n.isMesh) {
                 n.geometry.dispose();
-                if (Array.isArray(n.material)) n.material.forEach((m) => m.dispose());
-                else n.material.dispose();
+                const mats = Array.isArray(n.material) ? n.material : [n.material];
+                for (const m of mats) { if (m.map) m.map.dispose(); m.dispose(); }
             }
         });
         objects.room = null;
@@ -547,7 +547,7 @@ function displayServers(modelIdx) {
 }
 
 function displayRackText(text, asset, x, z) {
-    displayText(text, asset, x - 2.5, 19.5, z + 4);
+    displayText(text, asset, x - 2.5, 19.5, z + 4.2); // just proud of the rack front face
 }
 
 function displayServerText(text, asset, x, y, z) {
@@ -557,6 +557,7 @@ function displayServerText(text, asset, x, y, z) {
 const LABEL_DISTANCE = 40;                                  // draw a label only within this many world units
 const LABEL_DISTANCE_SQ = LABEL_DISTANCE * LABEL_DISTANCE;
 const _labelCamPos = new THREE.Vector3();
+const LABEL_GEO = new THREE.PlaneGeometry(1, 1);           // shared quad for every flat label (never disposed)
 
 function makeLabelTexture(text) {
     const scale = 3; // supersample the label canvas so the text stays crisp up close
@@ -592,22 +593,23 @@ function makeLabelTexture(text) {
     return texture;
 }
 
-// Labels are billboarding Sprites (always face the camera). The canvas texture is built
+// Labels are flat quads fixed to the front face (facing +z, the aisle side) -- a "sticker" on each
+// rack/case, NOT a billboard, so they don't rotate to follow the camera. The canvas texture is built
 // LAZILY the first time the label comes within LABEL_DISTANCE; updateLabels() (per frame)
 // distance-culls them so only the nearby handful actually draw. This bounds both label
 // build cost and draw-call count regardless of how big the location is.
 function displayText(text, data, x, y, z) {
-    const sprite = new THREE.Sprite(new THREE.SpriteMaterial());
-    sprite.position.set(x, y, z);
-    sprite.scale.set(2.5, 0.25, 1);
-    sprite.visible = false;
-    sprite.userData.text = text;
-    sprite.userData.drawn = false;
-    scene.add(sprite);
+    const label = new THREE.Mesh(LABEL_GEO, new THREE.MeshBasicMaterial());
+    label.position.set(x, y, z);
+    label.scale.set(2.5, 0.25, 1);   // matches the 10:1 label-texture aspect; +z normal = faces the aisle
+    label.visible = false;
+    label.userData.text = text;
+    label.userData.drawn = false;
+    scene.add(label);
     if (typeof data.hostname != "undefined") {
-        objects.labels.push(sprite);
+        objects.labels.push(label);
     } else {
-        objects.rackLabels.push(sprite);
+        objects.rackLabels.push(label);
     }
 }
 
@@ -830,19 +832,62 @@ function displaySwitches() {
     objects.network = cables;
 }
 
+// Procedural floor tile: slightly off-white tiles with seams + sporadic tiny speckles. Drawn as a
+// block of tiles so the speckle pattern doesn't visibly repeat tile-to-tile.
+function makeFloorTexture() {
+	const tiles = 4, px = 128, size = tiles * px;
+	const c = document.createElement('canvas'); c.width = c.height = size;
+	const g = c.getContext('2d');
+	g.fillStyle = '#eeece4'; g.fillRect(0, 0, size, size); // off-white base
+	g.strokeStyle = '#dcd9cf'; g.lineWidth = 2;            // tile seams
+	for (let i = 0; i <= tiles; i++) {
+		const p = i * px;
+		g.beginPath(); g.moveTo(p, 0); g.lineTo(p, size); g.moveTo(0, p); g.lineTo(size, p); g.stroke();
+	}
+	for (let i = 0; i < 460; i++) {                        // sporadic tiny spots
+		const x = Math.random() * size, y = Math.random() * size, r = Math.random() * 1.4 + 0.4;
+		g.fillStyle = Math.random() < 0.5 ? '#cfccc0' : '#b9b4a6';
+		g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill();
+	}
+	const t = new THREE.CanvasTexture(c);
+	t.wrapS = t.wrapT = THREE.RepeatWrapping;
+	t.colorSpace = THREE.SRGBColorSpace;
+	t.anisotropy = maxAnisotropy || 1;
+	return t;
+}
+
 function loadFloor() {
-	const helper = new THREE.GridHelper(500, 50);
-	helper.position.y = 0;
-	helper.material.opacity = 0.25;
-	helper.material.transparent = true;
-	scene.add(helper);
+	const floorTex = makeFloorTexture();
+	const tileUnits = 24 * UNITS_PER_INCH;          // 2 ft tiles
+	const reps = 500 / (4 * tileUnits);             // 4 tiles per texture block
+	floorTex.repeat.set(reps, reps);
+	const floor = new THREE.Mesh(
+		new THREE.PlaneGeometry(500, 500),
+		new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.9, metalness: 0.0 })
+	);
+	floor.rotation.x = -Math.PI / 2;
+	floor.position.y = -0.02;                        // just under the racks to avoid z-fighting
+	scene.add(floor);
 }
 
 // Room shell built around the racks. We have no real room dimensions in the data, so derive them
 // from the rack-layout bounds + a margin. Produces 4 walls + a ceiling, with fluorescent strip
 // fixtures and HVAC ducts along the top. Walls and ceiling are independently toggleable.
-const ROOM_MARGIN = 14;   // gap from the outermost rack footprints to the walls
-const ROOM_CEIL_Y = 30;   // ceiling height (~11.7 ft at this scene scale; racks are ~20 / ~7.8 ft)
+const ROOM_MARGIN = 14;     // gap from the outermost rack footprints to the walls
+const ROOM_CEIL_Y = 38.5;   // ceiling height (~15 ft at this scene scale; racks are ~20 / ~7.8 ft)
+const CEIL_TILE = 24 * UNITS_PER_INCH; // 2 ft drop-ceiling tiles
+
+// White drop-ceiling tile: a square panel with a slight recessed gap (the grid) around each edge,
+// so when repeated it reads as a suspended tile ceiling.
+function makeCeilingTexture() {
+	const px = 128, c = document.createElement('canvas'); c.width = c.height = px;
+	const g = c.getContext('2d');
+	g.fillStyle = '#f2f2ee'; g.fillRect(0, 0, px, px);       // white-ish panel
+	g.fillStyle = '#d6d6d0'; const gap = 6;                  // slight recessed gap between tiles
+	g.fillRect(0, 0, px, gap); g.fillRect(0, 0, gap, px); g.fillRect(0, px - gap, px, gap); g.fillRect(px - gap, 0, gap, px);
+	for (let i = 0; i < 140; i++) { g.fillStyle = Math.random() < 0.5 ? '#e8e8e2' : '#ececE6'; g.fillRect(Math.random() * px, Math.random() * px, 1, 1); } // faint fibreboard speckle
+	const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAnisotropy || 1; return t;
+}
 function buildRoom() {
 	const racksObj = (locations[options.location] || {}).racks || {};
 	let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
@@ -863,8 +908,10 @@ function buildRoom() {
 	const ceiling = new THREE.Group();
 	group.add(walls); group.add(ceiling);
 
-	const wallMat = new THREE.MeshStandardMaterial({ color: 0xc4c8d0, roughness: 0.95, metalness: 0.0, side: THREE.DoubleSide });
-	const ceilMat = new THREE.MeshStandardMaterial({ color: 0xb0b4bc, roughness: 0.95, metalness: 0.0, side: THREE.DoubleSide });
+	const wallMat = new THREE.MeshStandardMaterial({ color: 0xe9e2d2, roughness: 0.95, metalness: 0.0, side: THREE.DoubleSide }); // off-white / beige
+	const ceilTex = makeCeilingTexture();
+	ceilTex.repeat.set(Math.max(1, Math.round(W / CEIL_TILE)), Math.max(1, Math.round(D / CEIL_TILE)));
+	const ceilMat = new THREE.MeshStandardMaterial({ map: ceilTex, color: 0xffffff, roughness: 0.95, metalness: 0.0, emissive: 0x2a2a2a, side: THREE.DoubleSide });
 
 	// 4 walls (full-height vertical planes), one per side
 	const wN = new THREE.Mesh(new THREE.PlaneGeometry(W, ROOM_CEIL_Y), wallMat); wN.position.set(cx, ROOM_CEIL_Y / 2, minZ); walls.add(wN);
@@ -875,33 +922,57 @@ function buildRoom() {
 	// ceiling (horizontal plane, facing down into the room)
 	const ceil = new THREE.Mesh(new THREE.PlaneGeometry(W, D), ceilMat); ceil.rotation.x = Math.PI / 2; ceil.position.set(cx, ROOM_CEIL_Y, cz); ceiling.add(ceil);
 
-	// fluorescent strip fixtures: parallel rows spanning the room in x, just below the ceiling.
-	// Merge all housings into one mesh and all lenses into one -> 2 draw calls for every fixture.
-	const housings = [], lenses = [];
+	// Fluorescent fixtures: rows of troffers across the room. Each fixture holds 4 parallel bulbs,
+	// and each bulb run is broken into 4-ft segments with a 1" gap, so the runs look segmented.
+	// Housings merged into one mesh, bulbs into one (unlit -> always read as bright lit tubes).
+	const housings = [], bulbs = [];
 	const fixLenX = W - 2 * ROOM_MARGIN;
-	const fixW = Math.max(0.85, 4 * UNITS_PER_INCH); // ~4" wide strip
-	const rows = Math.max(1, Math.round(D / 14));
-	for (let i = 0; i < rows; i++) {
-		const z = minZ + (D * (i + 0.5) / rows);
-		const hg = new THREE.BoxGeometry(fixLenX, 0.5, fixW + 0.5); hg.translate(cx, ROOM_CEIL_Y - 0.5, z); housings.push(hg);
-		const lg = new THREE.BoxGeometry(fixLenX - 0.6, 0.25, fixW);  lg.translate(cx, ROOM_CEIL_Y - 0.78, z); lenses.push(lg);
+	const fixStartX = cx - fixLenX / 2, fixEndX = cx + fixLenX / 2;
+	const BULB_LEN = 48 * UNITS_PER_INCH;   // 4 ft bulb segment
+	const BULB_GAP = 1 * UNITS_PER_INCH;    // 1" break between segments
+	const BULB_W = 3 * UNITS_PER_INCH;      // ~3" tube
+	const bulbDz = [-1.65, -0.55, 0.55, 1.65]; // 4 bulbs across the ~4.4-wide fixture
+	const fixRows = Math.max(1, Math.round(D / 18));
+	const bulbY = ROOM_CEIL_Y - 0.95, housingY = ROOM_CEIL_Y - 0.6;
+	for (let i = 0; i < fixRows; i++) {
+		const z = minZ + (D * (i + 0.5) / fixRows);
+		const hg = new THREE.BoxGeometry(fixLenX + 0.5, 0.7, 4.4); hg.translate(cx, housingY, z); housings.push(hg);
+		for (const dz of bulbDz) {
+			for (let sx = fixStartX; sx < fixEndX - 0.05; sx += BULB_LEN + BULB_GAP) {
+				const segLen = Math.min(BULB_LEN, fixEndX - sx);
+				const bg = new THREE.BoxGeometry(segLen, 0.28, BULB_W); bg.translate(sx + segLen / 2, bulbY, z + dz); bulbs.push(bg);
+			}
+		}
 	}
-	const housingMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(housings), new THREE.MeshStandardMaterial({ color: 0x3a3d44, roughness: 0.6, metalness: 0.3 }));
+	const housingMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(housings), new THREE.MeshStandardMaterial({ color: 0x2c2f35, roughness: 0.6, metalness: 0.3 }));
 	housings.forEach((g) => g.dispose());
-	const lensMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(lenses), new THREE.MeshBasicMaterial({ color: 0xfdfff0 })); // unlit -> always reads as a lit tube
-	lenses.forEach((g) => g.dispose());
-	ceiling.add(housingMesh); ceiling.add(lensMesh);
+	const bulbMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(bulbs), new THREE.MeshBasicMaterial({ color: 0xffffff })); // pure-white unlit tubes
+	bulbs.forEach((g) => g.dispose());
+	ceiling.add(housingMesh); ceiling.add(bulbMesh);
 
-	// HVAC ducts: big galvanized rectangular runs along the two long sides, up near the ceiling.
+	// HVAC ductwork + pipes hung in the open space below the ceiling -- a few runs in different
+	// spots, mixed rectangular ducts + round pipes, to fill the tall overhead volume.
 	// Low metalness (no env map in the scene, so high metalness would render near-black).
+	const runX = W - 2 * ROOM_MARGIN, runZ = D - 2 * ROOM_MARGIN;
 	const ducts = [];
-	const ductLen = W - 2 * ROOM_MARGIN, ductW = 6, ductH = 4, ductY = ROOM_CEIL_Y - 3;
-	for (const zside of [minZ + ROOM_MARGIN * 0.7, maxZ - ROOM_MARGIN * 0.7]) {
-		const dg = new THREE.BoxGeometry(ductLen, ductH, ductW); dg.translate(cx, ductY, zside); ducts.push(dg);
+	for (const r of [
+		{ z: minZ + ROOM_MARGIN * 0.8, y: ROOM_CEIL_Y - 5, w: 6, h: 4.5 },   // along x by the near wall
+		{ z: maxZ - ROOM_MARGIN * 0.8, y: ROOM_CEIL_Y - 5, w: 6, h: 4.5 },   // along x by the far wall
+		{ z: cz, y: ROOM_CEIL_Y - 8, w: 5, h: 3.5 },                          // a lower central run
+	]) { const dg = new THREE.BoxGeometry(runX, r.h, r.w); dg.translate(cx, r.y, r.z); ducts.push(dg); }
+	for (const xline of [cx - W * 0.26, cx + W * 0.22]) {                     // a couple of cross runs along z
+		const dg = new THREE.BoxGeometry(4.5, 3.2, runZ); dg.translate(xline, ROOM_CEIL_Y - 10.5, cz); ducts.push(dg);
 	}
 	const ductMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(ducts), new THREE.MeshStandardMaterial({ color: 0xb8bcc2, roughness: 0.5, metalness: 0.15 }));
 	ducts.forEach((g) => g.dispose());
 	ceiling.add(ductMesh);
+	const pipes = [];
+	for (const p of [{ z: cz - D * 0.32, y: ROOM_CEIL_Y - 3.5, r: 1.1 }, { z: cz + D * 0.34, y: ROOM_CEIL_Y - 3.5, r: 0.8 }]) {
+		const pg = new THREE.CylinderGeometry(p.r, p.r, runX, 12); pg.rotateZ(Math.PI / 2); pg.translate(cx, p.y, p.z); pipes.push(pg);
+	}
+	const pipeMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(pipes), new THREE.MeshStandardMaterial({ color: 0xa9adb4, roughness: 0.4, metalness: 0.25 }));
+	pipes.forEach((g) => g.dispose());
+	ceiling.add(pipeMesh);
 
 	walls.visible = options.showWalls;
 	ceiling.visible = options.showCeiling;
@@ -1104,7 +1175,7 @@ function viewPreset(name) {
     return { pos: [b.cx, 18, b.maxZ + 22], look: [b.cx, 10, b.cz] };
 }
 
-function setView(name) {
+function setView(name, keepBlocker) {
     const v = viewPreset(name);
     // Overhead/exterior views look at the layout from above/outside the room shell, where the walls
     // and ceiling would just block the view -> hide them for those; interior views honor the toggles.
@@ -1119,7 +1190,24 @@ function setView(name) {
     flyTo.t = 0;
     flyTo.active = true;
     if (controls && controls.isLocked) controls.unlock();
-    const bl = document.getElementById('blocker'); if (bl) bl.style.display = 'none';
+    if (!keepBlocker) { const bl = document.getElementById('blocker'); if (bl) bl.style.display = 'none'; }
+}
+
+// When the pointer-lock prompt is showing (user not engaged) and the tab is visible, slowly cycle
+// the preset "show-off" views every IDLE_VIEW_MS so the page demos itself. Pauses once the user
+// clicks in (pointer locks) or the tab is hidden; the blocker message stays up the whole time.
+const IDLE_VIEWS = ['overview', 'aisle', 'labels', 'cables', 'top'];
+const IDLE_VIEW_MS = 5000;
+let idleLastSwitch = performance.now(), idleViewIdx = -1;
+function maybeCycleIdleView() {
+    if (options.useFirstPerson || !controls || controls.isLocked || document.hidden) { idleLastSwitch = performance.now(); return; }
+    const bl = document.getElementById('blocker');
+    if (!bl || bl.style.display === 'none') { idleLastSwitch = performance.now(); return; }
+    if (performance.now() - idleLastSwitch >= IDLE_VIEW_MS) {
+        idleLastSwitch = performance.now();
+        idleViewIdx = (idleViewIdx + 1) % IDLE_VIEWS.length;
+        setView(IDLE_VIEWS[idleViewIdx], true); // keepBlocker: the demo plays behind the prompt
+    }
 }
 
 function setupInteraction() {
@@ -1161,14 +1249,17 @@ function init() {
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0xffffff);
     scene.fog = new THREE.Fog(0xffffff, 0, 750);
-    // Add ambient light
-    const light = new THREE.HemisphereLight(0xeeeeff, 0x777788, 2.5);
+    // Add ambient light. Lighter ground term so down-facing surfaces (drop-ceiling tiles, duct/pipe
+    // undersides) aren't dim when viewed from below.
+    const light = new THREE.HemisphereLight(0xeeeeff, 0x9a9aa2, 2.6);
     light.position.set(0.5, 1, 0.75);
     scene.add(light);
     // soft directional light so cables (and racks) get specular highlights / depth, not flat ambient
     const sun = new THREE.DirectionalLight(0xffffff, 1.1);
     sun.position.set(60, 120, 40);
     scene.add(sun);
+    // flat ambient fill -> overall brighter room + lifts dark undersides the hemisphere misses
+    scene.add(new THREE.AmbientLight(0xfff6ec, 0.5));
     // Set up the renderer
     renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -1208,6 +1299,8 @@ function animate() {
             updateControls(time);
         }
     }
+    // Idle: auto-cycle the preset views while the "click to enable" prompt is up
+    maybeCycleIdleView();
     // Phase 7: glide toward a search fly-to target, then highlight what we're looking at (throttled)
     updateFlyTo();
     if ((_hlFrame++ % 4) === 0) updateHighlight();
