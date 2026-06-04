@@ -23,6 +23,8 @@ let prevTime = performance.now();
 let racksShown = false, showServers = true;
 let objects = {instanced: [], network: null, rackLabels: [], labels: [], room: null}, models = { racks: {}, servers: {} }, locationNames = {};
 let rackColliders = []; // x/z footprints of placed racks (for collision)
+let roomBounds = null;  // {minX,maxX,minZ,maxZ} wall extents (collide against the walls)
+let roomSpawn = null;   // {x,y,z,lookX,lookZ} a safe spot inside the room to drop the player
 const options = {
     useFirstPerson: false,
     showLabels: true,
@@ -143,6 +145,7 @@ function displayDatacenter() {
     getRackModels();
     getServerModels();
     displaySwitches();
+    spawnInside(); // place the player within the walls on load / location change
 }
 
 function setNetworkVisible(visible) {
@@ -168,13 +171,16 @@ function displayGui() {
 			moveFolder.add( options, 'moveForward').listen().disable();
 			moveFolder.add( options, 'moveBackward').listen().disable();*/
     moveFolder.add( options, 'collisionMovement');
-    // height shown as feet+inches (e.g. 5' 10"), waist as plain inches (e.g. 36") via dropdowns,
-    // since lil-gui number sliders can't reformat their numeric readout.
-    const heightChoices = {}; for (let i = 42; i <= 96; i++) heightChoices[`${Math.floor(i / 12)}' ${i % 12}"`] = i;
-    const waistChoices = {}; for (let i = 15; i <= 60; i++) waistChoices[`${i}"`] = i;
-    moveFolder.add( options, 'heightInches', heightChoices ).name( 'height' ).onChange(() => { camera.position.y = eyeHeight(); });
-    moveFolder.add( options, 'waistInches', waistChoices ).name( 'waist' );
+    // height + waist are sliders. lil-gui can't reformat the numeric readout, so the formatted
+    // value lives in the controller LABEL and refreshes on change (e.g. "height  5' 10"").
+    const fmtHeight = (i) => `height  ${Math.floor(i / 12)}' ${i % 12}"`;
+    const fmtWaist = (i) => `waist  ${i}"`;
+    const hc = moveFolder.add( options, 'heightInches', 42, 96, 1 ).onChange(() => { camera.position.y = eyeHeight(); hc.name(fmtHeight(options.heightInches)); });
+    hc.name(fmtHeight(options.heightInches));
+    const wc = moveFolder.add( options, 'waistInches', 15, 60, 1 ).onChange(() => { wc.name(fmtWaist(options.waistInches)); });
+    wc.name(fmtWaist(options.waistInches));
     moveFolder.open(); // expanded on load
+    buildLocationButtons();
 }
 function mergeLocations(data) {
     // The response always carries the full locations list (names, for the dropdown); only the
@@ -204,6 +210,8 @@ function locationLoaded(locId) {
 }
 
 function switchLocation() {
+    const el = document.getElementById('dcLocations');
+    if (el) el.querySelectorAll('button').forEach((b) => b.classList.toggle('active', Number(b.dataset.loc) === Number(options.location)));
     // Fetch the location's data on demand (cached after first load), then (re)build the scene.
     if (locationLoaded(options.location)) {
         displayDatacenter();
@@ -211,6 +219,27 @@ function switchLocation() {
         fetchLocation(options.location)
             .then(() => displayDatacenter())
             .catch((error) => console.error('There was a problem loading the location:', error));
+    }
+}
+
+// Vertical list of location buttons down the left side, kept in sync with the GUI dropdown.
+function buildLocationButtons() {
+    const el = document.getElementById('dcLocations');
+    if (!el) return;
+    el.innerHTML = '';
+    const entries = Object.keys(locationNames).map((name) => ({ name, id: Number(locationNames[name]) }));
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const { name, id } of entries) {
+        const btn = document.createElement('button');
+        btn.textContent = name;
+        btn.dataset.loc = id;
+        if (id === Number(options.location)) btn.classList.add('active');
+        btn.addEventListener('click', () => {
+            if (Number(options.location) === id) return;
+            options.location = id;
+            switchLocation();
+        });
+        el.appendChild(btn);
     }
 }
 
@@ -227,6 +256,7 @@ function loadDatacenter() {
 
 function clearScene() {
     rackColliders = []; // rebuilt as racks are re-placed
+    roomBounds = null; roomSpawn = null;
     // Instanced model meshes: detach + dispose the per-instance buffer. Their geometry and
     // material are the cached model templates in models.* (shared across rebuilds), so they
     // are kept; InstancedMesh.dispose() only frees the instanceMatrix buffer.
@@ -297,6 +327,8 @@ function playerRadius() { return Math.max(0.2, (options.waistInches / (2 * Math.
 // Collision: rackColliders holds each rack's x/z footprint (built in buildInstanced). A position
 // (x,z) with radius r collides if it overlaps any footprint -> used to block walking into racks.
 function collidesAt(x, z, r) {
+    // walls: keep the player inside the room
+    if (roomBounds && (x - r < roomBounds.minX || x + r > roomBounds.maxX || z - r < roomBounds.minZ || z + r > roomBounds.maxZ)) return true;
     for (const c of rackColliders) {
         if (x + r > c.minX && x - r < c.maxX && z + r > c.minZ && z - r < c.maxZ) return true;
     }
@@ -912,6 +944,29 @@ function makeLostCatTexture() {
 	g.font = '16px Arial'; g.fillText('Last seen near Rack B12', w / 2, 312); g.fillText('Reward! Call x4477', w / 2, 338);
 	const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAnisotropy || 1; return t;
 }
+
+// Old-fashioned pin-up calendar (a tasteful retro silhouette + a month grid) for the back of a door.
+function makeCalendarTexture() {
+	const w = 220, h = 340, c = document.createElement('canvas'); c.width = w; c.height = h;
+	const g = c.getContext('2d');
+	g.fillStyle = '#f3e7cf'; g.fillRect(0, 0, w, h);                         // aged paper
+	g.strokeStyle = '#b09a6a'; g.lineWidth = 3; g.strokeRect(5, 5, w - 10, h - 10);
+	g.textAlign = 'center'; g.fillStyle = '#a8332b'; g.font = "bold 22px Georgia"; g.fillText("PIN-UPS of '54", w / 2, 32);
+	// tasteful single-colour silhouette: head + hourglass torso + two legs + a raised arm
+	g.fillStyle = '#6e3a2c';
+	g.beginPath(); g.arc(w / 2, 78, 13, 0, Math.PI * 2); g.fill();
+	g.beginPath(); g.moveTo(w / 2 - 18, 98); g.quadraticCurveTo(w / 2 - 6, 130, w / 2 - 16, 162); g.lineTo(w / 2 + 16, 162); g.quadraticCurveTo(w / 2 + 6, 130, w / 2 + 18, 98); g.quadraticCurveTo(w / 2, 86, w / 2 - 18, 98); g.fill();
+	g.beginPath(); g.moveTo(w / 2 - 15, 160); g.quadraticCurveTo(w / 2 - 17, 200, w / 2 - 9, 226); g.lineTo(w / 2 - 1, 226); g.quadraticCurveTo(w / 2 - 3, 195, w / 2, 164); g.fill();
+	g.beginPath(); g.moveTo(w / 2 + 15, 160); g.quadraticCurveTo(w / 2 + 17, 200, w / 2 + 9, 226); g.lineTo(w / 2 + 1, 226); g.quadraticCurveTo(w / 2 + 3, 195, w / 2, 164); g.fill();
+	g.strokeStyle = '#6e3a2c'; g.lineWidth = 7; g.lineCap = 'round'; g.beginPath(); g.moveTo(w / 2 + 8, 104); g.quadraticCurveTo(w / 2 + 32, 86, w / 2 + 26, 62); g.stroke();
+	// month + day grid
+	g.fillStyle = '#333'; g.font = 'bold 18px Georgia'; g.fillText('JULY', w / 2, 252);
+	g.font = '11px Arial'; const days = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
+	for (let i = 0; i < 7; i++) { g.fillStyle = '#a8332b'; g.fillText(days[i], 24 + i * 28, 270); }
+	g.fillStyle = '#333'; let day = 1;
+	for (let r = 0; r < 6 && day <= 31; r++) for (let i = 0; i < 7; i++) { if (r === 0 && i < 4) continue; if (day > 31) break; g.fillText(String(day++), 24 + i * 28, 286 + r * 14); }
+	const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAnisotropy || 1; return t;
+}
 function buildRoom() {
 	const racksObj = (locations[options.location] || {}).racks || {};
 	let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
@@ -996,21 +1051,22 @@ function buildRoom() {
 	const runX = W - 2 * ROOM_MARGIN, runZ = D - 2 * ROOM_MARGIN;
 	const ducts = [];
 	for (const r of [
-		{ z: minZ + ROOM_MARGIN * 0.8, y: ROOM_CEIL_Y - 3, w: 6, h: 4.5 },   // along x by the near wall
-		{ z: maxZ - ROOM_MARGIN * 0.8, y: ROOM_CEIL_Y - 3, w: 6, h: 4.5 },   // along x by the far wall
-		{ z: cz, y: ROOM_CEIL_Y - 4.5, w: 5, h: 3.5 },                        // a central run
+		{ z: minZ + ROOM_MARGIN * 0.8, y: ROOM_CEIL_Y - 2.5, w: 6, h: 4.5 }, // along x by the near wall
+		{ z: maxZ - ROOM_MARGIN * 0.8, y: ROOM_CEIL_Y - 2.5, w: 6, h: 4.5 }, // along x by the far wall
+		{ z: cz, y: ROOM_CEIL_Y - 2, w: 5, h: 3.5 },                          // a central run
 	]) { const dg = new THREE.BoxGeometry(runX, r.h, r.w); dg.translate(cx, r.y, r.z); ducts.push(dg); }
 	for (const xline of [cx - W * 0.26, cx + W * 0.22]) {                     // a couple of cross runs along z
-		const dg = new THREE.BoxGeometry(4.5, 3.2, runZ); dg.translate(xline, ROOM_CEIL_Y - 6, cz); ducts.push(dg);
+		const dg = new THREE.BoxGeometry(4.5, 3.2, runZ); dg.translate(xline, ROOM_CEIL_Y - 2, cz); ducts.push(dg);
 	}
-	const ductMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(ducts), new THREE.MeshStandardMaterial({ color: 0xc8ccd2, roughness: 0.38, metalness: 0.72 }));
+	// shiny galvanized steel: high metalness + low roughness + boosted env reflection
+	const ductMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(ducts), new THREE.MeshStandardMaterial({ color: 0xcdd3da, roughness: 0.24, metalness: 0.92, envMapIntensity: 2.6 }));
 	ducts.forEach((g) => g.dispose());
 	ceiling.add(ductMesh);
 	const pipes = [];
-	for (const p of [{ z: cz - D * 0.32, y: ROOM_CEIL_Y - 2.5, r: 1.1 }, { z: cz + D * 0.34, y: ROOM_CEIL_Y - 2.5, r: 0.8 }]) {
-		const pg = new THREE.CylinderGeometry(p.r, p.r, runX, 14); pg.rotateZ(Math.PI / 2); pg.translate(cx, p.y, p.z); pipes.push(pg);
+	for (const p of [{ z: cz - D * 0.32, y: ROOM_CEIL_Y - 1.4, r: 1.1 }, { z: cz + D * 0.34, y: ROOM_CEIL_Y - 1.4, r: 0.8 }]) {
+		const pg = new THREE.CylinderGeometry(p.r, p.r, runX, 16); pg.rotateZ(Math.PI / 2); pg.translate(cx, p.y, p.z); pipes.push(pg);
 	}
-	const pipeMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(pipes), new THREE.MeshStandardMaterial({ color: 0xbcc0c6, roughness: 0.3, metalness: 0.8 }));
+	const pipeMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(pipes), new THREE.MeshStandardMaterial({ color: 0xc6ccd4, roughness: 0.16, metalness: 0.96, envMapIntensity: 2.9 }));
 	pipes.forEach((g) => g.dispose());
 	ceiling.add(pipeMesh);
 
@@ -1032,6 +1088,12 @@ function buildRoom() {
 	const phX = minX + 0.5, phZ = cz - D * 0.18;
 	const phBody = new THREE.Mesh(new THREE.BoxGeometry(0.6, 2.4, 1.6), new THREE.MeshStandardMaterial({ color: 0x2b2b30, roughness: 0.6 })); phBody.position.set(phX, 11, phZ); walls.add(phBody);
 	const phHandset = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.5, 2.1), new THREE.MeshStandardMaterial({ color: 0x161618, roughness: 0.6 })); phHandset.position.set(phX + 0.5, 12.5, phZ); walls.add(phHandset);
+	// a 2nd door on the minX wall with an old pin-up calendar hung on it
+	const cdZ = cz + D * 0.22;
+	const cdFrame = new THREE.Mesh(new THREE.BoxGeometry(0.6, 19, 10), new THREE.MeshStandardMaterial({ color: 0x8a7a60, roughness: 0.7 })); cdFrame.position.set(minX + 0.3, 9.5, cdZ); walls.add(cdFrame);
+	const cdDoor = new THREE.Mesh(new THREE.BoxGeometry(0.3, 18, 9), new THREE.MeshStandardMaterial({ color: 0x5b4a36, roughness: 0.65 })); cdDoor.position.set(minX + 0.55, 9, cdZ); walls.add(cdDoor);
+	const cdKnob = new THREE.Mesh(new THREE.SphereGeometry(0.4, 12, 12), new THREE.MeshStandardMaterial({ color: 0xd9c46a, metalness: 0.8, roughness: 0.3 })); cdKnob.position.set(minX + 0.8, 9, cdZ - 3.6); walls.add(cdKnob);
+	const cal = new THREE.Mesh(new THREE.PlaneGeometry(3, 4.6), new THREE.MeshBasicMaterial({ map: makeCalendarTexture() })); cal.rotation.y = Math.PI / 2; cal.position.set(minX + 0.75, 11.5, cdZ); walls.add(cal);
 	// bulletin board with a "lost cat" flyer on the far (maxZ) wall
 	const bdX = cx + W * 0.27;
 	const board = new THREE.Mesh(new THREE.BoxGeometry(11, 8, 0.4), new THREE.MeshStandardMaterial({ color: 0x8d6a44, roughness: 0.85 })); board.position.set(bdX, 12, maxZ - 0.3); walls.add(board);
@@ -1042,6 +1104,17 @@ function buildRoom() {
 	ceiling.visible = options.showCeiling;
 	scene.add(group);
 	objects.room = { group, walls, ceiling, flicker: flickMesh };
+	// wall colliders + a safe spawn spot (open margin near the maxZ wall, looking into the room)
+	roomBounds = { minX, maxX, minZ, maxZ };
+	roomSpawn = { x: cx, z: maxZ - ROOM_MARGIN * 0.5, lookX: cx, lookZ: cz };
+}
+
+// Drop the player at a safe spot inside the walls, facing into the room.
+function spawnInside() {
+    if (!roomSpawn || !camera) return;
+    camera.position.set(roomSpawn.x, eyeHeight(), roomSpawn.z);
+    camera.lookAt(roomSpawn.lookX, eyeHeight(), roomSpawn.lookZ);
+    velocity.set(0, 0, 0);
 }
 
 let keyHandlersAttached = false;
@@ -1081,6 +1154,13 @@ function setupControls() {
         controls.addEventListener("lock", function () {
             instructions.style.display = "none";
             blocker.style.display = "none";
+            // stop any in-progress demo fly + reset motion so the first movement frame doesn't jolt
+            flyTo.active = false;
+            velocity.set(0, 0, 0);
+            prevTime = performance.now();
+            // if locked from an exterior demo view (outside the walls or up high), drop back inside
+            const p = camera.position;
+            if (!roomBounds || p.x < roomBounds.minX || p.x > roomBounds.maxX || p.z < roomBounds.minZ || p.z > roomBounds.maxZ || p.y > 24) spawnInside();
         });
         controls.addEventListener("unlock", function () {
             blocker.style.display = "block";
@@ -1399,8 +1479,10 @@ function animate() {
 
 // Update controls based on user input
 function updateControls(time) {
-    // Calculate time delta
-    const delta = (time - prevTime) / 1000;
+    // Calculate time delta, CLAMPED. After an idle gap or a fly-to, prevTime is stale; an
+    // unclamped multi-second delta makes the damping term (velocity * 10 * delta) overshoot and
+    // flip sign -> the view suddenly spins/snaps and stops. Capping delta fixes that.
+    const delta = Math.min(0.05, (time - prevTime) / 1000);
     // Update velocity based on user input
     velocity.x -= velocity.x * 10.0 * delta;
     velocity.z -= velocity.z * 10.0 * delta;
@@ -1453,7 +1535,7 @@ function onKeyDown(event) {
             options.moveRight = true;
             break;
         case "Space":
-            if (options.canJump === true) velocity.y += 350;
+            if (options.canJump === true) velocity.y += 100; // ~2 ft hop (was 350 = a ~24 ft leap)
             options.canJump = false;
             break;
     }
