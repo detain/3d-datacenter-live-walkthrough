@@ -21,7 +21,7 @@ import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 let camera, scene, renderer, controls, controlObject, stats, gui, locations = {}, maxAnisotropy; // Declare global variables
 let prevTime = performance.now();
 let racksShown = false, showServers = true;
-let objects = {instanced: [], network: null, rackLabels: [], labels: [], room: null}, models = { racks: {}, servers: {} }, locationNames = {};
+let objects = {instanced: [], network: null, rackLabels: [], labels: [], room: null, community: null}, models = { racks: {}, servers: {} }, locationNames = {};
 let rackColliders = []; // x/z footprints of placed racks (for collision)
 let roomBounds = null;  // {minX,maxX,minZ,maxZ} wall extents (collide against the walls)
 let roomSpawn = null;   // {x,y,z,lookX,lookZ} a safe spot inside the room to drop the player
@@ -145,7 +145,8 @@ function displayDatacenter() {
     getRackModels();
     getServerModels();
     displaySwitches();
-    spawnInside(); // place the player within the walls on load / location change
+    buildCommunity(); // the other datacenters as exterior shells around this one
+    spawnInside();    // place the player within the walls on load / location change
 }
 
 function setNetworkVisible(visible) {
@@ -250,8 +251,11 @@ function buildLocationButtons() {
 }
 
 function loadDatacenter() {
-    fetchLocation(options.location)
-        .then(() => {
+    // Fetch ALL locations at once so every building's footprint is known for the community layout.
+    fetch('https://' + options.domain + '/ajax/datacenter.php')
+        .then((r) => { if (!r.ok) throw new Error('Network response was not ok'); return r.json(); })
+        .then((data) => {
+            mergeLocations(data);
             displayGui();
             displayDatacenter();
             const loading = document.getElementById('dcLoading');
@@ -300,6 +304,12 @@ function clearScene() {
             }
         });
         objects.room = null;
+    }
+    // Community: exterior shells of the other buildings -> dispose meshes + their sign textures.
+    if (objects.community) {
+        scene.remove(objects.community);
+        objects.community.traverse((n) => { if (n.isMesh) { n.geometry.dispose(); const m = n.material; if (m.map) m.map.dispose(); m.dispose(); } });
+        objects.community = null;
     }
 }
 
@@ -899,17 +909,15 @@ function makeFloorTexture() {
 }
 
 function loadFloor() {
-	const floorTex = makeFloorTexture();
-	const tileUnits = 24 * UNITS_PER_INCH;          // 2 ft tiles
-	const reps = 500 / (4 * tileUnits);             // 4 tiles per texture block
-	floorTex.repeat.set(reps, reps);
-	const floor = new THREE.Mesh(
-		new THREE.PlaneGeometry(500, 500),
-		new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.9, metalness: 0.0 })
+	// Outdoor ground for the community: a large asphalt lot. Each building's interior tile floor is
+	// added per-location in buildRoom (sitting on top of this).
+	const asphalt = new THREE.Mesh(
+		new THREE.PlaneGeometry(4000, 4000),
+		new THREE.MeshStandardMaterial({ color: 0x33343a, roughness: 0.96, metalness: 0.0 })
 	);
-	floor.rotation.x = -Math.PI / 2;
-	floor.position.y = -0.02;                        // just under the racks to avoid z-fighting
-	scene.add(floor);
+	asphalt.rotation.x = -Math.PI / 2;
+	asphalt.position.y = -0.1;
+	scene.add(asphalt);
 }
 
 // Room shell built around the racks. We have no real room dimensions in the data, so derive them
@@ -972,6 +980,58 @@ function makeCalendarTexture() {
 	g.fillStyle = '#333'; let day = 1;
 	for (let r = 0; r < 6 && day <= 31; r++) for (let i = 0; i < 7; i++) { if (r === 0 && i < 4) continue; if (day > 31) break; g.fillText(String(day++), 24 + i * 28, 286 + r * 14); }
 	const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAnisotropy || 1; return t;
+}
+// ---- Community: render every datacenter as a building. The current one is built in full
+// (interior + room); the rest are simple exterior shells placed on a street grid around it. ----
+function locName(id) {
+	for (const n in locationNames) if (Number(locationNames[n]) === Number(id)) return n;
+	return String(id);
+}
+function locationFootprint(id) {
+	const racks = (locations[id] || {}).racks || {};
+	let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+	for (const k in racks) { const r = racks[k]; const p = convertRackCoordinatesToPosition(r.x, r.y); minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x); minZ = Math.min(minZ, p.z); maxZ = Math.max(maxZ, p.z); }
+	if (!isFinite(minX)) return null;
+	const pad = 4 + ROOM_MARGIN;
+	return { w: (maxX - minX) + 2 * pad, d: (maxZ - minZ) + 2 * pad, cx: (minX + maxX) / 2, cz: (minZ + maxZ) / 2 };
+}
+function makeSignTexture(text) {
+	const w = 256, h = 64, c = document.createElement('canvas'); c.width = w; c.height = h;
+	const g = c.getContext('2d');
+	g.fillStyle = '#1d2430'; g.fillRect(0, 0, w, h);
+	g.strokeStyle = '#3a4350'; g.lineWidth = 4; g.strokeRect(2, 2, w - 4, h - 4);
+	g.fillStyle = '#ffd23a'; g.textAlign = 'center'; g.textBaseline = 'middle';
+	let fs = 30; g.font = 'bold ' + fs + 'px Arial';
+	while (g.measureText(text).width > w - 20 && fs > 10) { fs -= 2; g.font = 'bold ' + fs + 'px Arial'; }
+	g.fillText(text, w / 2, h / 2 + 2);
+	const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAnisotropy || 1; return t;
+}
+function buildCommunity() {
+	const ids = Object.keys(locationNames).map((n) => Number(locationNames[n])).filter((id) => locationLoaded(id));
+	ids.sort((a, b) => locName(a).localeCompare(locName(b)));
+	if (ids.length < 2) return;
+	const foot = {}; let maxW = 0, maxD = 0;
+	for (const id of ids) { const f = locationFootprint(id); if (f) { foot[id] = f; maxW = Math.max(maxW, f.w); maxD = Math.max(maxD, f.d); } }
+	const ncols = Math.ceil(Math.sqrt(ids.length));
+	const cellW = maxW + 90, cellD = maxD + 90;                 // ~street width between plots
+	const cell = {}; ids.forEach((id, i) => { cell[id] = { col: i % ncols, row: Math.floor(i / ncols) }; });
+	const cur = sceneBounds();                                  // the current building's world centre
+	const ci = cell[options.location] || { col: 0, row: 0 };
+	const grp = new THREE.Group();
+	const wallMat = new THREE.MeshStandardMaterial({ color: 0xcfc8b8, roughness: 0.9 });
+	const roofMat = new THREE.MeshStandardMaterial({ color: 0x55585e, roughness: 0.85 });
+	for (const id of ids) {
+		if (Number(id) === Number(options.location)) continue;  // current building is the real one
+		const f = foot[id]; if (!f) continue;
+		const px = cur.cx + (cell[id].col - ci.col) * cellW;
+		const pz = cur.cz + (cell[id].row - ci.row) * cellD;
+		const H = ROOM_CEIL_Y;
+		const body = new THREE.Mesh(new THREE.BoxGeometry(f.w, H, f.d), wallMat); body.position.set(px, H / 2, pz); grp.add(body);
+		const roof = new THREE.Mesh(new THREE.BoxGeometry(f.w + 4, 1.5, f.d + 4), roofMat); roof.position.set(px, H + 0.75, pz); grp.add(roof);
+		const sign = new THREE.Mesh(new THREE.PlaneGeometry(Math.min(f.w * 0.7, 46), 11), new THREE.MeshBasicMaterial({ map: makeSignTexture(locName(id)) }));
+		sign.position.set(px, H * 0.66, pz + f.d / 2 + 0.4); grp.add(sign);
+	}
+	scene.add(grp); objects.community = grp;
 }
 function buildRoom() {
 	const racksObj = (locations[options.location] || {}).racks || {};
@@ -1105,6 +1165,13 @@ function buildRoom() {
 	const board = new THREE.Mesh(new THREE.BoxGeometry(11, 8, 0.4), new THREE.MeshStandardMaterial({ color: 0x8d6a44, roughness: 0.85 })); board.position.set(bdX, 12, maxZ - 0.3); walls.add(board);
 	const flyer = new THREE.Mesh(new THREE.PlaneGeometry(3.4, 4.3), new THREE.MeshBasicMaterial({ map: makeLostCatTexture() })); flyer.rotation.y = Math.PI; flyer.position.set(bdX, 12.2, maxZ - 0.55); walls.add(flyer);
 	const pin = new THREE.Mesh(new THREE.SphereGeometry(0.18, 8, 8), new THREE.MeshStandardMaterial({ color: 0xcc2222 })); pin.position.set(bdX, 14.1, maxZ - 0.6); walls.add(pin);
+
+	// interior tile floor for this building (sits on top of the outdoor asphalt)
+	const floorTex = makeFloorTexture();
+	const tu = 24 * UNITS_PER_INCH;
+	floorTex.repeat.set(Math.max(1, Math.round(W / (4 * tu))), Math.max(1, Math.round(D / (4 * tu))));
+	const floor = new THREE.Mesh(new THREE.PlaneGeometry(W, D), new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.9 }));
+	floor.rotation.x = -Math.PI / 2; floor.position.set(cx, 0, cz); group.add(floor);
 
 	walls.visible = options.showWalls;
 	ceiling.visible = options.showCeiling;
@@ -1333,8 +1400,8 @@ function sceneBounds() {
 function viewPreset(name) {
     const b = sceneBounds();
     const span = Math.max(b.w, b.d, 40);
-    if (name === 'top') return { pos: [b.cx, span * 0.8 + 25, b.cz + 4], look: [b.cx, 0, b.cz] };
-    if (name === 'overview') return { pos: [b.maxX + span * 0.3, span * 0.5, b.maxZ + span * 0.4], look: [b.cx, 8, b.cz] };
+    if (name === 'top') return { pos: [b.cx + 40, span * 1.4 + 240, b.cz + 60], look: [b.cx, 0, b.cz] };          // high enough to see the community
+    if (name === 'overview') return { pos: [b.cx + span + 280, span * 0.6 + 150, b.cz + span + 280], look: [b.cx, 10, b.cz] };
     if (name === 'aisle') return { pos: [b.cx, 14, b.maxZ + 6], look: [b.cx, 12, b.minZ - 5] };
     if (name === 'cables') return { pos: [b.minX - 14, 30, b.cz + 8], look: [b.cx, 17, b.cz] };
     if (name === 'labels') {
@@ -1435,12 +1502,12 @@ function init() {
     // Load the datacenter information
     loadDatacenter();
     // Set up the camera
-    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 1, 1000);
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 1, 3000);
     camera.position.y = eyeHeight();
     // Create the scene
     scene = new THREE.Scene();
-    scene.background = new THREE.Color(0xffffff);
-    scene.fog = new THREE.Fog(0xffffff, 0, 750);
+    scene.background = new THREE.Color(0xaed4f5);                 // sky blue (the community is outdoors)
+    scene.fog = new THREE.Fog(0xc8e2f6, 600, 2600);              // sky-tinted haze, pushed far out
     // Add ambient light. Lighter ground term so down-facing surfaces (drop-ceiling tiles, duct/pipe
     // undersides) aren't dim when viewed from below.
     const light = new THREE.HemisphereLight(0xeeeeff, 0x9a9aa2, 2.6);
@@ -1450,6 +1517,10 @@ function init() {
     const sun = new THREE.DirectionalLight(0xffffff, 1.1);
     sun.position.set(60, 120, 40);
     scene.add(sun);
+    // a visible sun disc up in the sky (the directional light above is its illumination)
+    const sunDisc = new THREE.Mesh(new THREE.SphereGeometry(22, 24, 16), new THREE.MeshBasicMaterial({ color: 0xfff2bf }));
+    sunDisc.position.set(360, 360, 240);
+    scene.add(sunDisc);
     // flat ambient fill -> overall brighter room + lifts dark undersides the hemisphere misses
     scene.add(new THREE.AmbientLight(0xfff6ec, 0.5));
     // Set up the renderer
