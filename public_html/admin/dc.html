@@ -35,6 +35,12 @@
 		#dcViews button { padding: 7px 13px; border: 1px solid #888; border-radius: 5px; cursor: pointer;
 			background: rgba(255,255,255,0.93); font: 13px Arial, sans-serif; color: #222; }
 		#dcViews button:hover { background: #ffe9a8; }
+		#dcLocations { position: fixed; top: 50%; left: 10px; transform: translateY(-50%); z-index: 31;
+			display: flex; flex-direction: column; gap: 8px; max-height: 78vh; overflow-y: auto; padding: 2px; }
+		#dcLocations button { padding: 7px 12px; border: 1px solid #888; border-radius: 5px; cursor: pointer;
+			background: rgba(255,255,255,0.9); font: 13px Arial, sans-serif; color: #222; text-align: left; min-width: 116px; }
+		#dcLocations button:hover { background: #ffe9a8; }
+		#dcLocations button.active { background: #ffcc33; border-color: #cc9900; font-weight: bold; }
 	</style>
 </head>
 <body>
@@ -63,6 +69,7 @@
 		<button data-view="labels">Labels</button>
 		<button data-view="cables">Cables</button>
 	</div>
-	<script type="module" src="/js/dc.js?v=p31"></script>
+	<div id="dcLocations"></div>
+	<script type="module" src="/js/dc.js?v=p32"></script>
 </body>
 </html>
