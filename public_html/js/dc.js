@@ -19,26 +19,43 @@ import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import * as BufferGeometryUtils from "three/addons/utils/BufferGeometryUtils.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 let camera, scene, renderer, controls, controlObject, stats, gui, locations = {}, maxAnisotropy; // Declare global variables
+const VIEW_OPTS = { Overview: 'overview', 'Top-down': 'top', Aisle: 'aisle', Labels: 'labels', Cables: 'cables' };
+const _viewProxy = { view: 'overview' };   // bound to the GUI 'View' dropdown (replaces the #dcViews button bar)
 let prevTime = performance.now();
 let racksShown = false, showServers = true;
 let objects = {instanced: [], network: null, rackLabels: [], labels: [], room: null, community: null}, models = { racks: {}, servers: {} }, locationNames = {};
 let rackColliders = []; // x/z footprints of placed racks (for collision)
 let roomBounds = null;  // {minX,maxX,minZ,maxZ} wall extents (collide against the walls)
 let roomSpawn = null;   // {x,y,z,lookX,lookZ} a safe spot inside the room to drop the player
+// --- multi-building LOD: neighbours show cheap rack BLOCKS, swapped to full models on approach ---
+let lodBuildings = [];  // per-neighbour state {id, foot, dx,dz, wall rect, door, blocks, blockColliders, full, loading}
+let dcBuildings = [];   // wall/door descriptor for EVERY building (current + neighbours) -> walk-between collision
+let wallColliders = []; // thin AABB slabs for all building walls (door gaps open) + the lot perimeter
+let neighborBlinds = []; // venetian-blind handles for the neighbour windows (slats+cords InstancedMeshes), animated by updateBlinds
+let neighborDoors = []; // iS-logo glass double doors per neighbour (swing open on approach), animated by updateNeighborDoors
+let _posCtrls = null, _guiPosLast = 0; // the x/y/z GUI controllers; their left labels are refreshed by updateGuiPos()
+let roomDoors = [];     // the main building's solid SWING doors (back + left), animated by updateRoomDoors
+let roomSideDoors = []; // their {side,c,half} descriptors -> the current building's extra collision door gaps
+let lodFocus = null;    // {x,z} the player's ground position (set by dc-multi); the LOD keys off this, not the orbit camera
+const LOD_ENTER_PAD = 28; // a neighbour swaps to FULL models when the focus point is within this many units of its walls
+const LOD_EXIT_PAD = 80;  // ...and back to BLOCKS once beyond this (hysteresis stops thrashing at the threshold)
+const LOD_MAX_FULL = 1;   // neighbours at full detail at once (the current building is always full -> budget is 2 buildings)
 const options = {
     useFirstPerson: false,
     showLabels: true,
     showNetwork: true,
     showWalls: true,    // room walls (built from the rack-layout bounds)
     showCeiling: true,  // ceiling + fluorescent fixtures + HVAC ducts
-    faultyLights: 1,    // number of fixtures that flicker (0..20; 1 = a corner one)
+    faultyLights: 1,    // PERCENT of fixtures that flicker, in EVERY building (0..100; default 1%)
+    disco: false,       // when on, every light fixture cycles a random colour every 3-5s
 	moveForward: false,
 	moveBackward: false,
 	moveLeft: false,
 	moveRight: false,
 	canJump: false,
 	collisionMovement: true,
-	domain: 'my.interserver.net',
+	gravityMs2: 9.8,    // jump gravity (m/s²); slider lives in the Movement folder. moon 1.6 .. earth 9.8 .. 40 = barely a hop
+	domain: '',         // data + 3D assets load from THIS origin (same-origin -> no CORS). Set a host here only to pull from elsewhere.
 	location: 4,
 	heightInches: 70,   // player standing/eye height: 3.5ft (42") .. 8ft (96"), default 5'10"
 	waistInches: 36,    // player waist size -> collision radius: 15" .. 60", default 36"
@@ -152,8 +169,21 @@ function displayDatacenter() {
 
 function setNetworkVisible(visible) {
     if (objects.network) objects.network.visible = visible;
+    for (const b of lodBuildings) if (b.full && b.full.network) b.full.network.visible = visible;   // full neighbours' cabling too
 }
 
+// Set a lil-gui controller's left label to "name  value" with the VALUE in a colored span so it stands
+// out (the right number box is hidden via css). Uses $name.innerHTML directly since lil-gui's name() is
+// plain text. No parentheses — the colour separates the value.
+function valLabel(c, name, val) { c.$name.innerHTML = name + '&nbsp;&nbsp;<span class="dc-val">' + val + '</span>'; }
+// Refresh the x/y/z controllers' labels with the live camera position (throttled; programmatic camera
+// moves don't fire onChange).
+function updateGuiPos() {
+    if (!_posCtrls || !camera) return;
+    const now = performance.now();
+    if (now - _guiPosLast < 200) return; _guiPosLast = now;
+    for (const c of _posCtrls) valLabel(c, c._ax, Math.round(camera.position[c._ax]));
+}
 function displayGui() {
     gui = new GUI();
     gui.add( options, 'location', locationNames).listen().onChange( () => { switchLocation(); });
@@ -162,26 +192,32 @@ function displayGui() {
     displayFolder.add(options, 'showNetwork').onChange( (value) => { setNetworkVisible(value); });
     displayFolder.add(options, 'showWalls').name('walls').onChange((v) => { if (objects.room) objects.room.walls.visible = v; });
     displayFolder.add(options, 'showCeiling').name('ceiling').onChange((v) => { if (objects.room) objects.room.ceiling.visible = v; });
-    displayFolder.add(options, 'faultyLights', 0, 20, 1).name('faulty lights').onFinishChange(() => displayDatacenter());
+    const fc = displayFolder.add(options, 'faultyLights', 0, 100, 1);
+    fc.onChange(() => valLabel(fc, 'faulty lights', options.faultyLights + '%')).onFinishChange(() => displayDatacenter());
+    valLabel(fc, 'faulty lights', options.faultyLights + '%');
+    displayFolder.add(options, 'disco').name('disco').onChange((v) => { if (!v) resetDisco(); });   // unchecked default; cycles each fixture's colour
     displayFolder.add(options, 'useFirstPerson').onChange( () => { setupControls(); });
     const moveFolder = gui.addFolder( 'Movement' );
-    moveFolder.add( options, 'canJump').listen().disable();
-    moveFolder.add(camera.position, 'x', -250, 250).listen();
-    moveFolder.add(camera.position, 'y', -250, 250).listen();
-    moveFolder.add(camera.position, 'z', -250, 250).listen();
+    // live camera position. value lives in the LEFT label (the right number box is hidden via css);
+    // refreshed by updateGuiPos() each frame since programmatic camera moves don't fire onChange.
+    const xc = moveFolder.add(camera.position, 'x', -250, 250).listen(); xc._ax = 'x';
+    const yc = moveFolder.add(camera.position, 'y', -250, 250).listen(); yc._ax = 'y';
+    const zc = moveFolder.add(camera.position, 'z', -250, 250).listen(); zc._ax = 'z';
+    _posCtrls = [xc, yc, zc];
+    for (const c of _posCtrls) valLabel(c, c._ax, Math.round(camera.position[c._ax]));
     /*moveFolder.add( options, 'moveLeft').listen().disable();
 			moveFolder.add( options, 'moveRight').listen().disable();
 			moveFolder.add( options, 'moveForward').listen().disable();
 			moveFolder.add( options, 'moveBackward').listen().disable();*/
     moveFolder.add( options, 'collisionMovement');
-    // height + waist are sliders. lil-gui can't reformat the numeric readout, so the formatted
-    // value lives in the controller LABEL and refreshes on change (e.g. "height  5' 10"").
-    const fmtHeight = (i) => `height  ${Math.floor(i / 12)}' ${i % 12}"`;
-    const fmtWaist = (i) => `waist  ${i}"`;
-    const hc = moveFolder.add( options, 'heightInches', 42, 96, 1 ).onChange(() => { camera.position.y = eyeHeight(); hc.name(fmtHeight(options.heightInches)); });
-    hc.name(fmtHeight(options.heightInches));
-    const wc = moveFolder.add( options, 'waistInches', 15, 60, 1 ).onChange(() => { wc.name(fmtWaist(options.waistInches)); });
-    wc.name(fmtWaist(options.waistInches));
+    const gc = moveFolder.add( options, 'gravityMs2', 1.6, 14, 0.1 ).onChange(() => valLabel(gc, 'Gravity', options.gravityMs2 + ' m/s²'));
+    valLabel(gc, 'Gravity', options.gravityMs2 + ' m/s²');
+    // height + waist: the formatted value lives in the controller label (colourised) and refreshes on change.
+    const hLbl = (i) => `${Math.floor(i / 12)}' ${i % 12}"`;
+    const hc = moveFolder.add( options, 'heightInches', 42, 96, 1 ).onChange(() => { camera.position.y = eyeHeight(); valLabel(hc, 'height', hLbl(options.heightInches)); });
+    valLabel(hc, 'height', hLbl(options.heightInches));
+    const wc = moveFolder.add( options, 'waistInches', 15, 60, 1 ).onChange(() => valLabel(wc, 'waist', options.waistInches + '"'));
+    valLabel(wc, 'waist', options.waistInches + '"');
     moveFolder.open(); // expanded on load
     buildLocationButtons();
 }
@@ -198,8 +234,11 @@ function mergeLocations(data) {
     }
 }
 
+// Build a URL for datacenter data + 3D assets. Same-origin by default (options.domain==''), which
+// avoids CORS — mystage/prod serve their own /ajax + /images/3d. Set options.domain to pull elsewhere.
+function dcUrl(path) { return (options.domain ? 'https://' + options.domain : '') + path; }
 function fetchLocation(locId) {
-    return fetch('https://' + options.domain + '/ajax/datacenter.php?location=' + Number(locId))
+    return fetch(dcUrl('/ajax/datacenter.php?location=' + Number(locId)))
         .then((response) => {
             if (!response.ok) throw new Error('Network response was not ok');
             return response.json();
@@ -254,7 +293,7 @@ function buildLocationButtons() {
 
 function loadDatacenter() {
     // Fetch ALL locations at once so every building's footprint is known for the community layout.
-    fetch('https://' + options.domain + '/ajax/datacenter.php')
+    fetch(dcUrl('/ajax/datacenter.php'))
         .then((r) => { if (!r.ok) throw new Error('Network response was not ok'); return r.json(); })
         .then((data) => {
             mergeLocations(data);
@@ -269,6 +308,26 @@ function loadDatacenter() {
 function clearScene() {
     rackColliders = []; // rebuilt as racks are re-placed
     roomBounds = null; roomSpawn = null;
+    // Multi-building LOD: dispose any neighbour FULL models (their group is added straight to the scene,
+    // separate from objects.community). Geometry/material are shared cached templates -> only free each
+    // InstancedMesh's instanceMatrix (inst.dispose), like objects.instanced above. Block meshes live in
+    // objects.community and are disposed by its traverse below.
+    for (const b of lodBuildings) {
+        if (b.full) {
+            scene.remove(b.full.group);
+            b.full.group.traverse((n) => {
+                if (!n.isMesh) return;
+                if (n.isInstancedMesh) { n.dispose(); return; }   // shared cached rack/server geo+mat -> instanceMatrix only
+                n.geometry.dispose();
+                const mats = Array.isArray(n.material) ? n.material : [n.material];
+                for (const m of mats) { if (m.map) m.map.dispose(); m.dispose(); }   // interior meshes own unique geo/mat/maps
+            });
+            b.full = null;
+        }
+        b.loading = false;
+    }
+    for (const h of neighborBlinds) { if (h.inst) h.inst.dispose(); if (h.cords) h.cords.dispose(); } // free instanceMatrix; the meshes live in objects.community (disposed below)
+    lodBuildings = []; dcBuildings = []; wallColliders = []; neighborBlinds = []; neighborDoors = []; roomDoors = []; roomSideDoors = [];
     // Instanced model meshes: detach + dispose the per-instance buffer. Their geometry and
     // material are the cached model templates in models.* (shared across rebuilds), so they
     // are kept; InstancedMesh.dispose() only frees the instanceMatrix buffer.
@@ -409,11 +468,17 @@ function extractModelMeshes(root, scale) {
     return { parts, box };
 }
 
-function buildInstanced(model, placements, kind) {
+// `sink` (optional) redirects output to a per-building group instead of the live scene/current-building
+// state: { group, meshes:[], colliders:[] }. Default (undefined) = current building -> scene + objects.instanced
+// + rackColliders, exactly as before. Used to render a NEIGHBOUR's full models at its world offset.
+function buildInstanced(model, placements, kind, sink) {
     const n = placements.length;
     if (!model || !model.parts || n === 0) return;
     const assetIds = placements.map((p) => p.assetId);
     const assetData = placements.map((p) => p.asset);
+    const container = sink ? sink.group : scene;
+    const instList = sink ? sink.meshes : objects.instanced;
+    const collList = sink ? sink.colliders : rackColliders;
     const created = [];
     for (const part of model.parts) {
         const inst = new THREE.InstancedMesh(part.geometry, part.material, n);
@@ -430,8 +495,8 @@ function buildInstanced(model, placements, kind) {
         inst.userData.assetData = assetData; // instanceId -> asset object (hostname/name/id)
         inst.userData.placements = placements; // instanceId -> {x,y,z} placement (highlight box)
         inst.userData.modelBox = model.box;    // model-space bounds (highlight box size)
-        scene.add(inst);
-        objects.instanced.push(inst);
+        container.add(inst);
+        instList.push(inst);
         created.push(inst);
     }
     // Racks are the only collidable furniture. model.box unions EVERY sub-mesh -- including the
@@ -457,7 +522,7 @@ function buildInstanced(model, placements, kind) {
         if (!fb.isEmpty()) {
             for (const inst of created) inst.userData.footBox = fb; // tight highlight box (excludes the wide floor tile)
             for (const p of placements) {
-                rackColliders.push({
+                collList.push({
                     minX: p.x + fb.min.x, maxX: p.x + fb.max.x,
                     minZ: p.z + fb.min.z, maxZ: p.z + fb.max.z,
                 });
@@ -483,7 +548,7 @@ function getRackModels() {
 			// Create a closure to capture the current value of idx
 			(function (modelIdx) {
 				const currentModel = rackTypes[modelIdx];
-				loadGlbWithFallback('https://'+options.domain+'/images/3d/racks/', currentModel, function (gltf) {
+				loadGlbWithFallback(dcUrl('/images/3d/racks/'), currentModel, function (gltf) {
 						const scale = 10;
 						const rotationAngle = Math.PI / 2; // 90 degrees in radians
 						const model = gltf.scene;
@@ -538,7 +603,7 @@ function getServerModels() {
 				[currentModel, currentUnits] = serverTypes[modelIdx];
                 //console.log("Loading Server "+currentModel);
 				//loaderDae.load('https://'+options.domain+'/images/3d/servers/dae/'+currentModel+'/model.dae', function (collada) {
-				loadGlbWithFallback('https://'+options.domain+'/images/3d/servers/gltf/exported-centered/', currentModel, function (gltf) {
+				loadGlbWithFallback(dcUrl('/images/3d/servers/gltf/exported-centered/'), currentModel, function (gltf) {
 						//const scale = 0.26;
 						const scale = 10;
 						const rotationAngle = Math.PI / 2; // 90 degrees in radians
@@ -601,11 +666,11 @@ function displayServers(modelIdx) {
 }
 
 function displayRackText(text, asset, x, z) {
-    displayText(text, asset, x - 2.5, 19.5, z + 4.2); // just proud of the rack front face
+    return displayText(text, asset, x - 2.5, 19.5, z + 4.2); // just proud of the rack front face
 }
 
 function displayServerText(text, asset, x, y, z) {
-    displayText(text, asset, x + 3.5, y + 0.25, z + 0.2);
+    return displayText(text, asset, x + 3.5, y + 0.25, z + 0.2);
 }
 
 const LABEL_DISTANCE = 40;                                  // draw a label only within this many world units
@@ -665,6 +730,7 @@ function displayText(text, data, x, y, z) {
     } else {
         objects.rackLabels.push(label);
     }
+    return label;
 }
 
 function updateLabels() {
@@ -751,20 +817,23 @@ function cableCurvePoints(corners, rng) {
     return out;
 }
 
-function displaySwitches() {
+function displaySwitches(locId, dx, dz, sink) {
     // One merged tube mesh for ALL switchport cabling (1 draw call): each cable is a rounded 3D
     // tube (matte "plastic" cylinder) routed like real structured cabling. Racks form groups
     // (contiguous runs within a row). A cable goes out the back -> up to its row's overhead tray
     // -> along to the nearest END of its group -> trunk across to the destination group's nearest
     // end -> along that row to the asset. Same-rack links stay short; same-group links run along
     // the shared row tray without leaving the group.
-    const racks = locations[options.location].racks;
+    locId = (locId === undefined) ? options.location : locId;
+    dx = dx || 0; dz = dz || 0;
+    const intraOnly = !!sink;   // neighbours: only draw cables whose endpoints are inside THIS building
+    const racks = (locations[locId] || {}).racks; if (!racks) return;
     const tubes = [];
     const addCable = (pts, hex, off, seed) => {
         const vecs = [];
         for (let k = 0; k < pts.length; k++) {
             const p = pts[k];
-            let x = p[0], y = p[1], z = p[2];
+            let x = p[0] + dx, y = p[1], z = p[2] + dz;   // shift the whole route into this building's plot
             // offset the middle of the route (not the exact port/asset ends) so bundled cables spread
             if (off && k > 0 && k < pts.length - 1) { x += off.x; y += off.y; z += off.z; }
             const v = new THREE.Vector3(x, y, z);
@@ -819,6 +888,7 @@ function displaySwitches() {
                 if (px > portWidth) { px -= portWidth; py -= 0.15; }
                 px = positionX + 0.15 + (0.15 * px);
                 const pz = positionZ;
+                if (intraOnly && String(portData.datacenter) !== String(locId)) { continue; } // neighbour: only its own internal cabling
                 const destLoc = locations[portData.datacenter];
                 const destRack = (destLoc && destLoc.racks) ? destLoc.racks[portData.rack] : null;
                 const destServer = (destRack && destRack.servers) ? destRack.servers[portData.asset] : null;
@@ -832,17 +902,20 @@ function displaySwitches() {
                     y: (((seed * 29) % 1000) / 1000 - 0.5) * CABLE_SPREAD * 0.6,
                     z: (((seed * 97) % 1000) / 1000 - 0.5) * CABLE_SPREAD,
                 };
-                const sameRack = (String(portData.datacenter) === String(options.location)) && (String(portData.rack) === String(rackKey));
+                const sameRack = (String(portData.datacenter) === String(locId)) && (String(portData.rack) === String(rackKey));
                 const destGroup = groupOf(destRack.x, destRack.y);
-                const sameGroup = (String(portData.datacenter) === String(options.location))
+                const sameGroup = (String(portData.datacenter) === String(locId))
                     && destGroup.y === srcGroup.y && destGroup.xMin === srcGroup.xMin && destGroup.xMax === srcGroup.xMax;
-                // Switch end: come out the FRONT port, up the rack face, and over the top to the rear
-                // tray (so switch patches route around the front, not straight back through the box).
+                // Switch end: out the FRONT port, sideways to the nearest rack edge, UP that side
+                // (so patches hug the rack side instead of climbing the front over the servers),
+                // then over the top to the rear overhead tray.
+                const sideX = (px <= baseA.x ? baseA.x - 2.7 : baseA.x + 2.7);
                 const switchStart = [
-                    [px, py, pz],                 // front port
-                    [px, py, pz + 2.5],           // out the front a bit
-                    [px, 19.5, pz + 2.5],         // up the front of the rack
-                    [px, CABLE_OVERHEAD, rearAz], // over the top to the rear overhead tray
+                    [px, py, pz],                    // front port
+                    [px, py, pz + 1.8],              // out the front a touch
+                    [sideX, py, pz + 1.8],           // across to the side edge of the rack
+                    [sideX, 19.5, pz + 1.8],         // up the side edge, clear of the server faces
+                    [sideX, CABLE_OVERHEAD, rearAz], // over the top to the rear overhead tray
                 ];
                 if (sameRack || sameGroup) {
                     // along the overhead to the server's column, then drop BEHIND it and come straight in
@@ -870,7 +943,7 @@ function displaySwitches() {
             }
         }
     }
-    if (tubes.length === 0) { objects.network = null; return; }
+    if (tubes.length === 0) { if (!sink) objects.network = null; return; }
     const geometry = BufferGeometryUtils.mergeGeometries(tubes, false);
     tubes.forEach((g) => g.dispose());
     // matte plastic base + a clearcoat layer for a slight gloss / rounded depth on the cables
@@ -878,8 +951,8 @@ function displaySwitches() {
     const cables = new THREE.Mesh(geometry, material);
     cables.visible = options.showNetwork;
     cables.frustumCulled = false;
-    scene.add(cables);
-    objects.network = cables;
+    (sink ? sink.group : scene).add(cables);
+    if (sink) sink.network = cables; else objects.network = cables;
 }
 
 // Procedural floor tile: slightly off-white tiles with seams + sporadic tiny speckles. Drawn as a
@@ -888,15 +961,15 @@ function makeFloorTexture() {
 	const tiles = 4, px = 128, size = tiles * px;
 	const c = document.createElement('canvas'); c.width = c.height = size;
 	const g = c.getContext('2d');
-	g.fillStyle = '#eeece4'; g.fillRect(0, 0, size, size); // off-white base
-	g.strokeStyle = '#dcd9cf'; g.lineWidth = 2;            // tile seams
-	for (let i = 0; i <= tiles; i++) {
-		const p = i * px;
-		g.beginPath(); g.moveTo(p, 0); g.lineTo(p, size); g.moveTo(0, p); g.lineTo(size, p); g.stroke();
+	g.fillStyle = '#cfcabc'; g.fillRect(0, 0, size, size);     // grey-beige base (darker -> tiles don't blow out white)
+	for (let ty = 0; ty < tiles; ty++) for (let tx = 0; tx < tiles; tx++) {   // slight per-tile shade variation
+		const v = ((Math.random() * 14) | 0) - 7; g.fillStyle = `rgb(${207 + v},${202 + v},${188 + v})`; g.fillRect(tx * px + 2, ty * px + 2, px - 4, px - 4);
 	}
-	for (let i = 0; i < 460; i++) {                        // sporadic tiny spots
-		const x = Math.random() * size, y = Math.random() * size, r = Math.random() * 1.4 + 0.4;
-		g.fillStyle = Math.random() < 0.5 ? '#cfccc0' : '#b9b4a6';
+	g.strokeStyle = '#938e7f'; g.lineWidth = 3;                // distinctly darker grout so the squares read
+	for (let i = 0; i <= tiles; i++) { const p = i * px; g.beginPath(); g.moveTo(p, 0); g.lineTo(p, size); g.moveTo(0, p); g.lineTo(size, p); g.stroke(); }
+	for (let i = 0; i < 720; i++) {                            // random speckles, mixed light + dark for contrast
+		const x = Math.random() * size, y = Math.random() * size, r = Math.random() * 1.7 + 0.5;
+		g.fillStyle = Math.random() < 0.5 ? '#86816f' : '#c7c2b2';
 		g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill();
 	}
 	const t = new THREE.CanvasTexture(c);
@@ -921,7 +994,7 @@ function loadFloor() {
 // Room shell built around the racks. We have no real room dimensions in the data, so derive them
 // from the rack-layout bounds + a margin. Produces 4 walls + a ceiling, with fluorescent strip
 // fixtures and HVAC ducts along the top. Walls and ceiling are independently toggleable.
-const ROOM_MARGIN = 14;     // gap from the outermost rack footprints to the walls
+const ROOM_MARGIN = 28;     // gap from the outermost rack footprints to the walls
 const ROOM_CEIL_Y = 38.5;   // ceiling height (~15 ft at this scene scale; racks are ~20 / ~7.8 ft)
 const CEIL_TILE = 36 * UNITS_PER_INCH; // 3 ft drop-ceiling tiles
 
@@ -1007,10 +1080,22 @@ function makeSignTexture(text) {
 const WIN_SZ = 96 * UNITS_PER_INCH;     // 8 ft windows
 const WIN_BOTTOM = 18 * UNITS_PER_INCH; // sill ~1.5 ft off the ground
 const MULLION = 3 * UNITS_PER_INCH;     // 3" matte-black metal frame between adjacent windows
+// --- Venetian window blinds (slats tilted ~30deg). DOWN by default (covers ~half the glass -> cuts
+// see-through overdraw); auto-raise (bottom-up gather) when the viewer gets close to a window, then
+// descend again 2s after they walk away. Built once per room as ONE InstancedMesh for all slats. ---
+const BLIND_SLATS = 32;                       // slats per window
+const BLIND_TILT = 30 * Math.PI / 180;        // slat tilt when lowered
+const BLIND_DEPTH = 0.42;                      // front-back lath width (units) -> ~half-blocks at 30deg at this density
+const BLIND_THICK = 0.09;                      // slat thickness
+const BLIND_NEAR = 28;                         // raise the blinds within this distance of a window
+const BLIND_DESCEND_DELAY = 2.0;               // seconds after leaving before they descend again
+const BLIND_RATE = 0.85;                       // open/close speed (full travel ~1.2s)
+let windowSlots = [];                          // {axis,fixed,c,gw,midY} pushed by windowWall, drained by buildBlinds
+let _blindLast = 0;
 // Exterior detailing: a long ribbon of 8' "privacy glass" windows (dark from outside) with
 // matte-black mullions between them, plus a door near the middle of the front ribbon.
 function addBuildingExterior(parent, px, pz, w, d, H) {
-	const glass = makeGlassMaterial();
+	const glass = makeDarkGlassMaterial();   // neighbouring buildings -> dark mirrored glass from outside
 	const mullMat = new THREE.MeshStandardMaterial({ color: 0x0a0a0a, roughness: 0.95, metalness: 0.25 });
 	const winY = WIN_BOTTOM + WIN_SZ / 2, pitch = WIN_SZ + MULLION;
 	// ribbon of windows centred on a wall. side 'z' = front/back (vary x); side 'x' = sides (vary z).
@@ -1046,68 +1131,614 @@ function addBuildingExterior(parent, px, pz, w, d, H) {
 function makeGlassMaterial() {
 	return new THREE.MeshPhysicalMaterial({ color: 0x9fb6c4, metalness: 0.0, roughness: 0.05, transparent: true, opacity: 0.26, reflectivity: 0.6, envMapIntensity: 1.5, clearcoat: 0.6, clearcoatRoughness: 0.05, side: THREE.DoubleSide });
 }
+// Dark mirrored "privacy glass" for the OUTSIDE face: heavily tinted + much less transparent than the
+// interior glass, with a strong reflective sheen so from outside it reads as a dark glassy mirror
+// (not the old see-through pane). Used for the neighbouring buildings + the outward face of room windows.
+function makeDarkGlassMaterial(side) {
+	return new THREE.MeshPhysicalMaterial({ color: 0x0d1216, metalness: 0.5, roughness: 0.08, transparent: true, opacity: 0.82, reflectivity: 0.95, envMapIntensity: 2.6, clearcoat: 0.9, clearcoatRoughness: 0.04, side: side === undefined ? THREE.DoubleSide : side });
+}
 // A wall with a real ribbon of 8' windows: solid below the sill + above the head, a glass band (with
 // matte-black mullions) between -> see-through from inside, reflective from outside. axis 'x' spans x
 // (z = fixed); 'z' spans z (x = fixed). doorC = door centre along the wall, or null.
-function windowWall(parent, axis, fixed, c0, c1, H, wallMat, glass, mullMat, doorC) {
+function windowWall(parent, axis, fixed, c0, c1, H, wallMat, glass, mullMat, doorC, swing) {
 	const len = c1 - c0, cen = (c0 + c1) / 2, th = 0.4;
 	const sill = WIN_BOTTOM, head = WIN_BOTTOM + WIN_SZ, DOOR_H = 17.5;
+	let retDoor = null;   // when swing=true, the {pivot,...} for the door panel so the caller can animate it
 	const wall = (w, h, along, y) => { const g = axis === 'x' ? new THREE.BoxGeometry(w, h, th) : new THREE.BoxGeometry(th, h, w); const m = new THREE.Mesh(g, wallMat); axis === 'x' ? m.position.set(along, y, fixed) : m.position.set(fixed, y, along); parent.add(m); };
 	wall(len, H - head, cen, (head + H) / 2);                        // top strip (above the windows)
 	if (doorC == null) { wall(len, sill, cen, sill / 2); }           // bottom strip (below the windows)
 	else {
-		const dw = 9, lL = (doorC - dw / 2) - c0, rL = c1 - (doorC + dw / 2);
+		const dw = 16, lL = (doorC - dw / 2) - c0, rL = c1 - (doorC + dw / 2);
 		if (lL > 1) wall(lL, sill, c0 + lL / 2, sill / 2);
 		if (rL > 1) wall(rL, sill, c1 - rL / 2, sill / 2);
 		wall(dw, head - DOOR_H, doorC, (DOOR_H + head) / 2);         // panel above the door
-		const dg = axis === 'x' ? new THREE.BoxGeometry(dw, DOOR_H, 0.5) : new THREE.BoxGeometry(0.5, DOOR_H, dw);
-		const dm = new THREE.Mesh(dg, new THREE.MeshStandardMaterial({ color: 0x4a3c2c, roughness: 0.7 }));
-		axis === 'x' ? dm.position.set(doorC, DOOR_H / 2, fixed) : dm.position.set(fixed, DOOR_H / 2, doorC); parent.add(dm);
-		const kb = new THREE.Mesh(new THREE.SphereGeometry(0.35, 10, 10), new THREE.MeshStandardMaterial({ color: 0xd9c46a, metalness: 0.8, roughness: 0.3 }));
-		axis === 'x' ? kb.position.set(doorC + 3, 9, fixed) : kb.position.set(fixed, 9, doorC + 3); parent.add(kb);
+		const doorMat = new THREE.MeshStandardMaterial({ color: 0x4a3c2c, roughness: 0.7 });
+		const knobMat = new THREE.MeshStandardMaterial({ color: 0xd9c46a, metalness: 0.8, roughness: 0.3 });
+		if (swing) {   // hinge the panel at one edge so it can swing open (buildRoom registers it for animation)
+			const pivot = new THREE.Group();
+			axis === 'x' ? pivot.position.set(doorC - dw / 2, 0, fixed) : pivot.position.set(fixed, 0, doorC - dw / 2);
+			const dm = new THREE.Mesh(axis === 'x' ? new THREE.BoxGeometry(dw, DOOR_H, 0.5) : new THREE.BoxGeometry(0.5, DOOR_H, dw), doorMat);
+			axis === 'x' ? dm.position.set(dw / 2, DOOR_H / 2, 0) : dm.position.set(0, DOOR_H / 2, dw / 2); pivot.add(dm);
+			const kb = new THREE.Mesh(new THREE.SphereGeometry(0.35, 10, 10), knobMat);
+			axis === 'x' ? kb.position.set(dw - 1.4, 9, 0.45) : kb.position.set(0.45, 9, dw - 1.4); pivot.add(kb);
+			parent.add(pivot); retDoor = { pivot, axis, fixed, doorC, dw };
+		} else {
+			const dm = new THREE.Mesh(axis === 'x' ? new THREE.BoxGeometry(dw, DOOR_H, 0.5) : new THREE.BoxGeometry(0.5, DOOR_H, dw), doorMat);
+			axis === 'x' ? dm.position.set(doorC, DOOR_H / 2, fixed) : dm.position.set(fixed, DOOR_H / 2, doorC); parent.add(dm);
+			const kb = new THREE.Mesh(new THREE.SphereGeometry(0.35, 10, 10), knobMat);
+			axis === 'x' ? kb.position.set(doorC + 3, 9, fixed) : kb.position.set(fixed, 9, doorC + 3); parent.add(kb);
+		}
 	}
-	const pitch = WIN_SZ + MULLION, count = Math.max(1, Math.floor(len / pitch));
-	const start = cen - (count * pitch - MULLION) / 2 + WIN_SZ / 2, midY = (sill + head) / 2;
-	for (let i = 0; i < count; i++) {
-		const a = start + i * pitch;
-		if (doorC == null || Math.abs(a - doorC) >= WIN_SZ * 0.55) {
-			const gm = new THREE.Mesh(new THREE.PlaneGeometry(WIN_SZ, WIN_SZ), glass);
-			if (axis === 'z') gm.rotation.y = Math.PI / 2;
-			axis === 'x' ? gm.position.set(a, midY, fixed) : gm.position.set(fixed, midY, a); parent.add(gm);
+	// Tile the window band (sill..head) SEAMLESSLY: solid wall with the occasional window punched in
+	// (no gaps). Non-door walls get a window every ~3rd bay; the door wall is wall everywhere except
+	// the door opening + exactly one window flanking each side of it.
+	const midY = (sill + head) / 2, bandH = head - sill;
+	const wallStrip = (x0, x1) => {                       // solid wall covering [x0,x1] of the band
+		const wl = x1 - x0; if (wl < 0.1) return;
+		const g = axis === 'x' ? new THREE.BoxGeometry(wl, bandH, th) : new THREE.BoxGeometry(th, bandH, wl);
+		const m = new THREE.Mesh(g, wallMat); const c = (x0 + x1) / 2;
+		axis === 'x' ? m.position.set(c, midY, fixed) : m.position.set(fixed, midY, c); parent.add(m);
+	};
+	const glassPane = (c, gw) => {                        // a window of width gw centred at c
+		const gm = new THREE.Mesh(new THREE.PlaneGeometry(gw, WIN_SZ), glass);
+		if (axis === 'z') gm.rotation.y = Math.PI / 2;
+		axis === 'x' ? gm.position.set(c, midY, fixed) : gm.position.set(fixed, midY, c); parent.add(gm);
+	};
+	const mullion = (c) => {                              // thin black frame at a window edge
+		const g = axis === 'x' ? new THREE.BoxGeometry(MULLION, WIN_SZ, 0.6) : new THREE.BoxGeometry(0.6, WIN_SZ, MULLION);
+		const m = new THREE.Mesh(g, mullMat); axis === 'x' ? m.position.set(c, midY, fixed) : m.position.set(fixed, midY, c); parent.add(m);
+	};
+	const window = (c, gw) => { glassPane(c, gw); mullion(c - gw / 2); mullion(c + gw / 2); windowSlots.push({ axis, fixed, c, gw, midY }); };
+	if (doorC != null) {
+		const dHalf = 8, gw = WIN_SZ, gap = 0.6;
+		const lC = doorC - dHalf - gap - gw / 2, rC = doorC + dHalf + gap + gw / 2;  // flank-window centres
+		wallStrip(c0, lC - gw / 2); window(lC, gw); wallStrip(lC + gw / 2, doorC - dHalf);   // corner -> win -> door
+		wallStrip(doorC + dHalf, rC - gw / 2); window(rC, gw); wallStrip(rC + gw / 2, c1);   // door -> win -> corner
+	} else {
+		const bays = Math.max(1, Math.round(len / (WIN_SZ + MULLION))), step = len / bays;
+		for (let i = 0; i < bays; i++) {
+			const x0 = c0 + i * step, x1 = x0 + step, c = (x0 + x1) / 2;
+			if (i % 3 === 1 && step > WIN_SZ + 1) { wallStrip(x0, c - WIN_SZ / 2); window(c, WIN_SZ); wallStrip(c + WIN_SZ / 2, x1); }
+			else wallStrip(x0, x1);
 		}
-		if (i < count - 1) {
-			const mg = axis === 'x' ? new THREE.BoxGeometry(MULLION, WIN_SZ, 0.5) : new THREE.BoxGeometry(0.5, WIN_SZ, MULLION);
-			const mm = new THREE.Mesh(mg, mullMat); axis === 'x' ? mm.position.set(a + pitch / 2, midY, fixed) : mm.position.set(fixed, midY, a + pitch / 2); parent.add(mm);
+	}
+	return retDoor;
+}
+// Build ONE InstancedMesh holding every slat of every window (1 draw call) + a merged static mesh of
+// the pull-cords. Returns the handle stored on objects.room.blinds and animated by updateBlinds().
+function buildBlinds(parent, roomCx, roomCz, slots, addDarkPane) {
+	if (!slots || !slots.length) return null;
+	const slatGeo = new THREE.BoxGeometry(1, BLIND_THICK, BLIND_DEPTH);   // local x = width (scaled per instance)
+	const slatMat = new THREE.MeshStandardMaterial({ color: 0xd7d1c4, roughness: 0.72, metalness: 0.04, side: THREE.DoubleSide });
+	const inst = new THREE.InstancedMesh(slatGeo, slatMat, slots.length * BLIND_SLATS);
+	inst.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+	inst.frustumCulled = false;
+	// cords are an InstancedMesh too (2 per window) so they RETRACT with the blind (the string rises as
+	// the slats gather, instead of dangling full-length over a cleared window). unit-height; scaled in layoutBlinds.
+	const cordGeo = new THREE.BoxGeometry(0.1, 1, 0.1);
+	const cords = new THREE.InstancedMesh(cordGeo, new THREE.MeshStandardMaterial({ color: 0x6b6b6b, roughness: 0.85 }), slots.length * 2);
+	cords.instanceMatrix.setUsage(THREE.DynamicDrawUsage); cords.frustumCulled = false;
+	const darkMat = addDarkPane ? makeDarkGlassMaterial(THREE.FrontSide) : null;   // dark-outside pane (main room only; neighbours use tinted glass)
+	const wins = [], inch = UNITS_PER_INCH;
+	for (const sl of slots) {
+		const y0 = sl.midY - WIN_SZ / 2;
+		let nx = 0, nz = 0, yaw = 0;                                       // inward normal + width-axis yaw
+		if (sl.axis === 'x') { nz = Math.sign(roomCz - sl.fixed) || 1; }   // wall spans x -> faces +/-z
+		else { nx = Math.sign(roomCx - sl.fixed) || 1; yaw = Math.PI / 2; }// wall spans z -> faces +/-x
+		const inset = 0.7;
+		const px = sl.axis === 'x' ? sl.c : sl.fixed + nx * inset;
+		const pz = sl.axis === 'x' ? sl.fixed + nz * inset : sl.c;
+		const coff = sl.gw / 2 - inch;                                     // cord (x,z) positions, an inch in from each end
+		const cordXZ = sl.axis === 'x' ? [[sl.c - coff, pz], [sl.c + coff, pz]] : [[px, sl.c - coff], [px, sl.c + coff]];
+		wins.push({ y0, gw: sl.gw, yaw, px, pz, cordXZ, center: new THREE.Vector3(px, sl.midY, pz), open: 0, target: 0, leaveT: -1e9 });
+		if (darkMat) {
+			const dg = new THREE.PlaneGeometry(sl.gw, WIN_SZ);
+			if (sl.axis === 'x') { dg.rotateY(nz > 0 ? Math.PI : 0); dg.translate(sl.c, sl.midY, sl.fixed - nz * 0.2); }
+			else { dg.rotateY(nx > 0 ? -Math.PI / 2 : Math.PI / 2); dg.translate(sl.fixed - nx * 0.2, sl.midY, sl.c); }
+			parent.add(new THREE.Mesh(dg, darkMat));   // separate mesh per pane -> correct transparency sorting
 		}
+	}
+	parent.add(inst); parent.add(cords);
+	const handle = { inst, cords, wins };
+	layoutBlinds(handle);                                                  // initial matrices -> all lowered
+	return handle;
+}
+const _bd = new THREE.Object3D(), _qTilt = new THREE.Quaternion(), _qYaw = new THREE.Quaternion(), _bq = new THREE.Quaternion();
+const _bX = new THREE.Vector3(1, 0, 0), _bY = new THREE.Vector3(0, 1, 0);
+// Lay out every slat from each window's current `open` (0 = down/tilted, 1 = raised/stacked at top).
+// Raise = bottom-up gather: the gather point rises from sill to head; gathered slats stack tightly
+// just under it (near-flat), the rest still hang at their lowered tilt.
+function layoutBlinds(h) {
+	const spacing = WIN_SZ / BLIND_SLATS, pack = BLIND_THICK * 1.5;
+	let idx = 0, cIdx = 0;
+	for (const w of h.wins) {
+		const gatherY = w.y0 + w.open * WIN_SZ;
+		let G = 0; for (let i = 0; i < BLIND_SLATS; i++) if (w.y0 + (i + 0.5) * spacing <= gatherY) G++;
+		for (let i = 0; i < BLIND_SLATS; i++) {
+			let y, tilt;
+			if (i < G) { y = gatherY - (G - 1 - i) * pack; tilt = BLIND_TILT * 0.18; }
+			else { y = w.y0 + (i + 0.5) * spacing; tilt = BLIND_TILT; }
+			_qTilt.setFromAxisAngle(_bX, tilt); _qYaw.setFromAxisAngle(_bY, w.yaw); _bq.copy(_qYaw).multiply(_qTilt);
+			_bd.position.set(w.px, y, w.pz); _bd.quaternion.copy(_bq); _bd.scale.set(w.gw, 1, 1); _bd.updateMatrix();
+			h.inst.setMatrixAt(idx++, _bd.matrix);
+		}
+		// cords span from the head (y1) down to the bottom of the lowest slat -> they shorten/rise with the blind
+		if (h.cords) {
+			const y1 = w.y0 + WIN_SZ, cordBottom = G > 0 ? (gatherY - (G - 1) * pack) : w.y0;
+			const cLen = Math.max(0.01, y1 - cordBottom), cMid = (y1 + cordBottom) / 2;
+			for (const c of w.cordXZ) { _bd.position.set(c[0], cMid, c[1]); _bd.quaternion.identity(); _bd.scale.set(1, cLen, 1); _bd.updateMatrix(); h.cords.setMatrixAt(cIdx++, _bd.matrix); }
+		}
+	}
+	h.inst.instanceMatrix.needsUpdate = true;
+	if (h.cords) h.cords.instanceMatrix.needsUpdate = true;
+}
+// Per-frame: raise the blinds on windows the viewer is near, lower them 2s after they leave.
+function updateBlinds() {
+	const handles = [];
+	if (objects.room && objects.room.blinds) handles.push(objects.room.blinds);
+	for (const h of neighborBlinds) handles.push(h);   // every neighbour's blinds raise on proximity too (from outside)
+	if (!handles.length) return;
+	const now = performance.now();
+	let dt = _blindLast ? (now - _blindLast) / 1000 : 0; _blindLast = now;
+	if (dt <= 0) return; if (dt > 0.1) dt = 0.1;
+	const nowS = now / 1000, cam = camera.position, step = BLIND_RATE * dt;
+	for (const h of handles) {
+		let any = false;
+		for (const w of h.wins) {
+			if (cam.distanceTo(w.center) < BLIND_NEAR) { w.target = 1; w.leaveT = nowS; }
+			else if (nowS - w.leaveT > BLIND_DESCEND_DELAY) { w.target = 0; }
+			if (w.open !== w.target) {
+				w.open = w.open < w.target ? Math.min(w.target, w.open + step) : Math.max(w.target, w.open - step);
+				any = true;
+			}
+		}
+		if (any) layoutBlinds(h);
+	}
+}
+// Tinted glass for the neighbour curtain-walls: see-through enough to read the rack BLOCKS inside as
+// dark cabinet rows, glassy/reflective from outside. Lighter than the room's privacy glass on purpose.
+function makeNeighborGlassMaterial() {
+	return new THREE.MeshPhysicalMaterial({ color: 0x243443, metalness: 0.4, roughness: 0.12, transparent: true, opacity: 0.5, reflectivity: 0.7, envMapIntensity: 1.8, clearcoat: 0.5, clearcoatRoughness: 0.06, side: THREE.DoubleSide });
+}
+// Cheap rack proxies for a neighbour: one tall box per real rack, MERGED into a single opaque mesh
+// (1 draw call for the whole building) + matching x/z colliders. Placed by the same coordinate
+// transform as the current building, offset by (dx,dz) into the neighbour's community plot.
+const BLOCK_W = 5.4, BLOCK_D = 6.4, BLOCK_H = 18;   // a cabinet-ish proxy (real racks are ~20u tall)
+function buildRackBlocks(id, dx, dz, mat) {
+	const racks = (locations[id] || {}).racks || {};
+	const geos = [], colliders = [];
+	for (const k in racks) {
+		const r = racks[k];
+		const p = convertRackCoordinatesToPosition(r.x, r.y);
+		const wx = p.x + dx, wz = p.z + dz;
+		const g = new THREE.BoxGeometry(BLOCK_W, BLOCK_H, BLOCK_D); g.translate(wx, BLOCK_H / 2, wz); geos.push(g);
+		colliders.push({ minX: wx - BLOCK_W / 2, maxX: wx + BLOCK_W / 2, minZ: wz - BLOCK_D / 2, maxZ: wz + BLOCK_D / 2 });
+	}
+	if (!geos.length) return null;
+	const mesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(geos), mat);
+	geos.forEach((g) => g.dispose());
+	return { mesh, colliders };
+}
+// An open doorway frame (two posts + a lintel) on one side of a neighbour: 'N'/'S' = a gap in the
+// z-wall (varies x), 'E'/'W' = a gap in the x-wall (varies z). doorC is the gap centre along that wall.
+function addDoorway(grp, side, px, pz, f, doorC, doorHalf, dH, mat) {
+	const post = (x, z) => { const m = new THREE.Mesh(new THREE.BoxGeometry(0.9, dH, 0.9), mat); m.position.set(x, dH / 2, z); grp.add(m); };
+	if (side === 'N' || side === 'S') {
+		const fz = pz + (side === 'S' ? f.d / 2 : -f.d / 2);
+		post(doorC - doorHalf, fz); post(doorC + doorHalf, fz);
+		const lintel = new THREE.Mesh(new THREE.BoxGeometry(doorHalf * 2 + 1.8, 1.3, 0.9), mat); lintel.position.set(doorC, dH, fz); grp.add(lintel);
+	} else {
+		const fx = px + (side === 'E' ? f.w / 2 : -f.w / 2);
+		post(fx, doorC - doorHalf); post(fx, doorC + doorHalf);
+		const lintel = new THREE.Mesh(new THREE.BoxGeometry(0.9, 1.3, doorHalf * 2 + 1.8), mat); lintel.position.set(fx, dH, doorC); grp.add(lintel);
+	}
+}
+// A neighbour's outer shell, matching the current building's exterior: mostly SOLID wall with the
+// occasional window (every ~3rd bay). Built as ONE merged opaque mesh per building (cheap for ~11 of
+// them) plus its window panes. The door-side wall is left open at the doorway (doorSide N/S/E/W).
+function buildNeighborShell(grp, px, pz, f, H, doorSide, doorC, doorHalf, wallMat, glassMat) {
+	const TH = 0.6, sill = WIN_BOTTOM, head = WIN_BOTTOM + WIN_SZ, doorH = sill + WIN_SZ * 0.8;
+	const midY = (sill + head) / 2, bandH = head - sill;
+	const minX = px - f.w / 2, maxX = px + f.w / 2, minZ = pz - f.d / 2, maxZ = pz + f.d / 2;
+	const op = [], panes = [], slots = [];
+	const wbox = (axis, fixed, aC, aLen, yC, yH) => { if (aLen < 0.1 || yH < 0.1) return; const g = axis === 'x' ? new THREE.BoxGeometry(aLen, yH, TH) : new THREE.BoxGeometry(TH, yH, aLen); g.translate(axis === 'x' ? aC : fixed, yC, axis === 'x' ? fixed : aC); op.push(g); };
+	const pane = (axis, fixed, aC, gw) => { const g = new THREE.PlaneGeometry(gw, WIN_SZ); if (axis === 'z') g.rotateY(Math.PI / 2); g.translate(axis === 'x' ? aC : fixed, midY, axis === 'x' ? fixed : aC); panes.push(g); slots.push({ axis, fixed, c: aC, gw, midY }); };
+	const wall = (axis, fixed, c0, c1, hasDoor) => {
+		const cuts = [c0, c1]; if (hasDoor) cuts.push(doorC - doorHalf, doorC + doorHalf); cuts.sort((a, b) => a - b);
+		for (let i = 0; i < cuts.length - 1; i++) {
+			const a = cuts[i], b = cuts[i + 1], segLen = b - a; if (segLen < 0.1) continue;
+			if (hasDoor && a >= doorC - doorHalf - 0.01 && b <= doorC + doorHalf + 0.01) { wbox(axis, fixed, (a + b) / 2, segLen, (doorH + H) / 2, H - doorH); continue; } // wall above the doorway only
+			wbox(axis, fixed, (a + b) / 2, segLen, sill / 2, sill);           // solid below the windows
+			wbox(axis, fixed, (a + b) / 2, segLen, (head + H) / 2, H - head); // solid above the windows
+			const bays = Math.max(1, Math.round(segLen / (WIN_SZ + MULLION))), step = segLen / bays;
+			for (let k = 0; k < bays; k++) {
+				const x0 = a + k * step, x1 = x0 + step, cc = (x0 + x1) / 2;
+				if (k % 3 === 1 && step > WIN_SZ + 1) {                        // occasional window: solid wall flanks + a glass pane
+					wbox(axis, fixed, (x0 + cc - WIN_SZ / 2) / 2, (cc - WIN_SZ / 2) - x0, midY, bandH);
+					wbox(axis, fixed, (cc + WIN_SZ / 2 + x1) / 2, x1 - (cc + WIN_SZ / 2), midY, bandH);
+					pane(axis, fixed, cc, WIN_SZ);
+				} else wbox(axis, fixed, cc, step, midY, bandH);              // solid wall bay
+			}
+		}
+	};
+	wall('x', minZ, minX, maxX, doorSide === 'N');   // back
+	wall('x', maxZ, minX, maxX, doorSide === 'S');   // front
+	wall('z', minX, minZ, maxZ, doorSide === 'W');   // left
+	wall('z', maxX, minZ, maxZ, doorSide === 'E');   // right
+	if (op.length) { const m = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(op), wallMat); op.forEach((g) => g.dispose()); grp.add(m); }
+	for (const g of panes) grp.add(new THREE.Mesh(g, glassMat));   // individual panes -> correct transparency sorting
+	return slots;   // window slots (world coords) -> buildBlinds gives this neighbour the same venetian blinds
+}
+// InterServer "iS" mark on a transparent canvas (orange i-stem + blue dot + blue swoosh S), for the
+// neighbour entrance doors (mirrors dc-multi's main-building door logo).
+function makeISLogoTexture() {
+	const s = 256, c = document.createElement('canvas'); c.width = c.height = s;
+	const g = c.getContext('2d'), blue = '#2E8BCE', orange = '#F39019';
+	g.fillStyle = orange; g.fillRect(s * 0.20, s * 0.30, s * 0.075, s * 0.55);
+	g.fillStyle = blue; g.fillRect(s * 0.19, s * 0.14, s * 0.095, s * 0.095);
+	g.strokeStyle = blue; g.lineWidth = s * 0.085; g.lineCap = 'round'; g.beginPath();
+	g.moveTo(s * 0.80, s * 0.27);
+	g.bezierCurveTo(s * 0.46, s * 0.13, s * 0.40, s * 0.45, s * 0.62, s * 0.52);
+	g.bezierCurveTo(s * 0.86, s * 0.60, s * 0.72, s * 0.92, s * 0.34, s * 0.78);
+	g.stroke();
+	const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+}
+// Two glass leaves with the iS logo at a neighbour's doorway (doorSide N/S/E/W). They swing OUTWARD on
+// their hinges, opened on approach by updateNeighborDoors. Returns a handle stored in neighborDoors.
+function buildNeighborDoor(grp, b, logoTex, glassMat, frameMat) {
+	const side = b.doorSide, doorC = b.doorC, HW = b.doorHalf, H = WIN_BOTTOM + WIN_SZ * 0.8;
+	const axis = (side === 'N' || side === 'S') ? 'x' : 'z';
+	const F = side === 'S' ? b.maxZ : side === 'N' ? b.minZ : side === 'E' ? b.maxX : b.minX;
+	const outSign = (side === 'S' || side === 'E') ? 1 : -1;
+	const w = HW - 0.12;
+	const mkLeaf = (sign) => {
+		const pivot = new THREE.Group();
+		if (axis === 'x') pivot.position.set(doorC + sign * HW, 0, F); else pivot.position.set(F, 0, doorC + sign * HW);
+		const lc = -sign * w / 2;   // pane centre offset from the hinge toward the door centre
+		const pane = new THREE.Mesh(axis === 'x' ? new THREE.BoxGeometry(w, H, 0.16) : new THREE.BoxGeometry(0.16, H, w), glassMat);
+		if (axis === 'x') pane.position.set(lc, H / 2, 0); else pane.position.set(0, H / 2, lc); pivot.add(pane);
+		const rail = new THREE.Mesh(axis === 'x' ? new THREE.BoxGeometry(w, 0.18, 0.22) : new THREE.BoxGeometry(0.22, 0.18, w), frameMat);
+		if (axis === 'x') rail.position.set(lc, H - 0.1, 0); else rail.position.set(0, H - 0.1, lc); pivot.add(rail);
+		[0.12, -0.12].forEach((d) => {
+			const lg = new THREE.Mesh(new THREE.PlaneGeometry(w * 0.7, w * 0.7), new THREE.MeshBasicMaterial({ map: logoTex, transparent: true, opacity: 0.95, depthWrite: false, side: THREE.DoubleSide }));
+			// face the logo OUTWARD per door side so it reads correct from outside (mirrored from inside), like the main building
+			if (axis === 'x') { lg.rotation.y = outSign > 0 ? 0 : Math.PI; lg.position.set(lc, H * 0.55, d); }
+			else { lg.rotation.y = outSign > 0 ? Math.PI / 2 : -Math.PI / 2; lg.position.set(d, H * 0.55, lc); }
+			pivot.add(lg);
+		});
+		grp.add(pivot); return pivot;
+	};
+	const left = mkLeaf(-1), right = mkLeaf(1);
+	const leftSign = axis === 'x' ? -outSign : outSign;   // open angle sign so the leaves swing outward
+	return { left, right, leftSign, cx: axis === 'x' ? doorC : F, cz: axis === 'x' ? F : doorC, open: 0, target: 0, lastNear: -1e9 };
+}
+let _ndLast = 0;
+// Per-frame: swing each neighbour's entrance doors open when the player nears, shut a few seconds after.
+function updateNeighborDoors() {
+	if (!neighborDoors.length || !camera) return;
+	const now = performance.now();
+	let dt = _ndLast ? (now - _ndLast) / 1000 : 0; _ndLast = now;
+	if (dt <= 0) return; if (dt > 0.1) dt = 0.1;
+	const fx = lodFocus ? lodFocus.x : camera.position.x, fz = lodFocus ? lodFocus.z : camera.position.z;
+	for (const d of neighborDoors) {
+		if (Math.hypot(fx - d.cx, fz - d.cz) < 18) d.lastNear = now;
+		d.target = (now - d.lastNear < 3000) ? 1 : 0;
+		d.open += (d.target - d.open) * Math.min(1, dt * 6);
+		if (Math.abs(d.open - d.target) < 0.002) d.open = d.target;
+		const a = d.open * Math.PI / 2;
+		d.left.rotation.y = d.leftSign * a; d.right.rotation.y = -d.leftSign * a;
+	}
+}
+let _rdLast = 0;
+// Per-frame: swing the main building's solid back/left doors open when the player nears, shut after 3s.
+function updateRoomDoors() {
+	if (!roomDoors.length || !camera) return;
+	const now = performance.now();
+	let dt = _rdLast ? (now - _rdLast) / 1000 : 0; _rdLast = now;
+	if (dt <= 0) return; if (dt > 0.1) dt = 0.1;
+	const fx = lodFocus ? lodFocus.x : camera.position.x, fz = lodFocus ? lodFocus.z : camera.position.z;
+	for (const d of roomDoors) {
+		if (Math.hypot(fx - d.cx, fz - d.cz) < 16) d.lastNear = now;
+		d.target = (now - d.lastNear < 3000) ? 1 : 0;
+		d.open += (d.target - d.open) * Math.min(1, dt * 6);
+		if (Math.abs(d.open - d.target) < 0.002) d.open = d.target;
+		d.pivot.rotation.y = d.openSign * d.open * Math.PI / 2;
 	}
 }
 function buildCommunity() {
+	lodBuildings = []; dcBuildings = []; wallColliders = []; neighborBlinds = []; neighborDoors = [];
 	const ids = Object.keys(locationNames).map((n) => Number(locationNames[n])).filter((id) => locationLoaded(id));
 	ids.sort((a, b) => locName(a).localeCompare(locName(b)));
-	if (ids.length < 2) return;
-	const foot = {}; let maxW = 0, maxD = 0;
-	for (const id of ids) { const f = locationFootprint(id); if (f) { foot[id] = f; maxW = Math.max(maxW, f.w); maxD = Math.max(maxD, f.d); } }
-	const ncols = Math.ceil(Math.sqrt(ids.length));
-	const cellW = maxW + 90, cellD = maxD + 90;                 // ~street width between plots
-	const cell = {}; ids.forEach((id, i) => { cell[id] = { col: i % ncols, row: Math.floor(i / ncols) }; });
-	const cur = sceneBounds();                                  // the current building's world centre
-	const ci = cell[options.location] || { col: 0, row: 0 };
-	const grp = new THREE.Group();
-	const wallMat = new THREE.MeshStandardMaterial({ color: 0xcfc8b8, roughness: 0.9 });
-	const roofMat = new THREE.MeshStandardMaterial({ color: 0x55585e, roughness: 0.85 });
-	for (const id of ids) {
-		if (Number(id) === Number(options.location)) continue;  // current building is the real one
-		const f = foot[id]; if (!f) continue;
-		const px = cur.cx + (cell[id].col - ci.col) * cellW;
-		const pz = cur.cz + (cell[id].row - ci.row) * cellD;
-		const H = ROOM_CEIL_Y;
-		const body = new THREE.Mesh(new THREE.BoxGeometry(f.w, H, f.d), wallMat); body.position.set(px, H / 2, pz); grp.add(body);
-		const roof = new THREE.Mesh(new THREE.BoxGeometry(f.w + 4, 1.5, f.d + 4), roofMat); roof.position.set(px, H + 0.75, pz); grp.add(roof);
-		const sign = new THREE.Mesh(new THREE.PlaneGeometry(Math.min(f.w * 0.7, 46), 11), new THREE.MeshBasicMaterial({ map: makeSignTexture(locName(id)) }));
-		sign.position.set(px, H * 0.66, pz + f.d / 2 + 0.4); grp.add(sign);
-		addBuildingExterior(grp, px, pz, f.w, f.d, H);
+	// the CURRENT building's walls/door go in the descriptor list too (walkability + lot perimeter)
+	if (roomBounds) dcBuildings.push({ id: Number(options.location), kind: 'current', minX: roomBounds.minX, maxX: roomBounds.maxX, minZ: roomBounds.minZ, maxZ: roomBounds.maxZ, doorSide: 'S', doorC: (roomBounds.minX + roomBounds.maxX) / 2, doorHalf: 8, extraDoors: roomSideDoors });
+	if (ids.length >= 2) {
+		const foot = {}; let maxW = 0, maxD = 0;
+		for (const id of ids) { const f = locationFootprint(id); if (f) { foot[id] = f; maxW = Math.max(maxW, f.w); maxD = Math.max(maxD, f.d); } }
+		const ncols = Math.ceil(Math.sqrt(ids.length));
+		const cellW = maxW + 90, cellD = maxD + 90;                 // ~street width between plots
+		const cell = {}; ids.forEach((id, i) => { cell[id] = { col: i % ncols, row: Math.floor(i / ncols) }; });
+		const cur = sceneBounds();                                  // the current building's world centre
+		const ci = cell[options.location] || { col: 0, row: 0 };
+		const grp = new THREE.Group();
+		const wallMat = new THREE.MeshStandardMaterial({ color: 0xcfc8b8, roughness: 0.9 });
+		const roofMat = new THREE.MeshStandardMaterial({ color: 0x55585e, roughness: 0.85 });
+		const frameMat = new THREE.MeshStandardMaterial({ color: 0x6b5a44, roughness: 0.75 });
+		const glassMat = makeNeighborGlassMaterial();
+		const blockMat = new THREE.MeshStandardMaterial({ color: 0x2a2f37, roughness: 0.68, metalness: 0.14, emissive: 0x10141b });
+		const sill = WIN_BOTTOM;
+		// shared assets for the neighbour entrance doors (iS-logo glass leaves, like the main building's door)
+		const logoTex = makeISLogoTexture();
+		const doorGlassMat = new THREE.MeshPhysicalMaterial({ color: 0x9fb6c4, metalness: 0, roughness: 0.06, transparent: true, opacity: 0.34, reflectivity: 0.6, clearcoat: 0.6, clearcoatRoughness: 0.05, side: THREE.DoubleSide });
+		const doorFrameMat = new THREE.MeshStandardMaterial({ color: 0x20242a, metalness: 0.7, roughness: 0.4 });
+		for (const id of ids) {
+			if (Number(id) === Number(options.location)) continue;  // current building is the real one
+			const f = foot[id]; if (!f) continue;
+			const px = cur.cx + (cell[id].col - ci.col) * cellW;
+			const pz = cur.cz + (cell[id].row - ci.row) * cellD;
+			const H = ROOM_CEIL_Y, dx = px - f.cx, dz = pz - f.cz;
+			// doorway faces the HUB (the current building you walk out from) so you cross the street straight in.
+			// pick the wall side whose outward normal points toward the hub centre; collision opens that gap to match.
+			const doorHalf = 8, dH = sill + WIN_SZ * 0.8, toHubX = cur.cx - px, toHubZ = cur.cz - pz;
+			let doorSide, doorC;
+			if (Math.abs(toHubZ) >= Math.abs(toHubX)) { doorSide = toHubZ < 0 ? 'N' : 'S'; doorC = px; }
+			else { doorSide = toHubX < 0 ? 'W' : 'E'; doorC = pz; }
+			// mostly-solid walls with the occasional window (matches the current building), then roof + sign + doorway
+			const winSlots = buildNeighborShell(grp, px, pz, f, H, doorSide, doorC, doorHalf, wallMat, glassMat);
+			const bh = buildBlinds(grp, px, pz, winSlots, false);   // same venetian blinds as the main room (tinted glass already dark from outside -> no extra pane)
+			if (bh) neighborBlinds.push(bh);
+			const roof = new THREE.Mesh(new THREE.BoxGeometry(f.w + 4, 1.5, f.d + 4), roofMat); roof.position.set(px, H + 1.25, pz); grp.add(roof);   // sits a touch above the wall top so the interior drop-ceiling hides its underside (no z-fight)
+			const sign = new THREE.Mesh(new THREE.PlaneGeometry(Math.min(f.w * 0.7, 46), 11), new THREE.MeshBasicMaterial({ map: makeSignTexture(locName(id)) }));
+			sign.position.set(px, H * 0.74, pz + f.d / 2 + 0.5); grp.add(sign);
+			addDoorway(grp, doorSide, px, pz, f, doorC, doorHalf, dH, frameMat);
+			neighborDoors.push(buildNeighborDoor(grp, { doorSide, doorC, doorHalf, minX: px - f.w / 2, maxX: px + f.w / 2, minZ: pz - f.d / 2, maxZ: pz + f.d / 2 }, logoTex, doorGlassMat, doorFrameMat));
+			// cheap rack BLOCKS inside (collision + LOD placeholder; glimpsed through the windows, full models on approach)
+			const blk = buildRackBlocks(id, dx, dz, blockMat);
+			if (blk) grp.add(blk.mesh);
+			lodBuildings.push({ id: Number(id), foot: f, dx, dz, cx: px, cz: pz,
+				minX: px - f.w / 2, maxX: px + f.w / 2, minZ: pz - f.d / 2, maxZ: pz + f.d / 2, doorSide, doorC, doorHalf,
+				blocks: blk ? blk.mesh : null, blockColliders: blk ? blk.colliders : [], full: null, loading: false, _dist: Infinity });
+			dcBuildings.push({ id: Number(id), kind: 'neighbor', minX: px - f.w / 2, maxX: px + f.w / 2, minZ: pz - f.d / 2, maxZ: pz + f.d / 2, doorSide, doorC, doorHalf });
+		}
+		scene.add(grp); objects.community = grp;
 	}
-	scene.add(grp); objects.community = grp;
+	buildWallColliders();
+}
+// Thin AABB slabs for every building wall, with the door-side wall split around its gap so doorways are
+// passable, plus a fence around the whole lot. Fed to collideWorld() for walk-between collision.
+function buildWallColliders() {
+	wallColliders = [];
+	const T = 1.4, push = (minX, maxX, minZ, maxZ) => wallColliders.push({ minX, maxX, minZ, maxZ });
+	// add a wall spanning [c0,c1] along `axis` at the fixed cross-coord; if splitC != null leave a door gap
+	const addWall = (axis, fixed, c0, c1, splitC, splitHalf) => {
+		const segs = splitC == null ? [[c0, c1]] : [];
+		if (splitC != null) { if (splitC - splitHalf > c0) segs.push([c0, splitC - splitHalf]); if (splitC + splitHalf < c1) segs.push([splitC + splitHalf, c1]); }
+		for (const s of segs) { if (axis === 'x') push(s[0] - T, s[1] + T, fixed - T, fixed + T); else push(fixed - T, fixed + T, s[0] - T, s[1] + T); }
+	};
+	let LX = Infinity, RX = -Infinity, BZ = Infinity, FZ = -Infinity;
+	for (const b of dcBuildings) {
+		LX = Math.min(LX, b.minX); RX = Math.max(RX, b.maxX); BZ = Math.min(BZ, b.minZ); FZ = Math.max(FZ, b.maxZ);
+		const doors = [{ side: b.doorSide, c: b.doorC, half: b.doorHalf }].concat(b.extraDoors || []); // primary + any extra doors
+		const dOn = (side) => doors.find((d) => d.side === side);
+		const dN = dOn('N'), dS = dOn('S'), dW = dOn('W'), dE = dOn('E');
+		addWall('x', b.minZ, b.minX, b.maxX, dN ? dN.c : null, dN ? dN.half : 0); // back  (minZ)
+		addWall('x', b.maxZ, b.minX, b.maxX, dS ? dS.c : null, dS ? dS.half : 0); // front (maxZ)
+		addWall('z', b.minX, b.minZ, b.maxZ, dW ? dW.c : null, dW ? dW.half : 0); // left  (minX)
+		addWall('z', b.maxX, b.minZ, b.maxZ, dE ? dE.c : null, dE ? dE.half : 0); // right (maxX)
+	}
+	if (isFinite(LX)) {                                          // lot perimeter so you can't wander to infinity
+		const M = 80, TT = 6; LX -= M; RX += M; BZ -= M; FZ += M;
+		push(LX - TT, RX + TT, BZ - TT, BZ); push(LX - TT, RX + TT, FZ, FZ + TT);
+		push(LX - TT, LX, BZ - TT, FZ + TT); push(RX, RX + TT, BZ - TT, FZ + TT);
+	}
+}
+// distance from (x,z) to a building's wall rect (0 when inside) -> drives the LOD swap
+function distToRect(x, z, b) {
+	const dx = Math.max(b.minX - x, 0, x - b.maxX), dz = Math.max(b.minZ - z, 0, z - b.maxZ);
+	return Math.hypot(dx, dz);
+}
+// Unified walk-between collision: all building WALLS (door gaps open) + the current building's racks +
+// each neighbour's ACTIVE interior (blocks, or full racks once swapped). Read live, so no rebuilds.
+// dc.html still confines itself via roomBounds; only the dc-multi player uses this.
+function collideWorld(x, z, r) {
+	const hit = (c) => x + r > c.minX && x - r < c.maxX && z + r > c.minZ && z - r < c.maxZ;
+	for (const c of wallColliders) if (hit(c)) return true;
+	for (const c of rackColliders) if (hit(c)) return true;     // current building furniture (live)
+	for (const b of lodBuildings) {
+		if (x < b.minX - r - 1 || x > b.maxX + r + 1 || z < b.minZ - r - 1 || z > b.maxZ + r + 1) continue; // far from this plot -> skip its interior
+		const cols = b.full ? b.full.colliders : b.blockColliders;
+		for (let i = 0; i < cols.length; i++) if (hit(cols[i])) return true;
+	}
+	return false;
+}
+// Load a rack/server model TYPE into the shared cache (models.racks/servers, keyed by type index) if
+// missing, resolving when ready. Mirrors getRackModels()/getServerModels()'s loader; reused for both the
+// current building and neighbours, so any type a neighbour needs is fetched once and shared thereafter.
+function loadRackType(t) {
+	return new Promise((res) => {
+		if (models.racks[t] !== undefined || rackTypes[t] === undefined) return res();
+		loadGlbWithFallback(dcUrl('/images/3d/racks/'), rackTypes[t], (gltf) => {
+			const model = gltf.scene; model.traverse((n) => { if (n.isMesh) { n.castShadow = true; n.receiveShadow = true; } });
+			models.racks[t] = extractModelMeshes(model, 10); res();
+		});
+	});
+}
+function loadServerType(t) {
+	return new Promise((res) => {
+		if (models.servers[t] !== undefined || serverTypes[t] === undefined) return res();
+		loadGlbWithFallback(dcUrl('/images/3d/servers/gltf/exported-centered/'), serverTypes[t][0], (gltf) => {
+			const model = gltf.scene; model.traverse((n) => { if (n.isMesh) { n.castShadow = true; n.receiveShadow = true; } });
+			models.servers[t] = extractModelMeshes(model, 10); res();
+		});
+	});
+}
+// Ensure every rack + server type used by location `id` is loaded, then call cb. The 12s race guard means
+// a 404'd variant can never permanently wedge a building in the "loading" state.
+function loadBuildingModels(id, cb) {
+	const racks = (locations[id] || {}).racks || {};
+	const rt = new Set(), st = new Set();
+	for (const k in racks) { rt.add(racks[k].type); const sv = racks[k].servers || {}; for (const sk in sv) st.add(sv[sk].type); }
+	const tasks = [];
+	rt.forEach((t) => { if (models.racks[t] === undefined) tasks.push(loadRackType(t)); });
+	st.forEach((t) => { if (models.servers[t] === undefined) tasks.push(loadServerType(t)); });
+	if (!tasks.length) return cb();
+	Promise.race([Promise.all(tasks), new Promise((r) => setTimeout(r, 12000))]).then(cb);
+}
+// Build a neighbour's FULL racks+servers (same instanced models as the current building) into its own
+// group at the neighbour's world offset (dx,dz), with its own collider list. No labels/highlight (cheap,
+// and keeps neighbour meshes out of the current building's pick/label sets).
+function buildBuildingFull(id, dx, dz) {
+	const group = new THREE.Group(), sink = { group, meshes: [], colliders: [] };
+	const racks = (locations[id] || {}).racks || {};
+	const byR = {};
+	for (const k in racks) { const t = racks[k].type; (byR[t] || (byR[t] = [])).push({ k, r: racks[k] }); }
+	for (const t in byR) {
+		const model = models.racks[t]; if (!model) continue;
+		const placements = byR[t].map(({ k, r }) => { const p = convertRackCoordinatesToPosition(r.x, r.y); return { x: p.x + dx, y: 0, z: p.z + dz, assetId: k, asset: r }; });
+		buildInstanced(model, placements, 'rack', sink);
+	}
+	const byS = {};
+	for (const k in racks) { const r = racks[k], sv = r.servers || {}; for (const sk in sv) { const s = sv[sk]; (byS[s.type] || (byS[s.type] = [])).push({ sk, s, r }); } }
+	for (const t in byS) {
+		const model = models.servers[t]; if (!model) continue;
+		const placements = byS[t].map(({ sk, s, r }) => { const p = convertServerCoordinatesToPosition(r.x, r.y, s.start); return { x: p.x + dx, y: p.y, z: p.z + dz, assetId: sk, asset: s }; });
+		buildInstanced(model, placements, 'server', sink);
+	}
+	// this building's own switch cabling (into the full group) + rack/host labels (into the global
+	// objects.labels/rackLabels so updateLabels distance-culls them; tracked on sink for exitFull removal)
+	displaySwitches(id, dx, dz, sink);
+	sink.labels = [];
+	for (const k in racks) {
+		const r = racks[k], p = convertRackCoordinatesToPosition(r.x, r.y);
+		const rl = displayRackText(r.name, r, p.x + dx, p.z + dz); if (rl) sink.labels.push(rl);
+		const sv = r.servers || {};
+		for (const sk in sv) { const s = sv[sk], sp = convertServerCoordinatesToPosition(r.x, r.y, s.start); const sl = displayServerText(s.hostname, s, sp.x + dx, sp.y, sp.z + dz); if (sl) sink.labels.push(sl); }
+	}
+	return sink;
+}
+// The room INTERIOR for a near neighbour, mirroring buildRoom so a full building looks like the main one:
+// drop ceiling + troffer lights + HVAC ducts/pipes + a door-aware baseboard + a tiled floor, all at the
+// neighbour's world bounds. Built into the full group (torn down with it on exitFull). Non-instanced
+// meshes here own unique geometry/material -> exitFull disposes them; full racks are InstancedMesh (shared).
+function buildNeighborInterior(group, b) {
+	const minX = b.minX, maxX = b.maxX, minZ = b.minZ, maxZ = b.maxZ;
+	const W = maxX - minX, D = maxZ - minZ, cx = (minX + maxX) / 2, cz = (minZ + maxZ) / 2;
+	// drop ceiling (faces down)
+	const ceilTex = makeCeilingTexture(); ceilTex.repeat.set(Math.max(1, Math.round(W / CEIL_TILE)), Math.max(1, Math.round(D / CEIL_TILE)));
+	const ceil = new THREE.Mesh(new THREE.PlaneGeometry(W, D), new THREE.MeshStandardMaterial({ map: ceilTex, color: 0xffffff, roughness: 0.95, emissive: 0x2a2a2a, side: THREE.DoubleSide }));
+	ceil.rotation.x = Math.PI / 2; ceil.position.set(cx, ROOM_CEIL_Y, cz); group.add(ceil);
+	// fluorescent troffers (one bright diffuser panel per 4-ft slot, dark housing frame). options.faultyLights
+	// PERCENT of them flicker (collected in `faulty` -> returned so maybeFlicker animates them); rest merged & lit.
+	const fixLenX = W - 2 * ROOM_MARGIN, fixStartX = cx - fixLenX / 2, fixEndX = cx + fixLenX / 2;
+	const BULB_LEN = 48 * UNITS_PER_INCH, BULB_GAP = 1 * UNITS_PER_INCH, fixRows = Math.max(1, Math.round(D / 18));
+	const bulbY = ROOM_CEIL_Y - 0.78, housingY = ROOM_CEIL_Y - 0.3, housings = [], bulbs = [], slots = [], faulty = [];
+	for (let i = 0; i < fixRows; i++) {
+		const z = minZ + (D * (i + 0.5) / fixRows);
+		const hg = new THREE.BoxGeometry(fixLenX + 0.5, 0.5, 4.4); hg.translate(cx, housingY, z); housings.push(hg);
+		for (let sx = fixStartX; sx < fixEndX - 0.05; sx += BULB_LEN + BULB_GAP) { const len = Math.min(BULB_LEN, fixEndX - sx); slots.push({ x: sx + len / 2, len, z }); }
+	}
+	const nFaulty = Math.max(0, Math.min(slots.length, Math.round(slots.length * (options.faultyLights || 0) / 100)));
+	const faultyIdx = new Set();
+	if (nFaulty >= 1 && slots.length) { faultyIdx.add(slots.length - 1); let guard = 0; while (faultyIdx.size < nFaulty && faultyIdx.size < slots.length && guard++ < 800) faultyIdx.add(Math.floor(Math.random() * slots.length)); }
+	slots.forEach((s, idx) => {
+		const bg = new THREE.BoxGeometry(s.len - 0.2, 0.16, 3.7); bg.translate(s.x, bulbY, s.z);
+		if (faultyIdx.has(idx)) { const m = new THREE.Mesh(bg, new THREE.MeshBasicMaterial({ color: 0xffffff })); m.userData = {}; group.add(m); faulty.push(m); }
+		else bulbs.push(bg);
+	});
+	if (housings.length) { const m = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(housings), new THREE.MeshStandardMaterial({ color: 0x2c2f35, roughness: 0.6, metalness: 0.3 })); housings.forEach((g) => g.dispose()); group.add(m); }
+	let nbBulbDisco = null;
+	if (bulbs.length) { const m = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(bulbs), new THREE.MeshBasicMaterial({ color: 0xffffff })); bulbs.forEach((g) => g.dispose()); group.add(m); nbBulbDisco = makeBulbDisco(m, bulbs.length); }
+	// HVAC ducts (elbow runs in the gaps between rows) + a couple of pipes
+	const rowGap = D / fixRows, laneZ = (k) => minZ + rowGap * k, ducts = [];
+	const dbox = (w, h, d, x, y, z) => { const g = new THREE.BoxGeometry(w, h, d); g.translate(x, y, z); ducts.push(g); };
+	const elbow = (xFrom, xTo, z, y, w, h) => { dbox(Math.abs(xTo - xFrom), h, w, (xFrom + xTo) / 2, y, z); const leg = rowGap * 1.3; dbox(w, h, leg, xTo, y, z + (z < cz ? leg / 2 : -leg / 2)); };
+	elbow(minX + ROOM_MARGIN, cx + W * 0.10, laneZ(Math.max(1, Math.round(fixRows * 0.28))), ROOM_CEIL_Y - 2.4, 5, 4.2);
+	elbow(maxX - ROOM_MARGIN, cx - W * 0.10, laneZ(Math.min(fixRows - 1, Math.round(fixRows * 0.72))), ROOM_CEIL_Y - 2.1, 4.5, 3.6);
+	if (ducts.length) { const m = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(ducts), new THREE.MeshStandardMaterial({ color: 0xcdd3da, roughness: 0.24, metalness: 0.92, envMapIntensity: 2.6 })); ducts.forEach((g) => g.dispose()); group.add(m); }
+	const pipes = [], pipeRun = (z, x0, len, r, y) => { const pg = new THREE.CylinderGeometry(r, r, len, 16); pg.rotateZ(Math.PI / 2); pg.translate(x0 + len / 2, y, z); pipes.push(pg); };
+	const midLane = laneZ(Math.max(1, Math.round(fixRows * 0.5)));
+	pipeRun(midLane + 1.3, minX + ROOM_MARGIN + W * 0.06, W * 0.52, 1.0, ROOM_CEIL_Y - 1.5);
+	pipeRun(midLane - 1.3, cx + W * 0.04, W * 0.32, 0.7, ROOM_CEIL_Y - 1.5);
+	if (pipes.length) { const m = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(pipes), new THREE.MeshStandardMaterial({ color: 0xc6ccd4, roughness: 0.16, metalness: 0.96, envMapIntensity: 2.9 })); pipes.forEach((g) => g.dispose()); group.add(m); }
+	// dark baseboard along the inside foot of every wall, skipping this neighbour's one doorway
+	const BASE_H = 1.15, BASE_T = 0.55, baseMat = new THREE.MeshStandardMaterial({ color: 0x3b3b43, roughness: 0.7, metalness: 0.18 }), dHalf = (b.doorHalf || 8) + 1;
+	const baseboard = (axis, fixed, c0, c1, inward, gapC) => {
+		const segs = gapC == null ? [[c0, c1]] : [];
+		if (gapC != null) { if (gapC - dHalf > c0) segs.push([c0, gapC - dHalf]); if (gapC + dHalf < c1) segs.push([gapC + dHalf, c1]); }
+		for (const s of segs) { const len = s[1] - s[0]; if (len < 0.3) continue; const m = new THREE.Mesh(axis === 'x' ? new THREE.BoxGeometry(len, BASE_H, BASE_T) : new THREE.BoxGeometry(BASE_T, BASE_H, len), baseMat); if (axis === 'x') m.position.set((s[0] + s[1]) / 2, BASE_H / 2, fixed + inward * BASE_T / 2); else m.position.set(fixed + inward * BASE_T / 2, BASE_H / 2, (s[0] + s[1]) / 2); group.add(m); }
+	};
+	baseboard('x', maxZ, minX, maxX, -1, b.doorSide === 'S' ? b.doorC : null);
+	baseboard('x', minZ, minX, maxX, +1, b.doorSide === 'N' ? b.doorC : null);
+	baseboard('z', minX, minZ, maxZ, +1, b.doorSide === 'W' ? b.doorC : null);
+	baseboard('z', maxX, minZ, maxZ, -1, b.doorSide === 'E' ? b.doorC : null);
+	// wall props (matches the main room): fire extinguisher, wall phone, bulletin board + flyer, calendar
+	const feX = maxX - 0.9, feZ = cz + D * 0.2;
+	const fe = new THREE.Mesh(new THREE.CylinderGeometry(0.85, 0.85, 3, 16), new THREE.MeshStandardMaterial({ color: 0xc41f1f, roughness: 0.4, metalness: 0.2 })); fe.position.set(feX, 7, feZ); group.add(fe);
+	const feTop = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.5, 0.9, 12), new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.6 })); feTop.position.set(feX, 8.8, feZ); group.add(feTop);
+	const phX = minX + 0.5, phZ = cz - D * 0.18;
+	const ph = new THREE.Mesh(new THREE.BoxGeometry(0.6, 2.4, 1.6), new THREE.MeshStandardMaterial({ color: 0x2b2b30, roughness: 0.6 })); ph.position.set(phX, 11, phZ); group.add(ph);
+	const phH = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.5, 2.1), new THREE.MeshStandardMaterial({ color: 0x161618, roughness: 0.6 })); phH.position.set(phX + 0.5, 12.5, phZ); group.add(phH);
+	const bdX = cx + W * 0.27;
+	const board = new THREE.Mesh(new THREE.BoxGeometry(11, 8, 0.4), new THREE.MeshStandardMaterial({ color: 0x8d6a44, roughness: 0.85 })); board.position.set(bdX, 12, maxZ - 0.3); group.add(board);
+	const flyer = new THREE.Mesh(new THREE.PlaneGeometry(3.4, 4.3), new THREE.MeshBasicMaterial({ map: makeLostCatTexture() })); flyer.rotation.y = Math.PI; flyer.position.set(bdX, 12.2, maxZ - 0.55); group.add(flyer);
+	const cal = new THREE.Mesh(new THREE.PlaneGeometry(3, 4.6), new THREE.MeshBasicMaterial({ map: makeCalendarTexture() })); cal.rotation.y = Math.PI / 2; cal.position.set(minX + 0.75, 11.5, cz + D * 0.22); group.add(cal);
+	// tiled interior floor
+	const floorTex = makeFloorTexture(), tu = 24 * UNITS_PER_INCH;
+	floorTex.repeat.set(Math.max(1, Math.round(W / (4 * tu))), Math.max(1, Math.round(D / (4 * tu))));
+	const floor = new THREE.Mesh(new THREE.PlaneGeometry(W, D), new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.9 }));
+	floor.rotation.x = -Math.PI / 2; floor.position.set(cx, 0, cz); group.add(floor);
+	return { faulty, bulbDisco: nbBulbDisco };   // faulty -> b.full.faulty (maybeFlicker); bulbDisco -> b.full.bulbDisco (updateDisco)
+}
+// Swap a neighbour BLOCKS -> FULL (async-load its models, hide the blocks, add the full interior). The
+// loading flag both de-dupes concurrent triggers and acts as a cancel token (exitFull clears it mid-load).
+function enterFull(b) {
+	b.loading = true;
+	loadBuildingModels(b.id, () => {
+		if (!b.loading) return;                         // cancelled by exitFull while loading
+		b.full = buildBuildingFull(b.id, b.dx, b.dz);
+		const ri = buildNeighborInterior(b.full.group, b);             // interior; returns its flicker + disco handles
+		b.full.faulty = ri.faulty || []; b.full.bulbDisco = ri.bulbDisco;
+		scene.add(b.full.group);
+		if (b.blocks) b.blocks.visible = false;
+		b.loading = false;
+	});
+}
+// Swap FULL -> BLOCKS: drop the full group, show the blocks again, cancel any in-flight load. InstancedMesh
+// racks free only their instanceMatrix (geometry/material are shared cached templates); the interior meshes
+// own unique geometry/material/maps -> dispose those fully.
+function exitFull(b) {
+	b.loading = false;
+	if (b.full) {
+		scene.remove(b.full.group);
+		b.full.group.traverse((n) => {
+			if (!n.isMesh) return;
+			if (n.isInstancedMesh) { n.dispose(); return; }   // shared cached geo/mat -> only free instanceMatrix
+			n.geometry.dispose();
+			const mats = Array.isArray(n.material) ? n.material : [n.material];
+			for (const m of mats) { if (m.map) m.map.dispose(); m.dispose(); }
+		});
+		// labels live in the scene + global objects.labels (for distance culling), not the group -> remove them here
+		if (b.full.labels && b.full.labels.length) {
+			const set = new Set(b.full.labels);
+			for (const l of b.full.labels) { scene.remove(l); if (l.material.map) l.material.map.dispose(); l.material.dispose(); }
+			objects.labels = objects.labels.filter((l) => !set.has(l));
+			objects.rackLabels = objects.rackLabels.filter((l) => !set.has(l));
+		}
+		b.full = null;
+	}
+	if (b.blocks) b.blocks.visible = true;
+}
+// Per-frame LOD manager (called from DC.tick). Keep the nearest in-range neighbour(s) at full detail, up
+// to LOD_MAX_FULL, everything else as blocks. Keys off the player ground position (lodFocus) when set.
+function updateLOD() {
+	if (!lodBuildings.length || !camera) return;
+	const fx = lodFocus ? lodFocus.x : camera.position.x, fz = lodFocus ? lodFocus.z : camera.position.z;
+	let fullCount = 0;
+	for (const b of lodBuildings) { b._dist = distToRect(fx, fz, b); if (b.full) fullCount++; }
+	for (const b of lodBuildings) { if (b.full && b._dist > LOD_EXIT_PAD) { exitFull(b); fullCount--; } }
+	if (fullCount < LOD_MAX_FULL) {
+		const near = lodBuildings.filter((b) => !b.full && !b.loading && b._dist < LOD_ENTER_PAD).sort((a, c) => a._dist - c._dist);
+		for (const b of near) { if (fullCount >= LOD_MAX_FULL) break; enterFull(b); fullCount++; }
+	}
 }
 function buildRoom() {
 	const racksObj = (locations[options.location] || {}).racks || {};
@@ -1137,10 +1768,21 @@ function buildRoom() {
 	// 4 window-walls (solid strips + a see-through glass ribbon), the front one with a door
 	const glass = makeGlassMaterial();
 	const mullMat = new THREE.MeshStandardMaterial({ color: 0x0a0a0a, roughness: 0.95, metalness: 0.25 });
-	windowWall(walls, 'x', minZ, minX, maxX, ROOM_CEIL_Y, wallMat, glass, mullMat, null); // back
-	windowWall(walls, 'x', maxZ, minX, maxX, ROOM_CEIL_Y, wallMat, glass, mullMat, cx);   // front + door
-	windowWall(walls, 'z', minX, minZ, maxZ, ROOM_CEIL_Y, wallMat, glass, mullMat, null); // left
-	windowWall(walls, 'z', maxX, minZ, maxZ, ROOM_CEIL_Y, wallMat, glass, mullMat, null); // right
+	windowSlots = [];
+	// back (minZ) + left (minX) walls get a REAL door opening with a solid panel that SWINGS open + is
+	// walkable (collision gaps added via roomSideDoors). The front (maxZ) door stays the static panel that
+	// dc-multi's glass entrance replaces.
+	const sideDoorX = cx - W * 0.28, sideDoorZ = cz + D * 0.22;
+	const backDoor = windowWall(walls, 'x', minZ, minX, maxX, ROOM_CEIL_Y, wallMat, glass, mullMat, sideDoorX, true); // back + swing door
+	windowWall(walls, 'x', maxZ, minX, maxX, ROOM_CEIL_Y, wallMat, glass, mullMat, cx);                               // front (glass door replaces this)
+	const leftDoor = windowWall(walls, 'z', minX, minZ, maxZ, ROOM_CEIL_Y, wallMat, glass, mullMat, sideDoorZ, true); // left + swing door
+	windowWall(walls, 'z', maxX, minZ, maxZ, ROOM_CEIL_Y, wallMat, glass, mullMat, null);                            // right
+	const blinds = buildBlinds(walls, cx, cz, windowSlots, true); windowSlots = [];   // drain the slots windowWall just pushed
+	// register the swing doors (open OUTWARD on approach, auto-close); roomSideDoors feeds the collision gaps.
+	roomDoors = [];
+	if (backDoor) roomDoors.push({ pivot: backDoor.pivot, openSign: 1, cx: sideDoorX, cz: minZ, open: 0, target: 0, lastNear: -1e9 });   // minZ wall: swing -z (outward)
+	if (leftDoor) roomDoors.push({ pivot: leftDoor.pivot, openSign: -1, cx: minX, cz: sideDoorZ, open: 0, target: 0, lastNear: -1e9 });  // minX wall: swing -x (outward)
+	roomSideDoors = [{ side: 'N', c: sideDoorX, half: 8 }, { side: 'W', c: sideDoorZ, half: 8 }];
 
 	// ceiling (horizontal plane, facing down into the room)
 	const ceil = new THREE.Mesh(new THREE.PlaneGeometry(W, D), ceilMat); ceil.rotation.x = Math.PI / 2; ceil.position.set(cx, ROOM_CEIL_Y, cz); ceiling.add(ceil);
@@ -1155,73 +1797,68 @@ function buildRoom() {
 	const BULB_LEN = 48 * UNITS_PER_INCH, BULB_GAP = 1 * UNITS_PER_INCH, BULB_W = 3 * UNITS_PER_INCH;
 	const bulbDz = [-1.65, -0.55, 0.55, 1.65]; // 4 bulbs across the ~4.4-wide fixture
 	const fixRows = Math.max(1, Math.round(D / 18));
-	const bulbY = ROOM_CEIL_Y - 0.95, housingY = ROOM_CEIL_Y - 0.6;
+	const bulbY = ROOM_CEIL_Y - 0.78, housingY = ROOM_CEIL_Y - 0.3;   // bulbs hang JUST BELOW the housing so they read as lit (recessing them up inside it left only black strips); ducts now run in the gaps between rows, so no conflict
 	// enumerate every troffer slot (a 4-ft, 4-bulb fixture position), row-major
 	const slots = [];
 	for (let i = 0; i < fixRows; i++) {
 		const z = minZ + (D * (i + 0.5) / fixRows);
-		const hg = new THREE.BoxGeometry(fixLenX + 0.5, 0.7, 4.4); hg.translate(cx, housingY, z); housings.push(hg);
+		const hg = new THREE.BoxGeometry(fixLenX + 0.5, 0.5, 4.4); hg.translate(cx, housingY, z); housings.push(hg);
 		for (let sx = fixStartX; sx < fixEndX - 0.05; sx += BULB_LEN + BULB_GAP) {
 			const len = Math.min(BULB_LEN, fixEndX - sx);
 			slots.push({ x: sx + len / 2, len, z });
 		}
 	}
-	// pick faulty slots: a corner slot first (last row, last segment), the rest random
-	const nFaulty = Math.max(0, Math.min(20, Math.round(options.faultyLights || 0)));
+	// pick faulty slots: a corner slot first (last row, last segment), the rest random.
+	// options.faultyLights is now a PERCENT of this building's fixtures.
+	const nFaulty = Math.max(0, Math.min(slots.length, Math.round(slots.length * (options.faultyLights || 0) / 100)));
 	const faultyIdx = new Set();
 	if (nFaulty >= 1 && slots.length) {
 		faultyIdx.add(slots.length - 1);
 		let guard = 0;
 		while (faultyIdx.size < nFaulty && faultyIdx.size < slots.length && guard++ < 800) faultyIdx.add(Math.floor(Math.random() * slots.length));
 	}
+	// one bright DIFFUSER panel per 4-ft troffer (a single wide lit panel reads as "on"; 4 thin tubes
+	// against the wide dark housing just looked like dark strips). The dark housing frames it.
 	slots.forEach((s, idx) => {
-		const segs = [];
-		for (const dz of bulbDz) { const bg = new THREE.BoxGeometry(s.len, 0.28, BULB_W); bg.translate(s.x, bulbY, s.z + dz); segs.push(bg); }
+		const bg = new THREE.BoxGeometry(s.len - 0.2, 0.16, 3.7); bg.translate(s.x, bulbY, s.z);
 		if (faultyIdx.has(idx)) {
-			const m = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(segs), new THREE.MeshBasicMaterial({ color: 0xffffff }));
-			segs.forEach((g) => g.dispose()); m.userData = {}; ceiling.add(m); faultyMeshes.push(m);
+			const m = new THREE.Mesh(bg, new THREE.MeshBasicMaterial({ color: 0xffffff })); m.userData = {}; ceiling.add(m); faultyMeshes.push(m);
 		} else {
-			for (const g of segs) bulbs.push(g);
+			bulbs.push(bg);
 		}
 	});
 	const housingMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(housings), new THREE.MeshStandardMaterial({ color: 0x2c2f35, roughness: 0.6, metalness: 0.3 }));
 	housings.forEach((g) => g.dispose()); ceiling.add(housingMesh);
-	if (bulbs.length) { const bulbMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(bulbs), new THREE.MeshBasicMaterial({ color: 0xffffff })); bulbs.forEach((g) => g.dispose()); ceiling.add(bulbMesh); }
+	let roomBulbDisco = null;
+	if (bulbs.length) { const bulbMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(bulbs), new THREE.MeshBasicMaterial({ color: 0xffffff })); bulbs.forEach((g) => g.dispose()); ceiling.add(bulbMesh); roomBulbDisco = makeBulbDisco(bulbMesh, bulbs.length); }
 
-	// HVAC ductwork + pipes hung just below the ceiling -- a few runs in different spots, mixed
-	// rectangular ducts + round pipes. Galvanized steel: high metalness reflecting the env map.
-	const runX = W - 2 * ROOM_MARGIN, runZ = D - 2 * ROOM_MARGIN;
+	// HVAC ducts + pipes: kept OFF the fixture rows -- they run in the GAPS between rows, never the full
+	// length straight under a row, and each turns a corner (an elbow) so it reads as real ductwork.
+	const rowGap = D / fixRows, laneZ = (k) => minZ + rowGap * k;   // laneZ(k) sits between two fixture rows
 	const ducts = [];
-	for (const r of [
-		{ z: minZ + ROOM_MARGIN * 0.8, y: ROOM_CEIL_Y - 2.5, w: 6, h: 4.5 }, // along x by the near wall
-		{ z: maxZ - ROOM_MARGIN * 0.8, y: ROOM_CEIL_Y - 2.5, w: 6, h: 4.5 }, // along x by the far wall
-		{ z: cz, y: ROOM_CEIL_Y - 2, w: 5, h: 3.5 },                          // a central run
-	]) { const dg = new THREE.BoxGeometry(runX, r.h, r.w); dg.translate(cx, r.y, r.z); ducts.push(dg); }
-	for (const xline of [cx - W * 0.26, cx + W * 0.22]) {                     // a couple of cross runs along z
-		const dg = new THREE.BoxGeometry(4.5, 3.2, runZ); dg.translate(xline, ROOM_CEIL_Y - 2, cz); ducts.push(dg);
-	}
+	const dbox = (w, h, d, x, y, z) => { const g = new THREE.BoxGeometry(w, h, d); g.translate(x, y, z); ducts.push(g); };
+	const elbow = (xFrom, xTo, z, y, w, h) => {                     // a partial horizontal run + a short perpendicular leg
+		dbox(Math.abs(xTo - xFrom), h, w, (xFrom + xTo) / 2, y, z);
+		const leg = rowGap * 1.3; dbox(w, h, leg, xTo, y, z + (z < cz ? leg / 2 : -leg / 2));
+	};
+	elbow(minX + ROOM_MARGIN, cx + W * 0.10, laneZ(Math.max(1, Math.round(fixRows * 0.28))), ROOM_CEIL_Y - 2.4, 5, 4.2);
+	elbow(maxX - ROOM_MARGIN, cx - W * 0.10, laneZ(Math.min(fixRows - 1, Math.round(fixRows * 0.72))), ROOM_CEIL_Y - 2.1, 4.5, 3.6);
 	// shiny galvanized steel: high metalness + low roughness + boosted env reflection
 	const ductMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(ducts), new THREE.MeshStandardMaterial({ color: 0xcdd3da, roughness: 0.24, metalness: 0.92, envMapIntensity: 2.6 }));
 	ducts.forEach((g) => g.dispose());
 	ceiling.add(ductMesh);
 	const pipes = [];
-	for (const p of [{ z: cz - D * 0.32, y: ROOM_CEIL_Y - 1.4, r: 1.1 }, { z: cz + D * 0.34, y: ROOM_CEIL_Y - 1.4, r: 0.8 }]) {
-		const pg = new THREE.CylinderGeometry(p.r, p.r, runX, 16); pg.rotateZ(Math.PI / 2); pg.translate(cx, p.y, p.z); pipes.push(pg);
-	}
+	const pipeRun = (z, x0, len, r, y) => { const pg = new THREE.CylinderGeometry(r, r, len, 16); pg.rotateZ(Math.PI / 2); pg.translate(x0 + len / 2, y, z); pipes.push(pg); };
+	const midLane = laneZ(Math.max(1, Math.round(fixRows * 0.5)));  // a gap near the middle, pipes offset to one side of it
+	pipeRun(midLane + 1.3, minX + ROOM_MARGIN + W * 0.06, W * 0.52, 1.0, ROOM_CEIL_Y - 1.5);
+	pipeRun(midLane - 1.3, cx + W * 0.04, W * 0.32, 0.7, ROOM_CEIL_Y - 1.5);
 	const pipeMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(pipes), new THREE.MeshStandardMaterial({ color: 0xc6ccd4, roughness: 0.16, metalness: 0.96, envMapIntensity: 2.9 }));
 	pipes.forEach((g) => g.dispose());
 	ceiling.add(pipeMesh);
 
 	// --- wall detailing so the big blank planes have edges + things to read against ---
-	const trimMat = new THREE.MeshStandardMaterial({ color: 0x4a4a52, roughness: 0.8 });
-	const bb = [new THREE.BoxGeometry(W, 1.2, 0.4), new THREE.BoxGeometry(W, 1.2, 0.4), new THREE.BoxGeometry(0.4, 1.2, D), new THREE.BoxGeometry(0.4, 1.2, D)];
-	bb[0].translate(cx, 0.6, minZ + 0.25); bb[1].translate(cx, 0.6, maxZ - 0.25); bb[2].translate(minX + 0.25, 0.6, cz); bb[3].translate(maxX - 0.25, 0.6, cz);
-	const baseMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(bb), trimMat); bb.forEach((g) => g.dispose()); walls.add(baseMesh);
-	// a door on the near (minZ) wall
-	const doorX = cx - W * 0.28;
-	const frame = new THREE.Mesh(new THREE.BoxGeometry(10, 19, 0.6), new THREE.MeshStandardMaterial({ color: 0x8a7a60, roughness: 0.7 })); frame.position.set(doorX, 9.5, minZ + 0.3); walls.add(frame);
-	const door = new THREE.Mesh(new THREE.BoxGeometry(9, 18, 0.3), new THREE.MeshStandardMaterial({ color: 0x5b4a36, roughness: 0.65 })); door.position.set(doorX, 9, minZ + 0.55); walls.add(door);
-	const knob = new THREE.Mesh(new THREE.SphereGeometry(0.4, 12, 12), new THREE.MeshStandardMaterial({ color: 0xd9c46a, metalness: 0.8, roughness: 0.3 })); knob.position.set(doorX + 3.6, 9, minZ + 0.8); walls.add(knob);
+	// (the dark floor-line baseboard trim was removed — it read as a "bed rail" you'd trip over along the wall base)
+	// (the back + left doors are now functional swing doors built by windowWall above)
 	// fire extinguisher on the maxX wall
 	const feX = maxX - 0.9, feZ = cz + D * 0.2;
 	const feBody = new THREE.Mesh(new THREE.CylinderGeometry(0.85, 0.85, 3, 16), new THREE.MeshStandardMaterial({ color: 0xc41f1f, roughness: 0.4, metalness: 0.2 })); feBody.position.set(feX, 7, feZ); walls.add(feBody);
@@ -1230,17 +1867,32 @@ function buildRoom() {
 	const phX = minX + 0.5, phZ = cz - D * 0.18;
 	const phBody = new THREE.Mesh(new THREE.BoxGeometry(0.6, 2.4, 1.6), new THREE.MeshStandardMaterial({ color: 0x2b2b30, roughness: 0.6 })); phBody.position.set(phX, 11, phZ); walls.add(phBody);
 	const phHandset = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.5, 2.1), new THREE.MeshStandardMaterial({ color: 0x161618, roughness: 0.6 })); phHandset.position.set(phX + 0.5, 12.5, phZ); walls.add(phHandset);
-	// a 2nd door on the minX wall with an old pin-up calendar hung on it
-	const cdZ = cz + D * 0.22;
-	const cdFrame = new THREE.Mesh(new THREE.BoxGeometry(0.6, 19, 10), new THREE.MeshStandardMaterial({ color: 0x8a7a60, roughness: 0.7 })); cdFrame.position.set(minX + 0.3, 9.5, cdZ); walls.add(cdFrame);
-	const cdDoor = new THREE.Mesh(new THREE.BoxGeometry(0.3, 18, 9), new THREE.MeshStandardMaterial({ color: 0x5b4a36, roughness: 0.65 })); cdDoor.position.set(minX + 0.55, 9, cdZ); walls.add(cdDoor);
-	const cdKnob = new THREE.Mesh(new THREE.SphereGeometry(0.4, 12, 12), new THREE.MeshStandardMaterial({ color: 0xd9c46a, metalness: 0.8, roughness: 0.3 })); cdKnob.position.set(minX + 0.8, 9, cdZ - 3.6); walls.add(cdKnob);
-	const cal = new THREE.Mesh(new THREE.PlaneGeometry(3, 4.6), new THREE.MeshBasicMaterial({ map: makeCalendarTexture() })); cal.rotation.y = Math.PI / 2; cal.position.set(minX + 0.75, 11.5, cdZ); walls.add(cal);
+	// a pin-up calendar on the minX wall (next to its swing door, on a solid strip below the window band)
+	const cal = new THREE.Mesh(new THREE.PlaneGeometry(3, 4.6), new THREE.MeshBasicMaterial({ map: makeCalendarTexture() })); cal.rotation.y = Math.PI / 2; cal.position.set(minX + 0.55, 2.4, sideDoorZ - 14); walls.add(cal);
 	// bulletin board with a "lost cat" flyer on the far (maxZ) wall
 	const bdX = cx + W * 0.27;
 	const board = new THREE.Mesh(new THREE.BoxGeometry(11, 8, 0.4), new THREE.MeshStandardMaterial({ color: 0x8d6a44, roughness: 0.85 })); board.position.set(bdX, 12, maxZ - 0.3); walls.add(board);
 	const flyer = new THREE.Mesh(new THREE.PlaneGeometry(3.4, 4.3), new THREE.MeshBasicMaterial({ map: makeLostCatTexture() })); flyer.rotation.y = Math.PI; flyer.position.set(bdX, 12.2, maxZ - 0.55); walls.add(flyer);
 	const pin = new THREE.Mesh(new THREE.SphereGeometry(0.18, 8, 8), new THREE.MeshStandardMaterial({ color: 0xcc2222 })); pin.position.set(bdX, 14.1, maxZ - 0.6); walls.add(pin);
+
+	// --- dark baseboard along the inside foot of every wall (adds depth). It stops at each doorway and
+	// resumes on the far side. inward = which way that wall's interior face points (so the board hugs it).
+	const BASE_H = 1.15, BASE_T = 0.55, baseMat = new THREE.MeshStandardMaterial({ color: 0x3b3b43, roughness: 0.7, metalness: 0.18 });
+	const baseboard = (axis, fixed, c0, c1, inward, gapC, gapHalf) => {
+		const segs = gapC == null ? [[c0, c1]] : [];
+		if (gapC != null) { if (gapC - gapHalf > c0) segs.push([c0, gapC - gapHalf]); if (gapC + gapHalf < c1) segs.push([gapC + gapHalf, c1]); }
+		for (const s of segs) {
+			const len = s[1] - s[0]; if (len < 0.3) continue;
+			const m = new THREE.Mesh(axis === 'x' ? new THREE.BoxGeometry(len, BASE_H, BASE_T) : new THREE.BoxGeometry(BASE_T, BASE_H, len), baseMat);
+			if (axis === 'x') m.position.set((s[0] + s[1]) / 2, BASE_H / 2, fixed + inward * BASE_T / 2);
+			else m.position.set(fixed + inward * BASE_T / 2, BASE_H / 2, (s[0] + s[1]) / 2);
+			walls.add(m);
+		}
+	};
+	baseboard('x', maxZ, minX, maxX, -1, cx, 9);        // front wall: skip the main glass entrance (±8 door + clearance)
+	baseboard('x', minZ, minX, maxX, +1, sideDoorX, 9);     // back wall: skip the side swing door
+	baseboard('z', minX, minZ, maxZ, +1, sideDoorZ, 9);     // left wall: skip the side swing door
+	baseboard('z', maxX, minZ, maxZ, -1, null, 0);      // right wall: continuous (no door)
 
 	// interior tile floor for this building (sits on top of the outdoor asphalt)
 	const floorTex = makeFloorTexture();
@@ -1249,10 +1901,15 @@ function buildRoom() {
 	const floor = new THREE.Mesh(new THREE.PlaneGeometry(W, D), new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.9 }));
 	floor.rotation.x = -Math.PI / 2; floor.position.set(cx, 0, cz); group.add(floor);
 
+	// dark roof slab on top (above the drop ceiling) so the main building's exterior matches the neighbours.
+	// sits a touch above the wall top (like the neighbours) so the drop ceiling hides its underside (no z-fight).
+	const roofSlab = new THREE.Mesh(new THREE.BoxGeometry(W + 4, 1.5, D + 4), new THREE.MeshStandardMaterial({ color: 0x55585e, roughness: 0.85 }));
+	roofSlab.position.set(cx, ROOM_CEIL_Y + 1.25, cz); group.add(roofSlab);
+
 	walls.visible = options.showWalls;
 	ceiling.visible = options.showCeiling;
 	scene.add(group);
-	objects.room = { group, walls, ceiling, faulty: faultyMeshes };
+	objects.room = { group, walls, ceiling, faulty: faultyMeshes, blinds, bulbDisco: roomBulbDisco };
 	// wall colliders + a safe spawn spot (open margin near the maxZ wall, looking into the room)
 	roomBounds = { minX, maxX, minZ, maxZ };
 	roomSpawn = { x: cx, z: maxZ - ROOM_MARGIN * 0.5, lookX: cx, lookZ: cz };
@@ -1530,6 +2187,7 @@ function setView(name, keepBlocker) {
     flyTo.onDone = null; flyTo.speed = 0.012; // not a location transition
     if (controls && controls.isLocked) controls.unlock();
     if (!keepBlocker) { const bl = document.getElementById('blocker'); if (bl) bl.style.display = 'none'; }
+    _viewProxy.view = name;   // keep the GUI 'View' dropdown showing the current view (it .listen()s)
     // highlight the matching preset button so the idle demo shows which view it's currently on
     document.querySelectorAll('#dcViews button[data-view]').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
 }
@@ -1551,11 +2209,50 @@ function maybeCycleIdleView() {
     }
 }
 
+// --- Disco mode: each light fixture cycles a random colour every 3-5s via per-fixture VERTEX colours on
+// the merged diffuser mesh (1 draw call kept). Off -> all white. Handles on objects.room.bulbDisco +
+// b.full.bulbDisco (set where the bulb mesh is built). ---
+const _discoColor = new THREE.Color();
+function makeBulbDisco(mesh, count) {
+    if (!mesh || !count) return null;
+    const g = mesh.geometry, n = g.attributes.position.count;
+    g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(n * 3).fill(1), 3)); // start white
+    mesh.material.vertexColors = true; mesh.material.needsUpdate = true;
+    return { mesh, count, vertsPer: Math.max(1, Math.round(n / count)), next: new Float64Array(count) };
+}
+function _discoHandles() {
+    const h = [];
+    if (objects.room && objects.room.bulbDisco) h.push(objects.room.bulbDisco);
+    for (const b of lodBuildings) if (b.full && b.full.bulbDisco) h.push(b.full.bulbDisco);
+    return h;
+}
+function updateDisco() {
+    if (!options.disco) return;
+    const now = performance.now();
+    for (const h of _discoHandles()) {
+        const col = h.mesh.geometry.attributes.color; let changed = false;
+        for (let i = 0; i < h.count; i++) {
+            if (now >= h.next[i]) {
+                h.next[i] = now + 3000 + Math.random() * 2000;          // re-colour this fixture in 3-5s
+                _discoColor.setHSL(Math.random(), 0.9, 0.6);
+                const base = i * h.vertsPer * 3;
+                for (let v = 0; v < h.vertsPer; v++) { col.array[base + v * 3] = _discoColor.r; col.array[base + v * 3 + 1] = _discoColor.g; col.array[base + v * 3 + 2] = _discoColor.b; }
+                changed = true;
+            }
+        }
+        if (changed) col.needsUpdate = true;
+    }
+}
+function resetDisco() {   // back to plain white (disco toggled off)
+    for (const h of _discoHandles()) { const col = h.mesh.geometry.attributes.color; col.array.fill(1); col.needsUpdate = true; for (let i = 0; i < h.count; i++) h.next[i] = 0; }
+}
 // Each "faulty" fixture (objects.room.faulty) flickers on its own clock: mostly lit, but every few
 // seconds it stutters off/on for a moment like a dying fluorescent tube.
 function maybeFlicker() {
-    const arr = objects.room && objects.room.faulty;
-    if (!arr || !arr.length) return;
+    const arr = [];
+    if (objects.room && objects.room.faulty) for (const f of objects.room.faulty) arr.push(f);          // main building
+    for (const b of lodBuildings) if (b.full && b.full.faulty) for (const f of b.full.faulty) arr.push(f); // every full neighbour
+    if (!arr.length) return;
     const t = performance.now();
     for (const f of arr) {
         const s = f.userData;
@@ -1577,7 +2274,8 @@ function setupInteraction() {
             else if (hovered) showInfo(hovered);
         });
     }
-    // Preset "show-off" camera views
+    // Preset "show-off" camera view buttons along the bottom (wired to setView). Shown again (the GUI
+    // 'View' dropdown was removed); they fade to low opacity and are clickable on the click-to-enable screen.
     document.querySelectorAll('#dcViews button[data-view]').forEach((btn) => {
         btn.addEventListener('click', () => setView(btn.dataset.view));
     });
@@ -1677,6 +2375,7 @@ function animate() {
     if ((_hlFrame++ % 4) === 0) updateHighlight();
     // Distance-cull + lazily build labels, then render the scene
     updateLabels();
+    updateBlinds();
     renderer.render(scene, camera);
     // Update stats monitor
     stats.update();
@@ -1691,7 +2390,7 @@ function updateControls(time) {
     // Update velocity based on user input
     velocity.x -= velocity.x * 10.0 * delta;
     velocity.z -= velocity.z * 10.0 * delta;
-    velocity.y -= 9.8 * 100.0 * delta;
+    velocity.y -= (options.gravityMs2 || 9.8) * 100.0 * delta;
     direction.z = Number(options.moveForward) - Number(options.moveBackward);
     direction.x = Number(options.moveRight) - Number(options.moveLeft);
     direction.normalize();
@@ -1782,6 +2481,7 @@ window.DC = {
     get camera() { return camera; },
     get controls() { return controls; },
     get options() { return options; },
+    get gui() { return gui; },
     get locations() { return locations; },
     get locationNames() { return locationNames; },
     get objects() { return objects; },
@@ -1789,11 +2489,24 @@ window.DC = {
     display: displayDatacenter,
     clear: clearScene,
     cull: updateLabels,
-    tick: function () { updateFlyTo(); updateHighlight(); updateLabels(); renderer.render(scene, camera); return renderer.info.render.calls; },
+    tick: function () { maybeFlicker(); updateDisco(); maybeCycleIdleView(); updateFlyTo(); updateHighlight(); updateLabels(); updateBlinds(); updateNeighborDoors(); updateRoomDoors(); updateLOD(); updateGuiPos(); renderer.render(scene, camera); if (stats) stats.update(); return renderer.info.render.calls; },
     pick: function () { return raycastInstances(_centerNdc); },
     info: showInfo,
     search: searchServers,
     flyToServer: flyToServer,
+    // --- handles for the dc-multi.js third-person overlay; additive, no effect on dc.html ---
+    collidesAt: collidesAt,
+    playerRadius: playerRadius,
+    eyeHeight: eyeHeight,
+    spawnInside: spawnInside,
+    unitsPerInch: UNITS_PER_INCH,
+    get roomBounds() { return roomBounds; },
+    get roomSpawn() { return roomSpawn; },
+    // --- multi-building LOD + walk-between handles (used by dc-multi.js; inert for dc.html) ---
+    collideWorld: collideWorld,                 // walls + current racks + neighbours' active interiors
+    get buildings() { return dcBuildings; },    // wall/door rects for every building (current + neighbours)
+    setLodFocus: function (x, z) { lodFocus = { x, z }; },   // dc-multi feeds the player ground pos each frame
+    lodState: function () { return lodBuildings.map((b) => ({ id: b.id, full: !!b.full, loading: b.loading, dist: Math.round(b._dist) })); },
 };
 
 init();

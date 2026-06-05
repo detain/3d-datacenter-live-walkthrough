@@ -4,6 +4,7 @@
 	<meta charset="UTF-8">
 	<title>InterServer DataCenter</title>
 	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<meta http-equiv="Cache-Control" content="no-store, max-age=0">
 	<script type="importmap">
 		{
 		"imports": {
@@ -13,10 +14,12 @@
 		}
 	}
 </script>
-	<link rel="stylesheet" href="/css/dc.css">
+	<link rel="stylesheet" href="/css/dc.css?v=p45">
 	<style>
 		#dcSearch { position: fixed; top: 10px; left: 170px; z-index: 30; width: 240px;
-			padding: 7px 10px; border: 1px solid #888; border-radius: 4px; font: 14px Arial, sans-serif; }
+			padding: 7px 10px; border: 1px solid #888; border-radius: 4px; font: 14px Arial, sans-serif;
+			opacity: 0.4; transition: opacity 0.22s ease; }
+		#dcSearch:hover, #dcSearch:focus { opacity: 1; }
 		#dcSearchResults { position: fixed; top: 44px; left: 170px; z-index: 30; width: 262px;
 			max-height: 300px; overflow-y: auto; background: rgba(255,255,255,0.97); border-radius: 4px;
 			box-shadow: 0 2px 8px rgba(0,0,0,0.3); font: 13px Arial, sans-serif; }
@@ -46,6 +49,26 @@
 		#dcLocations button:hover .dc-loc-full { display: block; position: absolute; left: -1px; top: -1px; padding: 6px 10px;
 			background: #ffe9a8; border: 1px solid #888; border-radius: 5px; white-space: nowrap; z-index: 2; }
 		#dcViews button.active { background: #ffcc33; border-color: #cc9900; font-weight: bold; }
+
+		/* --- player (third-person) controls --- */
+		#dcPlayer { position: fixed; top: 10px; right: 12px; z-index: 32; display: flex; gap: 6px; align-items: center; }
+		#dcPlayer button, #dcPlayer select { padding: 7px 11px; border: 1px solid #888; border-radius: 5px; cursor: pointer;
+			background: rgba(255,255,255,0.93); font: 13px Arial, sans-serif; color: #222; }
+		#dcPlayer button:hover, #dcPlayer select:hover { background: #ffe9a8; }
+		#dcPlayerHud { position: fixed; top: 10px; left: 50%; transform: translateX(-50%); z-index: 31;
+			padding: 6px 12px; background: rgba(20,20,28,0.82); color: #fff; border-radius: 5px;
+			font: 12px Arial, sans-serif; pointer-events: none; max-width: 70vw; text-align: center; }
+		/* Fade the left (locations) + bottom (views) controls; a group snaps to full opacity when the mouse is near it. */
+		#dcLocations button, #dcViews button { opacity: 0.4; transition: opacity 0.22s ease; }
+		#dcLocations:hover button, #dcViews:hover button { opacity: 1; }
+		#dcLocations button.active, #dcViews button.active { opacity: 0.82; }
+		#dcLocations:hover button.active, #dcViews:hover button.active { opacity: 1; }
+		/* GUI sliders: drop the right-hand number box and show the value in the left label instead
+		   (the controllers set their own "label (value)" / "label value-unit" name). Widen the name
+		   column so the value fits, leaving the slider track to the right. */
+		.lil-gui { --name-width: 62%; }
+		.lil-gui .controller.number .widget input { display: none; }
+		.lil-gui .dc-val { color: #ffd23a; font-weight: bold; }   /* the value part of slider labels, highlighted */
 	</style>
 </head>
 <body>
@@ -58,15 +81,22 @@
 				<small>Press Escape to disable mouse look.</small>
 			</p>
 			<p>
-				Move: WASD<br />
+				Move: WASD &nbsp;·&nbsp; Run: SHIFT<br />
 				Jump: SPACE<br />
 				Look: MOUSE<br />
+				Zoom: SCROLL WHEEL (zoom all the way in → first-person)<br />
+				Toggle 1st / 3rd person: V<br />
+				Gestures (3rd person): 1 wave · 2 talk · 3 type · 4 look<br />
 			</p>
 		</div>
 	</div>
 	<input id="dcSearch" type="search" placeholder="Search hostname…" autocomplete="off" />
 	<div id="dcSearchResults"></div>
 	<div id="dcInfo"></div>
+	<div id="dcPlayer">
+		<select id="dcChar" title="Character" style="display:none"></select>
+		<button id="dcPerson" type="button">🧍 Third-person</button>
+	</div>
 	<div id="dcViews">
 		<button data-view="overview">Overview</button>
 		<button data-view="top">Top-down</button>
@@ -75,6 +105,7 @@
 		<button data-view="cables">Cables</button>
 	</div>
 	<div id="dcLocations"></div>
-	<script type="module" src="/js/dc.js?v=p38"></script>
+	<script type="module" src="/js/dc.js?v=p67"></script>
+	<script type="module" src="/js/dc-multi.js?v=p18"></script>
 </body>
 </html>
