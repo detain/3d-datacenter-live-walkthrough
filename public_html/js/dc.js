@@ -1052,6 +1052,84 @@ function makeCalendarTexture() {
 	for (let r = 0; r < 6 && day <= 31; r++) for (let i = 0; i < 7; i++) { if (r === 0 && i < 4) continue; if (day > 31) break; g.fillText(String(day++), 24 + i * 28, 286 + r * 14); }
 	const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAnisotropy || 1; return t;
 }
+// --- Funny tech "motivational" posters for the office walls: matte-black poster, a white-keyline image
+// with a simple tech icon, a big phrase, and a deadpan blurb. Framed + hung on the inside walls. ---
+const POSTER_ICONS = {
+	floppy(g, cx, cy, s) {
+		const w = s, x = cx - w / 2, y = cy - w / 2;
+		g.fillStyle = '#26303c'; g.fillRect(x, y, w, w);
+		g.fillStyle = '#8a9099'; g.fillRect(x + w * 0.52, y, w * 0.34, w * 0.34);
+		g.fillStyle = '#11161d'; g.fillRect(x + w * 0.6, y + w * 0.05, w * 0.1, w * 0.24);
+		g.fillStyle = '#d9dde2'; g.fillRect(x + w * 0.16, y + w * 0.5, w * 0.68, w * 0.42);
+		g.strokeStyle = '#9aa0a8'; g.lineWidth = Math.max(2, s * 0.012);
+		for (let i = 0; i < 3; i++) { g.beginPath(); g.moveTo(x + w * 0.2, y + w * 0.58 + i * w * 0.09); g.lineTo(x + w * 0.8, y + w * 0.58 + i * w * 0.09); g.stroke(); }
+	},
+	keyboard(g, cx, cy, s) {
+		const w = s * 1.25, h = s * 0.6, x = cx - w / 2, y = cy - h / 2;
+		g.fillStyle = '#2b313a'; g.fillRect(x, y, w, h);
+		g.fillStyle = '#c7ccd3'; const cols = 9, k = (w - s * 0.1) / cols;
+		for (let r = 0; r < 3; r++) for (let cc = 0; cc < cols; cc++) g.fillRect(x + s * 0.05 + cc * k + 1, y + s * 0.05 + r * (k * 0.62) + 1, k - 3, k * 0.5);
+		g.fillRect(x + w * 0.3, y + h - s * 0.12, w * 0.4, s * 0.09);
+	},
+	ethernet(g, cx, cy, s) {
+		const w = s * 0.66, h = s * 0.86, x = cx - w / 2, y = cy - h / 2;
+		g.fillStyle = '#2b313a'; g.fillRect(x + w * 0.38, y, w * 0.24, h * 0.16);
+		g.fillStyle = '#d9dde2'; g.fillRect(x, y + h * 0.16, w, h * 0.56);
+		g.beginPath(); g.moveTo(x, y + h * 0.72); g.lineTo(x + w, y + h * 0.72); g.lineTo(x + w * 0.66, y + h); g.lineTo(x + w * 0.34, y + h); g.closePath(); g.fill();
+		g.fillStyle = '#e7c558'; for (let i = 0; i < 6; i++) g.fillRect(x + w * 0.1 + i * w * 0.14, y + h * 0.2, w * 0.08, h * 0.22);
+	},
+	power(g, cx, cy, s) {
+		const r = s * 0.4; g.strokeStyle = '#3fd27a'; g.lineWidth = Math.max(4, s * 0.11); g.lineCap = 'round';
+		g.beginPath(); g.arc(cx, cy, r, -Math.PI / 2 + 0.5, -Math.PI / 2 - 0.5 + Math.PI * 2); g.stroke();
+		g.beginPath(); g.moveTo(cx, cy - r - s * 0.12); g.lineTo(cx, cy - s * 0.02); g.stroke();
+	},
+};
+const POSTERS = [
+	{ title: 'Teamwork',       blurb: 'Because saving your work is everyone’s job — right up until someone force-pushes to main.', icon: 'floppy' },
+	{ title: 'Perseverance',   blurb: 'It’s not down. It’s pursuing five-nines from a bold new direction.',                       icon: 'power' },
+	{ title: 'Persistence',    blurb: 'Have you tried turning it off and on again? Now do it four hundred more times.',                     icon: 'keyboard' },
+	{ title: 'Make It Happen', blurb: 'Deploy on a Friday. The on-call engineer believes in you.',                                         icon: 'ethernet' },
+];
+function makePosterTexture(spec) {
+	const W = 460, H = 576, c = document.createElement('canvas'); c.width = W; c.height = H;
+	const g = c.getContext('2d');
+	g.fillStyle = '#0b0b0c'; g.fillRect(0, 0, W, H);
+	const ix = 40, iy = 36, iw = W - 80, ih = 320;
+	const grd = g.createLinearGradient(0, iy, 0, iy + ih); grd.addColorStop(0, '#33424f'); grd.addColorStop(1, '#0f151b');
+	g.fillStyle = grd; g.fillRect(ix, iy, iw, ih);
+	g.strokeStyle = '#e9e9e9'; g.lineWidth = 2; g.strokeRect(ix - 6, iy - 6, iw + 12, ih + 12);
+	POSTER_ICONS[spec.icon](g, ix + iw / 2, iy + ih / 2, Math.min(iw, ih) * 0.46);
+	g.fillStyle = '#e7c558'; g.textAlign = 'center';
+	let fs = 50; g.font = 'bold ' + fs + 'px Georgia, serif';
+	while (g.measureText(spec.title.toUpperCase()).width > W - 56 && fs > 18) { fs -= 2; g.font = 'bold ' + fs + 'px Georgia, serif'; }
+	g.fillText(spec.title.toUpperCase(), W / 2, iy + ih + 70);
+	g.fillStyle = '#cfd3d8'; g.font = 'italic 20px Georgia, serif';
+	const words = spec.blurb.split(' '); let line = '', y = iy + ih + 112;
+	for (const wd of words) { const t = line ? line + ' ' + wd : wd; if (g.measureText(t).width > W - 64 && line) { g.fillText(line, W / 2, y); line = wd; y += 28; } else line = t; }
+	if (line) g.fillText(line, W / 2, y);
+	const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = maxAnisotropy || 1; return tex;
+}
+// Hang the 4 posters on the inside walls of a building (near corners, where the wall is solid). parent =
+// the building's walls/group; b = its {minX,maxX,minZ,maxZ} bounds.
+function addPosters(parent, b) {
+	const PW = 5, PH = 6.25, y = 13.5, frameMat = new THREE.MeshStandardMaterial({ color: 0x141414, roughness: 0.7 });
+	// FD = frame depth; its back embeds in the wall and its front stands `front` units into the room; the
+	// poster plane sits just proud of the frame face. The generous standoff (plus a depth bias) clears the
+	// wall thickness (0.4 main / 0.6 neighbour) so the poster never z-fights the wall behind it.
+	const FD = 0.5, front = 0.45, frameC = front - FD / 2, posterOff = front + 0.12;
+	const place = (spec, axis, fixed, along, inward) => {
+		const tex = makePosterTexture(spec);
+		const frame = new THREE.Mesh(axis === 'x' ? new THREE.BoxGeometry(PW + 0.5, PH + 0.5, FD) : new THREE.BoxGeometry(FD, PH + 0.5, PW + 0.5), frameMat);
+		const poster = new THREE.Mesh(new THREE.PlaneGeometry(PW, PH), new THREE.MeshBasicMaterial({ map: tex, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 }));
+		if (axis === 'x') { frame.position.set(along, y, fixed + inward * frameC); poster.position.set(along, y, fixed + inward * posterOff); poster.rotation.y = inward < 0 ? Math.PI : 0; }
+		else { frame.position.set(fixed + inward * frameC, y, along); poster.position.set(fixed + inward * posterOff, y, along); poster.rotation.y = inward > 0 ? Math.PI / 2 : -Math.PI / 2; }
+		parent.add(frame); parent.add(poster);
+	};
+	place(POSTERS[0], 'x', b.maxZ, b.minX + 8, -1);   // front wall, near minX corner
+	place(POSTERS[1], 'z', b.maxX, b.minZ + 8, -1);   // right wall, near minZ corner
+	place(POSTERS[2], 'x', b.minZ, b.maxX - 8, +1);   // back wall, near maxX corner
+	place(POSTERS[3], 'z', b.minX, b.maxZ - 8, +1);   // left wall, near maxZ corner
+}
 // ---- Community: render every datacenter as a building. The current one is built in full
 // (interior + room); the rest are simple exterior shells placed on a street grid around it. ----
 function locName(id) {
@@ -1140,7 +1218,7 @@ function makeDarkGlassMaterial(side) {
 // A wall with a real ribbon of 8' windows: solid below the sill + above the head, a glass band (with
 // matte-black mullions) between -> see-through from inside, reflective from outside. axis 'x' spans x
 // (z = fixed); 'z' spans z (x = fixed). doorC = door centre along the wall, or null.
-function windowWall(parent, axis, fixed, c0, c1, H, wallMat, glass, mullMat, doorC, swing) {
+function windowWall(parent, axis, fixed, c0, c1, H, wallMat, glass, mullMat, doorC, swing, doorW) {
 	const len = c1 - c0, cen = (c0 + c1) / 2, th = 0.4;
 	const sill = WIN_BOTTOM, head = WIN_BOTTOM + WIN_SZ, DOOR_H = 17.5;
 	let retDoor = null;   // when swing=true, the {pivot,...} for the door panel so the caller can animate it
@@ -1148,7 +1226,7 @@ function windowWall(parent, axis, fixed, c0, c1, H, wallMat, glass, mullMat, doo
 	wall(len, H - head, cen, (head + H) / 2);                        // top strip (above the windows)
 	if (doorC == null) { wall(len, sill, cen, sill / 2); }           // bottom strip (below the windows)
 	else {
-		const dw = 16, lL = (doorC - dw / 2) - c0, rL = c1 - (doorC + dw / 2);
+		const dw = doorW || 16, lL = (doorC - dw / 2) - c0, rL = c1 - (doorC + dw / 2);
 		if (lL > 1) wall(lL, sill, c0 + lL / 2, sill / 2);
 		if (rL > 1) wall(rL, sill, c1 - rL / 2, sill / 2);
 		wall(dw, head - DOOR_H, doorC, (DOOR_H + head) / 2);         // panel above the door
@@ -1189,18 +1267,30 @@ function windowWall(parent, axis, fixed, c0, c1, H, wallMat, glass, mullMat, doo
 		const m = new THREE.Mesh(g, mullMat); axis === 'x' ? m.position.set(c, midY, fixed) : m.position.set(fixed, midY, c); parent.add(m);
 	};
 	const window = (c, gw) => { glassPane(c, gw); mullion(c - gw / 2); mullion(c + gw / 2); windowSlots.push({ axis, fixed, c, gw, midY }); };
-	if (doorC != null) {
-		const dHalf = 8, gw = WIN_SZ, gap = 0.6;
-		const lC = doorC - dHalf - gap - gw / 2, rC = doorC + dHalf + gap + gw / 2;  // flank-window centres
-		wallStrip(c0, lC - gw / 2); window(lC, gw); wallStrip(lC + gw / 2, doorC - dHalf);   // corner -> win -> door
-		wallStrip(doorC + dHalf, rC - gw / 2); window(rC, gw); wallStrip(rC + gw / 2, c1);   // door -> win -> corner
-	} else {
-		const bays = Math.max(1, Math.round(len / (WIN_SZ + MULLION))), step = len / bays;
+	// Tile a [a,b] span of the band with 8' windows punched into 8' bays, leaving 1 or 3 solid bays
+	// between windows (alternating, for a varied rhythm). The two end bays stay solid so the wall
+	// corners (and the posters hung near them) sit on solid wall.
+	const tileBand = (a, b) => {
+		const L = b - a; if (L < WIN_SZ + 1) { wallStrip(a, b); return; }
+		// floor (not round) the bay count so step is ALWAYS >= pitch > WIN_SZ -> a window always fits its
+		// bay. round() can land step just under WIN_SZ on some wall lengths, which silently drops every
+		// window on that wall (the bug that left some buildings nearly windowless).
+		const bays = Math.max(1, Math.floor(L / (WIN_SZ + MULLION))), step = L / bays;
+		let nextWin = 1, tog = 0;
 		for (let i = 0; i < bays; i++) {
-			const x0 = c0 + i * step, x1 = x0 + step, c = (x0 + x1) / 2;
-			if (i % 3 === 1 && step > WIN_SZ + 1) { wallStrip(x0, c - WIN_SZ / 2); window(c, WIN_SZ); wallStrip(c + WIN_SZ / 2, x1); }
-			else wallStrip(x0, x1);
+			const x0 = a + i * step, x1 = x0 + step, c = (x0 + x1) / 2;
+			if (i === nextWin && i < bays - 1 && step > WIN_SZ) {
+				wallStrip(x0, c - WIN_SZ / 2); window(c, WIN_SZ); wallStrip(c + WIN_SZ / 2, x1);
+				nextWin = i + 1 + (tog++ % 4 === 3 ? 3 : 1);   // mostly 1 solid bay between windows, an occasional 3-bay pier
+			} else wallStrip(x0, x1);
 		}
+	};
+	if (doorC != null) {
+		const dHalf = (doorW || 16) / 2;
+		tileBand(c0, doorC - dHalf);     // corner -> door
+		tileBand(doorC + dHalf, c1);     // door -> corner
+	} else {
+		tileBand(c0, c1);
 	}
 	return retDoor;
 }
@@ -1350,13 +1440,15 @@ function buildNeighborShell(grp, px, pz, f, H, doorSide, doorC, doorHalf, wallMa
 			if (hasDoor && a >= doorC - doorHalf - 0.01 && b <= doorC + doorHalf + 0.01) { wbox(axis, fixed, (a + b) / 2, segLen, (doorH + H) / 2, H - doorH); continue; } // wall above the doorway only
 			wbox(axis, fixed, (a + b) / 2, segLen, sill / 2, sill);           // solid below the windows
 			wbox(axis, fixed, (a + b) / 2, segLen, (head + H) / 2, H - head); // solid above the windows
-			const bays = Math.max(1, Math.round(segLen / (WIN_SZ + MULLION))), step = segLen / bays;
+			const bays = Math.max(1, Math.floor(segLen / (WIN_SZ + MULLION))), step = segLen / bays;   // floor -> step always >= pitch > WIN_SZ so windows always fit (same fix as the main building)
+			let nextWin = 1, tog = 0;
 			for (let k = 0; k < bays; k++) {
 				const x0 = a + k * step, x1 = x0 + step, cc = (x0 + x1) / 2;
-				if (k % 3 === 1 && step > WIN_SZ + 1) {                        // occasional window: solid wall flanks + a glass pane
+				if (k === nextWin && k < bays - 1 && step > WIN_SZ) {           // window (1 or 3 solid bays between): solid flanks + a glass pane
 					wbox(axis, fixed, (x0 + cc - WIN_SZ / 2) / 2, (cc - WIN_SZ / 2) - x0, midY, bandH);
 					wbox(axis, fixed, (cc + WIN_SZ / 2 + x1) / 2, x1 - (cc + WIN_SZ / 2), midY, bandH);
 					pane(axis, fixed, cc, WIN_SZ);
+					nextWin = k + 1 + (tog++ % 4 === 3 ? 3 : 1);   // mostly 1 solid bay between windows, an occasional 3-bay pier
 				} else wbox(axis, fixed, cc, step, midY, bandH);              // solid wall bay
 			}
 		}
@@ -1681,6 +1773,7 @@ function buildNeighborInterior(group, b) {
 	const board = new THREE.Mesh(new THREE.BoxGeometry(11, 8, 0.4), new THREE.MeshStandardMaterial({ color: 0x8d6a44, roughness: 0.85 })); board.position.set(bdX, 12, maxZ - 0.3); group.add(board);
 	const flyer = new THREE.Mesh(new THREE.PlaneGeometry(3.4, 4.3), new THREE.MeshBasicMaterial({ map: makeLostCatTexture() })); flyer.rotation.y = Math.PI; flyer.position.set(bdX, 12.2, maxZ - 0.55); group.add(flyer);
 	const cal = new THREE.Mesh(new THREE.PlaneGeometry(3, 4.6), new THREE.MeshBasicMaterial({ map: makeCalendarTexture() })); cal.rotation.y = Math.PI / 2; cal.position.set(minX + 0.75, 11.5, cz + D * 0.22); group.add(cal);
+	addPosters(group, { minX, maxX, minZ, maxZ });   // funny tech motivational posters on the walls
 	// tiled interior floor
 	const floorTex = makeFloorTexture(), tu = 24 * UNITS_PER_INCH;
 	floorTex.repeat.set(Math.max(1, Math.round(W / (4 * tu))), Math.max(1, Math.round(D / (4 * tu))));
@@ -1773,16 +1866,16 @@ function buildRoom() {
 	// walkable (collision gaps added via roomSideDoors). The front (maxZ) door stays the static panel that
 	// dc-multi's glass entrance replaces.
 	const sideDoorX = cx - W * 0.28, sideDoorZ = cz + D * 0.22;
-	const backDoor = windowWall(walls, 'x', minZ, minX, maxX, ROOM_CEIL_Y, wallMat, glass, mullMat, sideDoorX, true); // back + swing door
-	windowWall(walls, 'x', maxZ, minX, maxX, ROOM_CEIL_Y, wallMat, glass, mullMat, cx);                               // front (glass door replaces this)
-	const leftDoor = windowWall(walls, 'z', minX, minZ, maxZ, ROOM_CEIL_Y, wallMat, glass, mullMat, sideDoorZ, true); // left + swing door
+	const backDoor = windowWall(walls, 'x', minZ, minX, maxX, ROOM_CEIL_Y, wallMat, glass, mullMat, sideDoorX, true, 8); // back + single swing door
+	windowWall(walls, 'x', maxZ, minX, maxX, ROOM_CEIL_Y, wallMat, glass, mullMat, cx);                               // front (glass double door replaces this)
+	const leftDoor = windowWall(walls, 'z', minX, minZ, maxZ, ROOM_CEIL_Y, wallMat, glass, mullMat, sideDoorZ, true, 8); // left + single swing door
 	windowWall(walls, 'z', maxX, minZ, maxZ, ROOM_CEIL_Y, wallMat, glass, mullMat, null);                            // right
 	const blinds = buildBlinds(walls, cx, cz, windowSlots, true); windowSlots = [];   // drain the slots windowWall just pushed
 	// register the swing doors (open OUTWARD on approach, auto-close); roomSideDoors feeds the collision gaps.
 	roomDoors = [];
 	if (backDoor) roomDoors.push({ pivot: backDoor.pivot, openSign: 1, cx: sideDoorX, cz: minZ, open: 0, target: 0, lastNear: -1e9 });   // minZ wall: swing -z (outward)
 	if (leftDoor) roomDoors.push({ pivot: leftDoor.pivot, openSign: -1, cx: minX, cz: sideDoorZ, open: 0, target: 0, lastNear: -1e9 });  // minX wall: swing -x (outward)
-	roomSideDoors = [{ side: 'N', c: sideDoorX, half: 8 }, { side: 'W', c: sideDoorZ, half: 8 }];
+	roomSideDoors = [{ side: 'N', c: sideDoorX, half: 4 }, { side: 'W', c: sideDoorZ, half: 4 }];   // 8-wide doors -> ±4 collision gap
 
 	// ceiling (horizontal plane, facing down into the room)
 	const ceil = new THREE.Mesh(new THREE.PlaneGeometry(W, D), ceilMat); ceil.rotation.x = Math.PI / 2; ceil.position.set(cx, ROOM_CEIL_Y, cz); ceiling.add(ceil);
@@ -1867,13 +1960,14 @@ function buildRoom() {
 	const phX = minX + 0.5, phZ = cz - D * 0.18;
 	const phBody = new THREE.Mesh(new THREE.BoxGeometry(0.6, 2.4, 1.6), new THREE.MeshStandardMaterial({ color: 0x2b2b30, roughness: 0.6 })); phBody.position.set(phX, 11, phZ); walls.add(phBody);
 	const phHandset = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.5, 2.1), new THREE.MeshStandardMaterial({ color: 0x161618, roughness: 0.6 })); phHandset.position.set(phX + 0.5, 12.5, phZ); walls.add(phHandset);
-	// a pin-up calendar on the minX wall (next to its swing door, on a solid strip below the window band)
-	const cal = new THREE.Mesh(new THREE.PlaneGeometry(3, 4.6), new THREE.MeshBasicMaterial({ map: makeCalendarTexture() })); cal.rotation.y = Math.PI / 2; cal.position.set(minX + 0.55, 2.4, sideDoorZ - 14); walls.add(cal);
+	// a pin-up calendar mounted ON the left swing door (child of its pivot -> hangs on the door + swings with it)
+	if (leftDoor) { const cal = new THREE.Mesh(new THREE.PlaneGeometry(3, 4.6), new THREE.MeshBasicMaterial({ map: makeCalendarTexture() })); cal.rotation.y = Math.PI / 2; cal.position.set(0.32, 10.5, leftDoor.dw / 2); leftDoor.pivot.add(cal); }
 	// bulletin board with a "lost cat" flyer on the far (maxZ) wall
 	const bdX = cx + W * 0.27;
 	const board = new THREE.Mesh(new THREE.BoxGeometry(11, 8, 0.4), new THREE.MeshStandardMaterial({ color: 0x8d6a44, roughness: 0.85 })); board.position.set(bdX, 12, maxZ - 0.3); walls.add(board);
 	const flyer = new THREE.Mesh(new THREE.PlaneGeometry(3.4, 4.3), new THREE.MeshBasicMaterial({ map: makeLostCatTexture() })); flyer.rotation.y = Math.PI; flyer.position.set(bdX, 12.2, maxZ - 0.55); walls.add(flyer);
 	const pin = new THREE.Mesh(new THREE.SphereGeometry(0.18, 8, 8), new THREE.MeshStandardMaterial({ color: 0xcc2222 })); pin.position.set(bdX, 14.1, maxZ - 0.6); walls.add(pin);
+	addPosters(walls, { minX, maxX, minZ, maxZ });   // funny tech motivational posters on the walls
 
 	// --- dark baseboard along the inside foot of every wall (adds depth). It stops at each doorway and
 	// resumes on the far side. inward = which way that wall's interior face points (so the board hugs it).
@@ -1890,8 +1984,8 @@ function buildRoom() {
 		}
 	};
 	baseboard('x', maxZ, minX, maxX, -1, cx, 9);        // front wall: skip the main glass entrance (±8 door + clearance)
-	baseboard('x', minZ, minX, maxX, +1, sideDoorX, 9);     // back wall: skip the side swing door
-	baseboard('z', minX, minZ, maxZ, +1, sideDoorZ, 9);     // left wall: skip the side swing door
+	baseboard('x', minZ, minX, maxX, +1, sideDoorX, 5);     // back wall: skip the side swing door (8-wide)
+	baseboard('z', minX, minZ, maxZ, +1, sideDoorZ, 5);     // left wall: skip the side swing door (8-wide)
 	baseboard('z', maxX, minZ, maxZ, -1, null, 0);      // right wall: continuous (no door)
 
 	// interior tile floor for this building (sits on top of the outdoor asphalt)

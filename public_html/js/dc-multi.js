@@ -89,7 +89,9 @@ whenReady(async () => {
   } else {
     populateCharacterPicker();
     const startId = new URLSearchParams(location.search).get("char");
-    const ch = S.manifest.characters.find(c => c.id === startId || c.name === startId) || S.manifest.characters[0];
+    // ?char=<id|name> pins a character; otherwise pick a RANDOM one each load.
+    const ch = (startId && S.manifest.characters.find(c => c.id === startId || c.name === startId))
+      || S.manifest.characters[Math.floor(Math.random() * S.manifest.characters.length)];
     await loadCharacter(ch);
   }
 
@@ -127,22 +129,27 @@ async function loadCharacter(ch) {
   S.modelHeight = targetH;
   S.player.add(root);
   S.model = root;
+  // Find the head bone so first-person can collapse it: the camera sits inside the head, so hiding the
+  // head stops it catching the skull's inner faces. Mixamo names it ".../Head" (Neck / HeadTop_End excluded).
+  S.headBone = null;
+  root.traverse((o) => { if (!S.headBone && /head$/i.test(o.name)) S.headBone = o; });
 
   S.mixer = new THREE.AnimationMixer(root);
   // idle = the base GLB's own clip (the base was exported with the Idle motion + skin)
   if (gltf.animations && gltf.animations.length) S.actions.idle = makeAction(gltf.animations[0]);
 
-  // load each clip-only GLB and register it under its label
+  // Play idle IMMEDIATELY (the character appears after just its skinned GLB), then stream the clip-only
+  // animation GLBs in the BACKGROUND so page load isn't blocked on all of them. Guard against a
+  // character switch mid-load: a late clip must not attach to a different character's mixer.
+  if (S.actions.idle) play("idle", 0);
+  const myMixer = S.mixer;
   for (const a of (ch.animations || [])) {
-    try {
-      const ag = await S.loader.loadAsync(a.clip + cb);
+    S.loader.loadAsync(a.clip + cb).then((ag) => {
+      if (S.mixer !== myMixer) return;                 // character changed while this clip loaded
       const clip = ag.animations && ag.animations[0];
-      if (clip) { S.actions[a.label || clip.name] = makeAction(clip, a); }
-      else log("no clip in", a.clip);
-    } catch (e) { log("failed clip", a.clip, e); }
+      if (clip) S.actions[a.label || clip.name] = makeAction(clip, a);
+    }).catch((e) => log("failed clip", a.clip, e));
   }
-  log("actions:", Object.keys(S.actions));
-  play(S.actions.idle ? "idle" : Object.keys(S.actions)[0], 0);
 }
 
 function makeAction(clip, meta) {
@@ -254,13 +261,22 @@ function chooseAnimation(moving, speed) {
 function placeCamera() {
   const eye = (S.DC.eyeHeight ? S.DC.eyeHeight() : 15);
   if (S.mode === "first") {
-    // eyes at the player position; PointerLockControls owns the orientation
+    // eyes at the player position; PointerLockControls owns the orientation. Keep the body VISIBLE so you
+    // can glance down at your hands/torso and see gestures play, and turn the body to face wherever you're
+    // looking. Collapse the head bone to ~0 so the camera (which sits inside the head) doesn't catch the
+    // skull's inner faces. mixer.update() ran already this frame and only drives rotation, so this sticks.
     S.camera.position.set(S.player.position.x, S.player.position.y + eye, S.player.position.z);
-    if (S.model) S.model.visible = false;
+    if (S.model) {
+      S.model.visible = true;
+      S.camera.getWorldDirection(_dir);
+      if (Math.hypot(_dir.x, _dir.z) > 0.05) S.facing = S.player.rotation.y = Math.atan2(_dir.x, _dir.z);
+    }
+    if (S.headBone) S.headBone.scale.setScalar(1e-4);
     return;
   }
   // third person: orbit behind the player along the current look direction
   if (S.model) S.model.visible = true;
+  if (S.headBone) S.headBone.scale.setScalar(1);        // restore the head (collapsed in first-person)
   _head.set(S.player.position.x, S.player.position.y + eye * 0.95, S.player.position.z);
   S.camera.getWorldDirection(_dir).normalize();      // current mouse-look direction
   // pull the camera in if a rack/wall is between head and the ideal position (any building's, now)
@@ -432,12 +448,12 @@ function onWheel(e) {
 }
 
 function applyMode() {
-  if (S.model) S.model.visible = (S.mode === "third");
+  if (S.model) S.model.visible = true;   // visible in BOTH views now (attract mode still hides it while unlocked)
   const btn = document.getElementById("dcPerson");
   if (btn) btn.textContent = S.mode === "first" ? "👁 First-person" : "🧍 Third-person";
   hud(S.mode === "first"
-    ? "First-person — scroll out: third-person · V: third-person · WASD move · Shift run · Space jump"
-    : "Third-person — scroll: zoom in/out (→ first-person) · V: toggle · WASD move · Shift run · Space jump · 1 wave 2 talk 3 type 4 look");
+    ? "First-person — scroll out: third-person · V: third-person · WASD move · Shift run · Space jump · 1-5 gestures · 0/` reset"
+    : "Third-person — scroll: zoom in/out (→ first-person) · V: toggle · WASD move · Shift run · Space jump · 1 dance 2 dance 3 clap 4 dying 5 wave · 0/` reset");
 }
 
 function gesture(label) {
@@ -449,6 +465,13 @@ function gesture(label) {
   play(label, 0.15);
 }
 
+// Cancel any running gesture and return to normal: drop the gesture lock so chooseAnimation() resumes
+// idle/walk/run, and snap to idle now.
+function endGesture() {
+  S.gestureUntil = 0;
+  play(S.actions.idle ? "idle" : Object.keys(S.actions)[0], 0.2);
+}
+
 // ---------------------------------------------------------------- input + UI
 function setupInput() {
   document.addEventListener("keydown", (e) => {
@@ -457,10 +480,12 @@ function setupInput() {
       case "ShiftLeft": case "ShiftRight": S.options.runFast = true; break;
       case "Space": if (S.grounded) { S.vy = JUMP_V; S.grounded = false; } break;
       case "KeyV": case "KeyC": toggleMode(); break;
-      case "Digit1": gesture("wave"); break;
-      case "Digit2": gesture("talk"); break;
-      case "Digit3": gesture("type"); break;
-      case "Digit4": gesture("look"); break;
+      case "Digit1": gesture("dance1"); break;
+      case "Digit2": gesture("dance2"); break;
+      case "Digit3": gesture("clap"); break;
+      case "Digit4": gesture("dying"); break;
+      case "Digit5": gesture("wave"); break;
+      case "Backquote": case "Digit0": endGesture(); break;   // return to normal / stop the gesture
     }
   });
   document.addEventListener("keyup", (e) => {
@@ -509,7 +534,7 @@ function hud(text) {
 function exposeDebug() {
   window.DCM = {
     state: S,
-    setMode, toggleMode, gesture,
+    setMode, toggleMode, gesture, endGesture,
     play: (l) => play(l, 0.2),
     reload: () => location.reload(),
     setCamDist: (d) => { S.camDist = d; },
