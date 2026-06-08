@@ -452,8 +452,8 @@ function applyMode() {
   const btn = document.getElementById("dcPerson");
   if (btn) btn.textContent = S.mode === "first" ? "👁 First-person" : "🧍 Third-person";
   hud(S.mode === "first"
-    ? "First-person — scroll out: third-person · V: third-person · WASD move · Shift run · Space jump · 1-5 gestures · 0/` reset"
-    : "Third-person — scroll: zoom in/out (→ first-person) · V: toggle · WASD move · Shift run · Space jump · 1 dance 2 dance 3 clap 4 dying 5 wave · 0/` reset");
+    ? "First-person — scroll out: third-person · V: third-person · WASD move · Shift run · Space jump · 1-9 gestures · G/H cycle · 0 reset"
+    : "Third-person — scroll: zoom in/out (→ first-person) · V: toggle · WASD move · Shift run · Space jump · 1-9 gestures · G/H cycle · 0/` reset");
 }
 
 function gesture(label) {
@@ -472,6 +472,39 @@ function endGesture() {
   play(S.actions.idle ? "idle" : Object.keys(S.actions)[0], 0.2);
 }
 
+// Full ordered gesture list (locomotion excluded). Number keys 1-9 hit the first nine directly; G / H
+// cycle through whatever the loaded character actually has (queries can miss for some characters).
+const GESTURE_ORDER = ["dance1", "dance2", "clap", "dying", "wave", "dance3", "dance4", "salute", "cheer",
+  "bow", "point", "thumbsup", "talk", "laugh", "think", "shrug", "punch", "kick", "sit", "backflip", "jacks"];
+const GESTURE_NAMES = { dance1: "Samba", dance2: "Hip-Hop", dance3: "Breakdance", dance4: "Gangnam",
+  clap: "Clap", wave: "Wave", dying: "Dying", salute: "Salute", cheer: "Cheer", bow: "Bow", point: "Point",
+  thumbsup: "Thumbs Up", talk: "Talk", laugh: "Laugh", think: "Think", shrug: "Shrug", punch: "Punch",
+  kick: "Kick", sit: "Sit", backflip: "Backflip", jacks: "Jumping Jacks" };
+
+function cycleGesture(dir) {
+  const avail = GESTURE_ORDER.filter((l) => S.actions[l]);
+  if (!avail.length) return;
+  let i = avail.indexOf(S.current);
+  i = i < 0 ? (dir > 0 ? 0 : avail.length - 1) : (i + dir + avail.length) % avail.length;
+  const label = avail[i];
+  gesture(label);
+  flashGesture(GESTURE_NAMES[label] || label);
+}
+
+let _gFlashTimer = 0;
+function flashGesture(text) {                          // brief centred toast naming the gesture you cycled to
+  let el = document.getElementById("dcGesture");
+  if (!el) {
+    el = document.createElement("div"); el.id = "dcGesture";
+    el.style.cssText = "position:fixed;top:46px;left:50%;transform:translateX(-50%);z-index:33;padding:5px 14px;" +
+      "background:rgba(20,20,28,0.85);color:#ffd23a;border-radius:5px;font:bold 14px Arial,sans-serif;pointer-events:none;transition:opacity .3s;";
+    document.body.appendChild(el);
+  }
+  el.textContent = text; el.style.opacity = "1";
+  clearTimeout(_gFlashTimer);
+  _gFlashTimer = setTimeout(() => { el.style.opacity = "0"; }, 1200);
+}
+
 // ---------------------------------------------------------------- input + UI
 function setupInput() {
   document.addEventListener("keydown", (e) => {
@@ -485,6 +518,12 @@ function setupInput() {
       case "Digit3": gesture("clap"); break;
       case "Digit4": gesture("dying"); break;
       case "Digit5": gesture("wave"); break;
+      case "Digit6": gesture("dance3"); break;
+      case "Digit7": gesture("dance4"); break;
+      case "Digit8": gesture("salute"); break;
+      case "Digit9": gesture("cheer"); break;
+      case "KeyG": cycleGesture(1); break;                    // cycle forward through ALL gestures
+      case "KeyH": cycleGesture(-1); break;                   // cycle backward
       case "Backquote": case "Digit0": endGesture(); break;   // return to normal / stop the gesture
     }
   });
@@ -534,7 +573,7 @@ function hud(text) {
 function exposeDebug() {
   window.DCM = {
     state: S,
-    setMode, toggleMode, gesture, endGesture,
+    setMode, toggleMode, gesture, endGesture, cycleGesture,
     play: (l) => play(l, 0.2),
     reload: () => location.reload(),
     setCamDist: (d) => { S.camDist = d; },
