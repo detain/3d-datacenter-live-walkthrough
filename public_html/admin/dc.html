@@ -69,6 +69,15 @@
 		.lil-gui { --name-width: 62%; }
 		.lil-gui .controller.number .widget input { display: none; }
 		.lil-gui .dc-val { color: #ffd23a; font-weight: bold; }   /* the value part of slider labels, highlighted */
+		/* --- presence indicator --- */
+		#dcPresence { position: fixed; top: 10px; right: 80px; z-index: 32;
+			display: flex; align-items: center; gap: 6px;
+			padding: 5px 10px; background: rgba(20,20,28,0.88); color: #d0d8e4;
+			border-radius: 5px; font: 12px Arial, sans-serif; min-width: 90px; }
+		#dcPresenceDot { width: 8px; height: 8px; border-radius: 50%; background: #888; flex-shrink: 0; }
+		#dcPresenceDot.active { background: #3ecf4a; box-shadow: 0 0 5px #3ecf4a; }
+		#dcPresenceLabel { color: #aabbd0; }
+		#dcPresenceCount { font-weight: bold; color: #fff; margin-left: 2px; }
 	</style>
 </head>
 <body>
@@ -105,7 +114,18 @@
 		<button data-view="cables">Cables</button>
 	</div>
 	<div id="dcLocations"></div>
-	<script type="module" src="/js/dc.js?v=p73"></script>
+	<div id="dcPresence">
+		<span id="dcPresenceDot"></span>
+		<span id="dcPresenceLabel">Users: <span id="dcPresenceCount">0</span></span>
+	</div>
+	<script type="module" src="/js/dc-ws.js?v=p1"></script>
+	<script type="module" src="/js/dc.js?v=p45"></script>
+	<script type="module" src="/js/dc-presence.js?v=p1"></script>
 	<script type="module" src="/js/dc-multi.js?v=p24"></script>
+	<script>
+		window.DC_SESSION_ID = window.DC_SESSION_ID || "";
+		window.DC_USER_NAME  = window.DC_USER_NAME  || "";
+		window.DC_ACCOUNT_ID = window.DC_ACCOUNT_ID || 0;
+	</script>
 </body>
 </html>

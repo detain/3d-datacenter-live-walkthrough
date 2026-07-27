@@ -99,6 +99,9 @@ whenReady(async () => {
   applyMode();                                    // sets visibility for the starting mode
   // Re-sync the player anchor whenever pointer-lock engages (dc may have re-spawned the camera).
   S.controls.addEventListener && S.controls.addEventListener("lock", syncPlayerFromCamera);
+  S.controls.addEventListener && S.controls.addEventListener("unlock", function () {
+    if (typeof window.DC_PRESENCE_LEAVE === 'function') window.DC_PRESENCE_LEAVE();
+  });
   // Take over the loop: drive the player, then let dc render (flyTo + highlight + labels + render).
   S.renderer.setAnimationLoop(frame);
   exposeDebug();
@@ -236,6 +239,11 @@ function frame() {
     const target = Math.atan2(_move.x, _move.z);     // model faces +Z by default
     S.facing = lerpAngle(S.facing, target, Math.min(1, dt * 10));
     if (S.model) S.player.rotation.y = S.facing;
+  }
+
+  // Throttled presence update — dc-presence.js enforces the 250ms throttle internally
+  if (typeof window.DC_PRESENCE_MOVE === 'function') {
+    window.DC_PRESENCE_MOVE(S.player.position.x, S.player.position.z, S.facing);
   }
 
   chooseAnimation(moving, speed);
@@ -409,6 +417,9 @@ function trySpawn() {
   S.camera.lookAt(sp.x, eye * 0.95, sp.z);
   S.spawned = true;
   log("spawned player at", sp.x.toFixed(1), sp.z.toFixed(1));
+  if (typeof window.DC_PRESENCE_JOIN === 'function') {
+    window.DC_PRESENCE_JOIN(S.player.position.x, S.player.position.z, S.facing);
+  }
 }
 
 function syncPlayerFromCamera() {
