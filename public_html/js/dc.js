@@ -561,12 +561,14 @@ function collidesAt(x, z, r) {
     const cx = Math.floor(x / RACK_GRID_CELL);
     const cz = Math.floor(z / RACK_GRID_CELL);
     const check = [];
+    // Fix 2: use a Set for O(1) deduplication lookups instead of O(n) .includes()
+    const checkSet = new Set();
     for (let dx = -1; dx <= 1; dx++) {
         for (let dz = -1; dz <= 1; dz++) {
             const cell = _rackGrid[(cx + dx) * 10000 + (cz + dz)];
             if (cell) {
                 for (const idx of cell) {
-                    if (!check.includes(idx)) check.push(idx);
+                    if (!checkSet.has(idx)) { check.push(idx); checkSet.add(idx); }
                 }
             }
         }
@@ -2835,6 +2837,8 @@ function onWindowResize() {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    // Also re-apply pixel ratio cap in case devicePixelRatio changed (e.g., moving between displays)
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 }
 
 // --- Phase 1 measurement handle (admin-gated page; getters add zero render work) ---
@@ -2856,7 +2860,6 @@ window.DC = {
         if (document.hidden) return;
         // Idle skip: after _IDLE_FRAME_THRESHOLD idle frames, gate expensive per-frame updates; reset on player movement (via setLodFocus)
         if (_skipExpensiveUpdates) {
-            updateGuiPos();
             renderer.render(scene, camera);
             if (stats) stats.update();
             return renderer.info.render.calls;
@@ -2865,14 +2868,13 @@ window.DC = {
         updateDisco();
         maybeCycleIdleView();
         updateFlyTo();
-        updateHighlight();
+        if ((_hlFrame++ % 4) === 0) updateHighlight();
         updateLabels();
         updateBlinds();
         updateNeighborDoors();
         updateRoomDoors();
         updateLOD();
         updateGuiPos();
-        renderer.render(scene, camera);
         if (stats) stats.update();
         if (++_tickSkippedFrames > _IDLE_FRAME_THRESHOLD) _skipExpensiveUpdates = true;
         return renderer.info.render.calls;

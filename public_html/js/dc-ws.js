@@ -55,6 +55,19 @@
 		});
 	}
 
+	/* -------------------------- URL param helpers -------------------------- */
+
+	// Allow override via ?ws_url=<wss://url:port> in page URL
+	const _urlParams = new URLSearchParams(window.location.search);
+	const _wsUrlOverride = _urlParams.get('ws_url');
+	const wsUrl = _wsUrlOverride || 'wss://mystage.interserver.net:7272';
+
+	// Default 30s. URL param ?ws_keepalive=<seconds> overrides (clamped 5-300s). // Example: ?ws_keepalive=60 → 60s interval
+	const _wsKeepaliveRaw = parseInt(_urlParams.get('ws_keepalive'), 10);
+	const WS_KEEPALIVE_MS = (!isNaN(_wsKeepaliveRaw) && _wsKeepaliveRaw >= 5 && _wsKeepaliveRaw <= 300)
+	    ? _wsKeepaliveRaw * 1000
+	    : 30000;
+
 	/* -------------------------- Client -------------------------- */
 
 	function Client() {
@@ -65,13 +78,9 @@
 		this.reconnectAttempts = 0;
 		this.reconnectDelay = 3000; // 3 seconds initial
 		this.maxReconnectAttempts = 10;
-		this.wsUrl = 'wss://mystage.interserver.net:7272';
+		this.wsUrl = wsUrl;
 		this._keepaliveTimer = null;
 	}
-
-	// Allow override via ?ws_keepalive=60 (seconds) in page URL
-	const _urlParams = new URLSearchParams(window.location.search);
-	const WS_KEEPALIVE_MS = (parseInt(_urlParams.get('ws_keepalive'), 10) * 1000) || 30000;
 
 	Client.prototype = {
 

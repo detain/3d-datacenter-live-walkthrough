@@ -56,7 +56,7 @@
 	_nameCanvas.height = 48;
 	var _nameCtx = _nameCanvas.getContext('2d');
 
-	/** @type {Map<string, THREE.CanvasTexture>} Cache texture per username (Fix 1) */
+	/** @type {Map<string, {texture: THREE.CanvasTexture, sprite: THREE.Sprite}>} Cache sprite+texture per username (Fix 1) */
 	var _nameSpriteCache = new Map();
 	var _nameSpriteCacheOrder = [];
 	var MAX_NAME_SPRITE_CACHE = 64;
@@ -183,17 +183,14 @@
 	 */
 	function makeNameSprite(name) {
 		/* eslint-disable no-undef */
-		// Return cached texture for this username (Fix 1)
+		// Return cached sprite for this username (Fix 1 — cache the Sprite, not just the texture)
 		if (_nameSpriteCache.has(name)) {
-			var cachedTex = _nameSpriteCache.get(name);
+			var cached = _nameSpriteCache.get(name);
 			// Move to end of order (most recently used)
 			var idx = _nameSpriteCacheOrder.indexOf(name);
 			if (idx !== -1) { _nameSpriteCacheOrder.splice(idx, 1); }
 			_nameSpriteCacheOrder.push(name);
-			var cachedMat = new THREE.SpriteMaterial({ map: cachedTex, transparent: true, depthTest: false });
-			var cachedSprite = new THREE.Sprite(cachedMat);
-			cachedSprite.scale.set(1.6, 0.30, 1);
-			return cachedSprite;
+			return cached.sprite;  // sprite already in scene from previous call — no new object created
 		}
 
 		var canvas = _nameCanvas;   // reuse the pooled canvas (Fix B)
@@ -227,14 +224,17 @@
 		// LRU eviction: if at max capacity, dispose and remove oldest
 		if (_nameSpriteCacheOrder.length >= MAX_NAME_SPRITE_CACHE) {
 			var oldest = _nameSpriteCacheOrder.shift();
-			var oldTex = _nameSpriteCache.get(oldest);
-			if (oldTex) { oldTex.dispose(); _nameSpriteCache.delete(oldest); }
+			var oldEntry = _nameSpriteCache.get(oldest);
+			if (oldEntry) {
+				oldEntry.texture.dispose();
+				if (oldEntry.sprite.material) oldEntry.sprite.material.dispose();
+				_nameSpriteCache.delete(oldest);
+			}
 		}
 		_nameSpriteCacheOrder.push(name);
-		_nameSpriteCache.set(name, texture);
-		var mat     = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
-		var sprite  = new THREE.Sprite(mat);
+		var sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false }));
 		sprite.scale.set(1.6, 0.30, 1);
+		_nameSpriteCache.set(name, { texture: texture, sprite: sprite });
 		/* eslint-enable no-undef */
 
 		return sprite;
@@ -306,10 +306,11 @@
 		var entry = state.remote.get(data.uid);
 		if (!entry) return;
 
-		// Dispose cached name sprite texture and clear from cache (Fix 2)
+		// Dispose cached name sprite texture+sprite and clear from cache (Fix 1)
 		if (entry.name && _nameSpriteCache.has(entry.name)) {
-			var tex = _nameSpriteCache.get(entry.name);
-			tex.dispose();
+			var cached = _nameSpriteCache.get(entry.name);
+			cached.texture.dispose();
+			if (cached.sprite.material) cached.sprite.material.dispose();
 			_nameSpriteCache.delete(entry.name);
 			var idx = _nameSpriteCacheOrder.indexOf(entry.name);
 			if (idx !== -1) _nameSpriteCacheOrder.splice(idx, 1);
@@ -479,17 +480,21 @@
 		// Remove all remote avatars from scene
 		if (sceneReady()) {
 			state.remote.forEach(function (entry) {
-				// Dispose cached name sprite texture (Fix 4)
+				// Dispose cached name sprite texture+sprite (Fix 1)
 				if (entry.name && _nameSpriteCache.has(entry.name)) {
-					var tex = _nameSpriteCache.get(entry.name);
-					tex.dispose();
+					var cached = _nameSpriteCache.get(entry.name);
+					cached.texture.dispose();
+					if (cached.sprite.material) cached.sprite.material.dispose();
 					_nameSpriteCache.delete(entry.name);
 				}
 				if (entry.group) window.DC.scene.remove(entry.group);
 			});
 		}
-		// Clear name sprite cache (Fix 4)
-		_nameSpriteCache.forEach(function (tex) { tex.dispose(); });
+		// Clear name sprite cache (Fix 1: dispose both texture and sprite material)
+		_nameSpriteCache.forEach(function (cached) {
+			cached.texture.dispose();
+			if (cached.sprite.material) cached.sprite.material.dispose();
+		});
 		_nameSpriteCache.clear();
 		_nameSpriteCacheOrder = [];
 

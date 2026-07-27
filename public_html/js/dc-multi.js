@@ -55,8 +55,6 @@ const S = {
   camDist: 11,                    // third-person follow distance (scene units)
   pixelScale,                     // exposed for GUI control
   fov: 75,                        // camera field of view (degrees), adjustable via GUI
-  walkSpeed: WALK,                // walk speed (scene units/sec), synced with module-level WALK
-  runSpeed: RUN,                  // run speed (scene units/sec), synced with module-level RUN
   powerPreference: 'high-performance', // GPU power preference (display-only; set at renderer creation)
 };
 
@@ -133,6 +131,12 @@ whenReady(async () => {
   S.renderer.setAnimationLoop(frame);
   exposeDebug();
   log("overlay active. mode =", S.mode);
+
+  // Dispose cached logo texture and glass material on page close/navigate (Fix 2)
+  window.addEventListener('beforeunload', function () {
+    if (_cachedLogoTexture) { _cachedLogoTexture.dispose(); _cachedLogoTexture = null; }
+    if (_cachedGlassMaterial) { _cachedGlassMaterial.dispose(); _cachedGlassMaterial = null; }
+  });
 });
 
 // ---------------------------------------------------------------- character
@@ -654,13 +658,14 @@ function populateCharacterPicker() {
     });
     f.add({ toggle: () => toggleMode() }, "toggle").name("Toggle Perspective (1st/3rd)");
     f.add(S, 'pixelScale', 0.3, 1.0).name('Quality').step(0.1).onChange(v => { setPixelScale(v); });
+    f.add({ 'DPR Cap': 'max 2.0' }, 'DPR Cap').name('DPR Cap').enable(false);
     f.add(S, 'fov', 30, 120).name('FOV').step(1).onChange(v => {
         if (S.camera) { S.camera.fov = v; S.camera.updateProjectionMatrix(); }
     });
     // powerPreference is set at renderer creation and can't be changed afterwards — display-only
     f.add({ 'GPU Mode': S.powerPreference }, 'GPU Mode').name('GPU Mode').enable(false);
-    f.add(S, 'walkSpeed', 1, 30).name('Walk Speed').step(0.5).onChange(v => { WALK = v; });
-    f.add(S, 'runSpeed', 5, 60).name('Run Speed').step(0.5).onChange(v => { RUN = v; });
+    f.add({ get walk() { return WALK; }, set walk(v) { WALK = v; } }, 'walk', 1, 30).name('Walk Speed').step(0.5).onChange(v => { WALK = v; });
+    f.add({ get run() { return RUN; }, set run(v) { RUN = v; } }, 'run', 5, 60).name('Run Speed').step(0.5).onChange(v => { RUN = v; });
     f.open();
     S.playerGui = f;
     const pl = document.getElementById("dcPlayer"); if (pl) pl.style.display = "none";
