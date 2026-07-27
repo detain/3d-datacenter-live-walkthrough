@@ -30,7 +30,7 @@ let pixelScale = 0.8;  // quality scale factor for renderer pixel ratio (module-
 
 // Pixel scale setter — clamps to slider range and syncs renderer pixel ratio
 function setPixelScale(v) {
-    pixelScale = Math.min(Math.max(v, 0.3), 1.0); // clamp to slider range [0.3, 1.0]
+    pixelScale = Math.min(Math.max(v, 0.5), 1.0); // clamp to slider range [0.5, 1.0]
     if (S && S.renderer) S.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2) * pixelScale);
     if (S) S.pixelScale = pixelScale;
 }
@@ -128,7 +128,7 @@ whenReady(async () => {
     if (typeof window.DC_PRESENCE_LEAVE === 'function') window.DC_PRESENCE_LEAVE();
   });
   // Take over the loop: drive the player, then let dc render (flyTo + highlight + labels + render).
-  S.renderer.setAnimationLoop(frame);
+  if (S.DC.setAnimationLoop) S.DC.setAnimationLoop(frame);
   exposeDebug();
   log("overlay active. mode =", S.mode);
 
@@ -136,6 +136,17 @@ whenReady(async () => {
   window.addEventListener('beforeunload', function () {
     if (_cachedLogoTexture) { _cachedLogoTexture.dispose(); _cachedLogoTexture = null; }
     if (_cachedGlassMaterial) { _cachedGlassMaterial.dispose(); _cachedGlassMaterial = null; }
+  });
+  // Clear DC_PRESENCE_JOIN on disconnect/auth-failure to prevent stale coordinate calls (MAJOR-4)
+  document.addEventListener('dc:disconnected', () => { window.DC_PRESENCE_JOIN = null; });
+  document.addEventListener('dc:auth-failure', () => { window.DC_PRESENCE_JOIN = null; });
+
+  // IDEA-2: Context loss handling (IDEA-2)
+  document.addEventListener('dc:context-lost', () => {
+    log('GPU context lost');
+  });
+  document.addEventListener('dc:context-restored', () => {
+    log('GPU context restored');
   });
 });
 
@@ -340,7 +351,7 @@ function placeCamera() {
   // pull the camera in if a rack/wall is between head and the ideal position (any building's, now)
   // Skip expensive collision loop if player hasn't moved, camera hasn't rotated, and camDist unchanged (Fix 6, Fix 9)
   const _posKey = S.player.position.x.toFixed(1) + ',' + S.player.position.z.toFixed(1);
-  const _camDirKey = Math.round(_dir.x * 10) + ',' + Math.round(_dir.y * 10) + ',' + Math.round(_dir.z * 10);
+  const _camDirKey = Math.round(_dir.x * 20) + ',' + Math.round(_dir.y * 20) + ',' + Math.round(_dir.z * 20);
   let dist;
   const playerMoved = !_lastPlayerPos.equals(S.player.position);
   if (!playerMoved && _posKey === _lastCollisionCamPos && _camDirKey === _lastCollisionCamDir && S.camDist === _lastSafeDist) {
@@ -657,7 +668,7 @@ function populateCharacterPicker() {
       if (ch) { S.spawned = false; loadCharacter(ch); }
     });
     f.add({ toggle: () => toggleMode() }, "toggle").name("Toggle Perspective (1st/3rd)");
-    f.add(S, 'pixelScale', 0.3, 1.0).name('Quality').step(0.1).onChange(v => { setPixelScale(v); });
+    f.add(S, 'pixelScale', 0.5, 1.0).name('Quality').step(0.1).onChange(v => { setPixelScale(v); });
     f.add({ 'DPR Cap': 'max 2.0' }, 'DPR Cap').name('DPR Cap').enable(false);
     f.add(S, 'fov', 30, 120).name('FOV').step(1).onChange(v => {
         if (S.camera) { S.camera.fov = v; S.camera.updateProjectionMatrix(); }
@@ -687,5 +698,10 @@ function exposeDebug() {
     reload: () => location.reload(),
     setCamDist: (d) => { S.camDist = d; },
     setFacingOffset: (rad) => { S.player.rotation.y = S.facing + rad; },
+    getLatency: () => window.DC_LATENCY || 0,
+    getConnected: () => window.DC_AUTHED || false,
+    // IDEA-3: expose current viewport from WS layer
+    getViewport: () => window.DC_WS?._viewport || null,
+    viewDist: 50,
   };
 }

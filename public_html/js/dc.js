@@ -39,14 +39,20 @@ const _IDLE_FRAME_THRESHOLD = 18000;
 let _tickSkippedFrames = 0;
 let _skipExpensiveUpdates = false;
 
+// IDEA-2: WebGL context loss state (set by context loss/restored event listeners in init())
+let _contextLost = false;
+let _sessionBackup = null;
+
 // --- FPS monitoring for automatic quality scaling ---
 let _fpsHistory = [];           // rolling window of frame times (ms)
 let _lastFrameTime = 0;         // timestamp of last frame
 let _qualityDowngradeTime = 0;  // when we last downgraded (debounce guard)
+let _lastUpgradeTime = 0;       // when we last upgraded (debounce guard)
 const FPS_WINDOW = 60;          // frames to average over
 const FPS_TARGET = 55;          // FPS below this triggers a downgrade
 const FPS_RECOVERY = 65;        // FPS needed to suggest an upgrade
 const DOWNGRADE_COOLDOWN = 10000; // ms between downgrades (debounce)
+const UPGRADE_COOLDOWN = 3000;   // ms between upgrades (debounce)
 
 // Quality settings — progressively reduced when FPS drops. Exposed via DC.quality.
 const S = {
@@ -304,14 +310,18 @@ function _updateFPS(now) {
 
 function _autoQualityScale(now) {
     if (_fpsHistory.length < FPS_WINDOW) return; // not enough data yet
-    if (now - _qualityDowngradeTime < DOWNGRADE_COOLDOWN) return; // debounce: don't spam downgrades
 
     const avgFrameTime = _fpsHistory.reduce((a, b) => a + b, 0) / _fpsHistory.length;
     const fps = 1000 / avgFrameTime;
 
     if (fps < FPS_TARGET) {
+        if (now - _qualityDowngradeTime < DOWNGRADE_COOLDOWN) return; // debounce: don't spam downgrades
         _qualityDowngradeTime = now;
         _reduceQuality();
+    } else if (fps > FPS_RECOVERY) {
+        if (now - _lastUpgradeTime < UPGRADE_COOLDOWN) return; // debounce: don't spam upgrades
+        _lastUpgradeTime = now;
+        _upgradeQuality();
     }
 }
 
@@ -339,6 +349,34 @@ function _reduceQuality() {
     // Step 3: make LOD more aggressive (higher bias = objects switch to low-LOD sooner)
     S.lodBias = Math.min(S.lodBias + 0.5, 2);
     _notifyQualityChange('lodBias', S.lodBias);
+}
+
+function _upgradeQuality() {
+    // Reverse Step 3: reduce LOD bias (make LOD less aggressive)
+    if (S.lodBias > 0) {
+        S.lodBias = Math.max(0, S.lodBias - 0.5);
+        _notifyQualityChange('lodBias', S.lodBias);
+        return;
+    }
+
+    // Reverse Step 2: double the shadow map size
+    if (_shadowMapSize <= 1024) {
+        _shadowMapSize = Math.min(2048, _shadowMapSize * 2);
+        S.shadowMapSize = _shadowMapSize;
+        _applyShadowMapSize();
+        _notifyQualityChange('shadowMap', _shadowMapSize);
+        return;
+    }
+
+    // Reverse Step 1: increase pixel scale
+    if (S.pixelScale < 1.0) {
+        S.pixelScale = Math.min(1.0, S.pixelScale + 0.25);
+        if (renderer) {
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio * S.pixelScale, 2));
+        }
+        _notifyQualityChange('pixelScale', S.pixelScale);
+        return;
+    }
 }
 
 function _applyShadowMapSize() {
@@ -449,7 +487,7 @@ function displayGui() {
 function mergeLocations(data) {
     // The response always carries the full locations list (names, for the dropdown); only the
     // requested location has its racks populated. Keep already-loaded full data; fill in names.
-    for (const idx in data.locations) {
+    for (const idx of Object.keys(data.locations)) {
         const incoming = data.locations[idx];
         const hasRacks = incoming.racks && Object.keys(incoming.racks).length > 0;
         if (hasRacks || !locations[idx]) {
@@ -543,9 +581,9 @@ function clearScene() {
         cached.geometry.dispose();
     }
     _cableGeometryCache.clear();
-    // Clear texture caches (Fix #5, #7, #11, #18)
-    _labelTextureCache.forEach(tex => tex.dispose());
-    _labelTextureCache.clear();
+    // Clear texture caches — label textures are NOT disposed here because they may still be
+    // referenced by label Mesh objects; updateLabels() rebuilds them on demand. Only dispose
+    // the per-label material.map in the label cleanup loop below (Fix #18).
     _posterTextureCache.forEach(tex => tex.dispose());
     _posterTextureCache.clear();
     _signTextureCache.forEach(tex => tex.dispose());
@@ -656,7 +694,7 @@ function playerRadius() { return Math.max(0.2, (options.waistInches / (2 * Math.
 // (x,z) with radius r collides if it overlaps any footprint -> used to block walking into racks.
 function collidesAt(x, z, r) {
     // walls: keep the player inside the room
-    if (roomBounds && (x - r < roomBounds.minX || x + r > roomBounds.maxX || z - r < roomBounds.minZ || z + r > roomBounds.maxZ)) return true;
+    if (roomBounds && (x - r <= roomBounds.minX || x + r >= roomBounds.maxX || z - r <= roomBounds.minZ || z + r >= roomBounds.maxZ)) return true;
     // Fast spatial grid lookup: only check rack colliders in nearby cells (Fix #3)
     const cx = Math.floor(x / RACK_GRID_CELL);
     const cz = Math.floor(z / RACK_GRID_CELL);
@@ -676,14 +714,14 @@ function collidesAt(x, z, r) {
     if (check.length === 0) {
         // Fallback: rack grid empty (shouldn't happen), use full scan
         for (const c of rackColliders) {
-            if (x + r > c.minX && x - r < c.maxX && z + r > c.minZ && z - r < c.maxZ) return true;
+            if (x + r >= c.minX && x - r <= c.maxX && z + r >= c.minZ && z - r <= c.maxZ) return true;
         }
         return false;
     }
     for (const idx of check) {
         const c = rackColliders[idx];
         if (!c) continue;
-        if (x + r > c.minX && x - r < c.maxX && z + r > c.minZ && z - r < c.maxZ) return true;
+        if (x + r >= c.minX && x - r <= c.maxX && z + r >= c.minZ && z - r <= c.maxZ) return true;
     }
     return false;
 }
@@ -922,6 +960,7 @@ function displayRacks(modelIdx) {
         }
     }
     buildInstanced(models.racks[modelIdx], placements, 'rack');
+    _rackCollidersInserted.clear(); // Ensure clean rebuild on every displayRacks() call (Bug #2)
     _rebuildRackGrid(); // Update spatial grid with new rack colliders (Fix #3)
 }
 
@@ -953,8 +992,12 @@ function displayServerText(text, asset, x, y, z) {
 
 const LABEL_DISTANCE = 40;                                  // draw a label only within this many world units
 const LABEL_DISTANCE_SQ = LABEL_DISTANCE * LABEL_DISTANCE;
+const MAX_LABELS = 200;                                     // max labels to texture at once (IDEA-6)
 const _labelCamPos = new THREE.Vector3();
-const LABEL_GEO = new THREE.PlaneGeometry(1, 1);           // shared quad for every flat label (never disposed)
+// Shared quad geometry for ALL flat labels. NOT disposed on scene clear because
+// it remains in use by every label Mesh — disposing it would break all live labels.
+// New label quads reuse this same geometry instance (scaled via label.scale.set).
+const LABEL_GEO = new THREE.PlaneGeometry(1, 1);
 
 // Cache: hostname string → CanvasTexture (Fix #7)
 const _labelTextureCache = new Map();
@@ -1022,15 +1065,33 @@ function updateLabels() {
     if (!camera) return;
     const show = options.showLabels;
     camera.getWorldPosition(_labelCamPos);
+
+    // IDEA-6: If too many labels, only texture the closest MAX_LABELS to avoid overworking the GPU
+    const allLabels = [...objects.labels, ...objects.rackLabels];
+    if (allLabels.length > MAX_LABELS) {
+        // Sort by distance and mark the furthest as "de-prioritized" (skip texture creation)
+        const withDist = allLabels.map(s => ({
+            sprite: s,
+            distSq: s.position.distanceToSquared(_labelCamPos),
+        }));
+        withDist.sort((a, b) => a.distSq - b.distSq);
+        // Mark all beyond MAX_LABELS as not-to-render, so updateLabels below skips them
+        for (let i = MAX_LABELS; i < withDist.length; i++) {
+            withDist[i].sprite.userData.dePrioritized = true;
+        }
+    }
+
     for (const arr of [objects.labels, objects.rackLabels]) {
         for (const sprite of arr) {
             const near = show && sprite.position.distanceToSquared(_labelCamPos) < LABEL_DISTANCE_SQ;
-            if (near && !sprite.userData.drawn) {
+            // IDEA-6: Skip texture creation for de-prioritized labels (too far/too many)
+            const canTexture = near && !sprite.userData.drawn && !sprite.userData.dePrioritized;
+            if (canTexture) {
                 sprite.material.map = makeLabelTexture(sprite.userData.text);
                 sprite.material.needsUpdate = true;
                 sprite.userData.drawn = true;
             }
-            sprite.visible = near;
+            sprite.visible = near && !sprite.userData.dePrioritized;
         }
     }
 }
@@ -1114,8 +1175,13 @@ function displaySwitches(locId, dx, dz, sink) {
     const intraOnly = !!sink;   // neighbours: only draw cables whose endpoints are inside THIS building
     const racks = (locations[locId] || {}).racks; if (!racks) return;
 
-    // Fix #10: Cache cable geometry per location for the main building (not neighbours)
-    if (!sink && _cableGeometryCache.has(locId)) {
+    // IDEA-4: Cable geometry LOD — reduce tubular segments when camera is far (overview mode)
+    const camY = camera ? camera.position.y : 0;
+    const farFromCables = camY > 25;
+    const maxTubular = farFromCables ? 40 : 220;
+
+    // Fix #10: Cache cable geometry per location for the main building (not neighbours, not LOD-reduced)
+    if (!sink && !farFromCables && _cableGeometryCache.has(locId)) {
         const cached = _cableGeometryCache.get(locId);
         // Reuse cached merged geometry (clone so dispose doesn't affect cache)
         const geo = cached.geometry.clone();
@@ -1146,7 +1212,7 @@ function displaySwitches(locId, dx, dz, sink) {
         let len = 0;
         for (let i = 1; i < vecs.length; i++) len += vecs[i - 1].distanceTo(vecs[i]);
         const curve = new THREE.CatmullRomCurve3(cableCurvePoints(vecs, makeRng(seed || 1)));
-        const tubular = Math.min(220, Math.max(10, Math.round(len / 2.2)));
+        const tubular = Math.min(maxTubular, Math.max(10, Math.round(len / 2.2)));
         const geo = new THREE.TubeGeometry(curve, tubular, CABLE_RADIUS, CABLE_RADIAL, false);
         const count = geo.attributes.position.count;
         const colors = new Float32Array(count * 3);
@@ -1247,6 +1313,31 @@ function displaySwitches(locId, dx, dz, sink) {
         }
     }
     if (tubes.length === 0) { if (!sink) objects.network = null; return; }
+
+    // IDEA-8: Progressive cable loading - when many cables, defer merge to avoid main-thread blocking
+    if (tubes.length > 150 && !sink) {
+        const _tubes = tubes;
+        const _locId = locId;
+        (requestIdleCallback || setTimeout)(() => {
+            const geometry = BufferGeometryUtils.mergeGeometries(_tubes, false);
+            _tubes.forEach((g) => g.dispose());
+            _cableGeometryCache.set(_locId, { geometry: geometry.clone(), tubeCount: _tubes.length });
+            if (objects.network) {
+                scene.remove(objects.network);
+                objects.network.geometry.dispose();
+                objects.network.material.dispose();
+            }
+            const material = new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: 0.6, metalness: 0.0, clearcoat: 0.6, clearcoatRoughness: 0.25 });
+            const cables = new THREE.Mesh(geometry, material);
+            cables.visible = options.showNetwork;
+            cables.frustumCulled = false;
+            scene.add(cables);
+            objects.network = cables;
+        }, { timeout: 2000 });
+        return;
+    }
+
+    // Small-to-medium cable count: merge synchronously (fast enough)
     const geometry = BufferGeometryUtils.mergeGeometries(tubes, false);
     tubes.forEach((g) => g.dispose());
     // Fix #10: Cache the merged cable geometry for the main building (not neighbours)
@@ -2373,6 +2464,19 @@ function spawnInside() {
     camera.position.set(sx, eyeHeight(), sz);
     camera.lookAt(roomSpawn.lookX, eyeHeight(), roomSpawn.lookZ);
     velocity.set(0, 0, 0);
+    // IDEA-3: notify server of viewport after spawn/camera move
+    if (window.DC_WS && window.DC_WS._updateViewport) {
+        const dir = new THREE.Vector3();
+        camera.getWorldDirection(dir);
+        window.DC_WS._updateViewport({
+            x: camera.position.x,
+            y: camera.position.y,
+            z: camera.position.z,
+            dirX: dir.x,
+            dirY: dir.y,
+            dirZ: dir.z
+        });
+    }
 }
 
 // Scan the open margin band around the racks for the first spot a player of radius r fits.
@@ -2585,6 +2689,11 @@ function updateFlyTo() {
 // Changing locations: float up out of the current building, rebuild for the new one, then descend
 // into it -- a quick (~3s) transition instead of an instant jump.
 function flyTransition(toLoc) {
+    const loc = locations[toLoc];
+    if (!loc || !loc.racks || Object.keys(loc.racks).length === 0) {
+        console.warn('flyTransition: no valid room data for location', toLoc);
+        return;
+    }
     const oldCx = roomBounds ? (roomBounds.minX + roomBounds.maxX) / 2 : camera.position.x;
     const oldCz = roomBounds ? (roomBounds.minZ + roomBounds.maxZ) / 2 : camera.position.z;
     flyTo.from.copy(camera.position);
@@ -2600,6 +2709,19 @@ function flyTransition(toLoc) {
         flyTo.to.set(s.x, eyeHeight(), s.z);
         flyTo.look.set(s.lookX, eyeHeight(), s.lookZ);
         flyTo.t = 0; flyTo.speed = 0.012; flyTo.active = true; flyTo.onDone = null; // phase 2: descend in
+        // IDEA-3: notify server of viewport after fly-to lands
+        if (window.DC_WS && window.DC_WS._updateViewport) {
+            const dir = new THREE.Vector3();
+            camera.getWorldDirection(dir);
+            window.DC_WS._updateViewport({
+                x: camera.position.x,
+                y: camera.position.y,
+                z: camera.position.z,
+                dirX: dir.x,
+                dirY: dir.y,
+                dirZ: dir.z
+            });
+        }
     };
 }
 
@@ -2795,6 +2917,110 @@ function init() {
     renderer.setSize(window.innerWidth, window.innerHeight);
     document.body.appendChild(renderer.domElement);
     maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
+
+    // IDEA-2: WebGL context loss handling
+    let _animationLoopCb = animate;  // stored callback; honoured on restore
+
+    function _backupSession() {
+        _sessionBackup = {
+            authenticated: window.DC_AUTHED === true,
+            session: window.DC_SESSION_ID || null,
+            uid: window.DC_UID || null,
+            name: window.DC_PRESENCE ? window.DC_PRESENCE.name : null,
+            loc: options.location || 0,
+            pos: camera ? { x: camera.position.x, y: camera.position.y, z: camera.position.z } : null,
+            yaw: camera ? camera.rotation.y : 0,
+            wsConnected: window.DC_WS && window.DC_WS.connected(),
+            ts: Date.now()
+        };
+    }
+
+    function _rejoinPresence(session) {
+        if (window.DC_WS && window.DC_WS._updateViewport) {
+            const dir = new THREE.Vector3();
+            camera.getWorldDirection(dir);
+            window.DC_WS._updateViewport({
+                x: camera.position.x,
+                y: camera.position.y,
+                z: camera.position.z,
+                dirX: dir.x,
+                dirY: dir.y,
+                dirZ: dir.z,
+                viewDist: 50
+            });
+        }
+        if (window.DC_WS && window.DC_WS.send) {
+            window.DC_WS.send({
+                v: 1,
+                op: 'dc.presence.join',
+                data: {
+                    loc: session.loc || 0,
+                    x: session.pos ? session.pos.x : 0,
+                    z: session.pos ? session.pos.z : 0,
+                    yaw: session.yaw || 0
+                }
+            });
+        }
+    }
+
+    function _reconnectAndRejoin(session) {
+        if (!window.DC_WS) return;
+        const originalOnOpen = window.DC_WS._onOpen;
+        window.DC_WS._onOpen = function () {
+            if (originalOnOpen) originalOnOpen.call(window.DC_WS);
+            setTimeout(() => _rejoinPresence(session), 500);
+        };
+        window.DC_WS._connect();
+    }
+
+    function _showContextLostOverlay() {
+        let overlay = document.getElementById('dc-context-lost-overlay');
+        if (!overlay) {
+            overlay = document.createElement('div');
+            overlay.id = 'dc-context-lost-overlay';
+            overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.85);display:flex;align-items:center;justify-content:center;z-index:999999;color:#fff;font-family:sans-serif;font-size:18px;';
+            overlay.innerHTML = '<div style="text-align:center"><div style="font-size:32px;margin-bottom:12px">🔄</div>Restoring 3D View...<br><small>GPU context was lost</small></div>';
+            document.body.appendChild(overlay);
+        }
+        overlay.style.display = 'flex';
+    }
+
+    function _hideContextLostOverlay() {
+        const overlay = document.getElementById('dc-context-lost-overlay');
+        if (overlay) overlay.remove();  // remove from DOM
+    }
+
+    renderer.domElement.addEventListener('webglcontextlost', (e) => {
+        e.preventDefault();
+        _contextLost = true;
+        _backupSession();
+        _showContextLostOverlay();
+        console.warn('WebGL context lost - session backed up');
+        document.dispatchEvent(new CustomEvent('dc:context-lost', { bubbles: true }));
+    }, false);
+
+    renderer.domElement.addEventListener('webglcontextrestored', () => {
+        console.warn('WebGL context restored - rebuilding scene');
+        _contextLost = false;
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        clearScene();
+        displayDatacenter();
+        if (_sessionBackup && _sessionBackup.pos) {
+            camera.position.set(_sessionBackup.pos.x, _sessionBackup.pos.y, _sessionBackup.pos.z);
+            camera.rotation.y = _sessionBackup.yaw || 0;
+        }
+        if (_sessionBackup && _sessionBackup.authenticated && window.DC_WS) {
+            if (window.DC_WS.connected()) {
+                _rejoinPresence(_sessionBackup);
+            } else {
+                _reconnectAndRejoin(_sessionBackup);
+            }
+        }
+        renderer.setAnimationLoop(_animationLoopCb);
+        _hideContextLostOverlay();
+        document.dispatchEvent(new CustomEvent('dc:context-restored', { bubbles: true }));
+    }, false);
     // Neutral image-based environment so metallic surfaces (galvanized ducts/pipes, cable sheen)
     // reflect something instead of rendering black. Subtle intensity so it doesn't wash the racks.
     const pmrem = new THREE.PMREMGenerator(renderer);
@@ -2823,6 +3049,9 @@ function init() {
 
 // Animation loop
 function animate() {
+    // IDEA-2: skip rendering when WebGL context is lost
+    if (_contextLost) return;
+
     const now = performance.now();
 
     if (options.useFirstPerson == true) {
@@ -2913,6 +3142,20 @@ function onKeyDown(event) {
             if (options.canJump === true) velocity.y += 100; // ~2 ft hop (was 350 = a ~24 ft leap)
             options.canJump = false;
             break;
+        // IDEA-5: Number keys 1-9 jump to the first 9 locations
+        case "Digit1": case "Digit2": case "Digit3": case "Digit4": case "Digit5":
+        case "Digit6": case "Digit7": case "Digit8": case "Digit9": {
+            const idx = parseInt(event.code.replace("Digit", ""), 10) - 1;
+            const locKeys = Object.keys(locationNames);
+            if (locKeys[idx] !== undefined) {
+                const locId = locationNames[locKeys[idx]];
+                if (locId !== options.location) {
+                    options.location = locId;
+                    switchLocation();
+                }
+            }
+            break;
+        }
     }
 }
 
@@ -3008,6 +3251,10 @@ window.DC = {
     collideWorld: collideWorld,                 // walls + current racks + neighbours' active interiors
     get buildings() { return dcBuildings; },    // wall/door rects for every building (current + neighbours)
     setLodFocus: function (x, z) { lodFocus = { x, z }; _tickSkippedFrames = 0; _skipExpensiveUpdates = false; },   // dc-multi feeds the player ground pos each frame
+    setAnimationLoop: function (cb) {
+        _animationLoopCb = cb || animate;
+        if (renderer) renderer.setAnimationLoop(_animationLoopCb);
+    },
     lodState: function () { return lodBuildings.map((b) => ({ id: b.id, full: !!b.full, loading: b.loading, dist: Math.round(b._dist) })); },
 };
 

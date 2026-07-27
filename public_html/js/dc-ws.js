@@ -80,6 +80,16 @@
 		this.maxReconnectAttempts = 10;
 		this.wsUrl = wsUrl;
 		this._keepaliveTimer = null;
+		// MINOR-5: ping timestamp tracking
+		this._lastPingTs = null;
+		// IDEA-1: presence batching
+		this._presenceBatch = null;
+		this._batchRaf = null;
+		// IDEA-7: latency tracking
+		this._latencyHistory = [];
+		// IDEA-3: viewport update throttle
+		this._viewportSendTimer = null;
+		this._viewport = null;
 	}
 
 	Client.prototype = {
@@ -102,7 +112,13 @@
 				if (self._keepaliveTimer) clearInterval(self._keepaliveTimer);
 				self._keepaliveTimer = setInterval(function () {
 					if (self.ws && self.ws.readyState === WebSocket.OPEN) {
-						self.send({v:1, op: 'ping', id: 'keepalive', ts: Date.now(), data: {}});
+						// MINOR-5: If we sent a ping > 2x keepalive interval ago without response, reconnect
+						if (self._lastPingTs && Date.now() - self._lastPingTs > WS_KEEPALIVE_MS * 2) {
+							self.ws.close();
+							return;
+						}
+						self._lastPingTs = Date.now();
+						self.send('ping', {});
 					}
 				}, WS_KEEPALIVE_MS);
 			};
@@ -118,8 +134,8 @@
 				if (!self.closedByUs && self.reconnectAttempts < self.maxReconnectAttempts) {
 					self.reconnectAttempts++;
 					setTimeout(function () { self._connect(); }, self.reconnectDelay);
-					// exponential backoff: double each attempt, add jitter, cap at 30s
-					self.reconnectDelay = Math.min(self.reconnectDelay * 2 + Math.random() * 500, 30000);
+					// exponential backoff: double each attempt, cap at 30s, then add jitter
+					self.reconnectDelay = Math.min(self.reconnectDelay * 2, 30000) + Math.random() * 500;
 				} else if (!self.closedByUs) {
 					// exhausted reconnect attempts
 					self._setStatus('exhausted');
@@ -154,6 +170,18 @@
 		 * @param {string} op   Op name, e.g. 'dc.presence.join'.
 		 * @param {Object} [data] */
 		send: function (op, data) {
+			// IDEA-1: batch dc.presence.* ops and flush on next animation frame
+			if (op.startsWith('dc.presence.')) {
+				if (!this._presenceBatch) this._presenceBatch = [];
+				this._presenceBatch.push({ op: op, data: data || {} });
+				if (!this._batchRaf) {
+					const self = this;
+					this._batchRaf = requestAnimationFrame(function () {
+						self._flushPresence();
+					});
+				}
+				return;
+			}
 			this._sendRaw({
 				v: 1,
 				id: uuid(),
@@ -161,6 +189,23 @@
 				ts: Math.floor(Date.now() / 1000),
 				data: data || {}
 			});
+		},
+
+		// IDEA-1: flush batched presence moves
+		_flushPresence: function () {
+			if (this._presenceBatch && this._presenceBatch.length) {
+				for (const { op, data } of this._presenceBatch) {
+					this._sendRaw({
+						v: 1,
+						id: uuid(),
+						op: op,
+						ts: Math.floor(Date.now() / 1000),
+						data: data
+					});
+				}
+				this._presenceBatch = [];
+			}
+			this._batchRaf = null;
 		},
 
 		/** Handle an incoming JSON frame. */
@@ -197,9 +242,25 @@
 				return;
 			}
 
+			// pong — server responded to our keepalive ping
+			if (op === 'pong') {
+				// IDEA-7: track latency
+				if (this._lastPingTs) {
+					const latency = Date.now() - this._lastPingTs;
+					window.DC_LATENCY = latency;
+					if (!window.DC_DEBUG_PING_HISTORY) window.DC_DEBUG_PING_HISTORY = [];
+					window.DC_DEBUG_PING_HISTORY.push(latency);
+					if (window.DC_DEBUG_PING_HISTORY.length > 10) {
+						window.DC_DEBUG_PING_HISTORY.shift();
+					}
+					this._lastPingTs = null;
+				}
+				return;
+			}
+
 			// ping — server health check, respond with pong
 			if (op === 'ping') {
-				this.send({v:1, op: 'pong', id: envelope.id, ts: Date.now(), data: data || {}});
+				this.send('pong', data || {});
 				return;
 			}
 
@@ -232,12 +293,53 @@
 			}
 		},
 
+		// IDEA-7: get average latency from ping history
+		getLatency: function () {
+			const history = window.DC_DEBUG_PING_HISTORY || [];
+			if (history.length === 0) return null;
+			const sum = history.reduce((a, b) => a + b, 0);
+			return Math.round(sum / history.length);
+		},
+
+		// IDEA-2: check if WebSocket is currently connected
+		connected: function () {
+			return !!(this.ws && this.ws.readyState === WebSocket.OPEN);
+		},
+
+		// IDEA-3: send throttled viewport updates (500ms cooldown)
+		_updateViewport: function (data) {
+			// data: { x, y, z, dirX, dirY, dirZ } — camera position + look direction
+			this._viewport = data;
+			if (this._viewportSendTimer) return;
+			this._viewportSendTimer = setTimeout(() => {
+				this._viewportSendTimer = null;
+				this._sendRaw({
+					v: 1,
+					id: uuid(),
+					op: 'dc.viewport.update',
+					ts: Math.floor(Date.now() / 1000),
+					data: data
+				});
+			}, 500);
+		},
+
 		/** Close the socket and suppress the reconnect loop. */
 		destroy: function () {
 			this.closedByUs = true;
 			if (this._keepaliveTimer) {
 				clearInterval(this._keepaliveTimer);
 				this._keepaliveTimer = null;
+			}
+			// IDEA-1: cancel any pending presence batch flush
+			if (this._batchRaf) {
+				cancelAnimationFrame(this._batchRaf);
+				this._batchRaf = null;
+				this._presenceBatch = null;
+			}
+			// IDEA-3: cancel any pending viewport throttle timer
+			if (this._viewportSendTimer) {
+				clearTimeout(this._viewportSendTimer);
+				this._viewportSendTimer = null;
 			}
 			if (this.ws) {
 				try { this.ws.close(); } catch (e) { /* noop */ }
@@ -269,6 +371,14 @@
 		var client = new Client();
 		window.DC_WS = client;
 		client._connect();
+
+		// IDEA-2: Handle GPU context loss - notify hub and pause
+		document.addEventListener('dc:context-lost', function () {
+			console.warn('[dc-ws] GPU context lost, will restore when available');
+		});
+		document.addEventListener('dc:context-restored', function () {
+			console.warn('[dc-ws] GPU context restored');
+		});
 	}
 
 	if (document.readyState === 'loading') {

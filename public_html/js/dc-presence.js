@@ -221,11 +221,13 @@
 		ctx.fillText(name, 128, 24);
 
 		var texture = new THREE.CanvasTexture(canvas);
-		// LRU eviction: if at max capacity, dispose and remove oldest
-		if (_nameSpriteCacheOrder.length >= MAX_NAME_SPRITE_CACHE) {
+		// LRU eviction: if over max capacity, dispose and remove oldest (CRIT-4: was >=, now >)
+		if (_nameSpriteCacheOrder.length > MAX_NAME_SPRITE_CACHE) {
 			var oldest = _nameSpriteCacheOrder.shift();
 			var oldEntry = _nameSpriteCache.get(oldest);
 			if (oldEntry) {
+				// CRIT-3: remove sprite from its parent group before disposal
+				oldEntry.sprite.parent?.remove(oldEntry.sprite);
 				oldEntry.texture.dispose();
 				if (oldEntry.sprite.material) oldEntry.sprite.material.dispose();
 				_nameSpriteCache.delete(oldest);
@@ -320,7 +322,8 @@
 			if (idx !== -1) _nameSpriteCacheOrder.splice(idx, 1);
 		}
 
-		if (entry.group && sceneReady()) {
+		// BUG-1: check group is still in scene before removing
+		if (entry.group && entry.group.parent === window.DC.scene) {
 			entry.group.traverse(function (child) {
 				if (child.isSprite && child.material) {
 					if (child.material.map) {
