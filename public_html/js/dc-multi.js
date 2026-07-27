@@ -26,6 +26,8 @@ let _lastCollisionCamDir = null;  // "x,y,z" rounded to 1 decimal (camera world 
 let _cachedLogoTexture = null;
 let _cachedGlassMaterial = null;
 
+let pixelScale = 0.8;  // quality scale factor for renderer pixel ratio
+
 const S = {
   DC: null, scene: null, camera: null, renderer: null, controls: null, options: null,
   loader: new GLTFLoader(),
@@ -44,6 +46,7 @@ const S = {
   gestureUntil: 0,                // ms timestamp; while > now a gesture overrides locomotion
   spawned: false,
   camDist: 11,                    // third-person follow distance (scene units)
+  pixelScale,                     // exposed for GUI control
 };
 
 // movement tuning (scene units/sec). dc.js's own walk terminal speed is ~40 u/s; match-ish.
@@ -85,8 +88,8 @@ whenReady(async () => {
   const _draco = new DRACOLoader(); _draco.setDecoderPath('/lib/three/examples/jsm/libs/draco/');
   S.loader.setDRACOLoader(_draco);
   // render at a slightly lower internal resolution for FPS headroom (the datacenter is fill-heavy)
-  // 0.8 factor is intentional: balances visual quality vs FPS on GPU-limited frames
-  S.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2) * 0.8);
+  // pixelScale factor is adjustable via GUI (0.3–1.0): balances visual quality vs FPS on GPU-limited frames
+  S.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2) * S.pixelScale);
   S.renderer.setSize(window.innerWidth, window.innerHeight);
 
   try {
@@ -123,8 +126,20 @@ whenReady(async () => {
 async function loadCharacter(ch) {
   S.loadedCharId = ch.id;                           // remembered for the (deferred) GUI dropdown default
   if (S.charProxy) S.charProxy.character = ch.id;   // keep the GUI 'Character' dropdown in sync
-  // tear down a previous model
-  if (S.model) { S.player.remove(S.model); S.model.traverse(o => { o.geometry && o.geometry.dispose && o.geometry.dispose(); }); }
+  // tear down a previous model — dispose geometry, materials, and textures to prevent GPU memory leaks
+  if (S.model) {
+    S.player.remove(S.model);
+    S.model.traverse(o => {
+      if (o.geometry) { o.geometry.dispose(); }
+      if (o.isMesh) {
+        const mats = Array.isArray(o.material) ? o.material : [o.material];
+        mats.forEach(m => {
+          if (m.map) m.map.dispose();
+          m.dispose();
+        });
+      }
+    });
+  }
   S.actions = {}; S.current = null; S.mixer = null; S.model = null;
 
   log("loading character", ch.name, ch.model);
@@ -445,6 +460,16 @@ function updateDoor(dt) {
 }
 
 function trySpawn() {
+  if (S.door && S.door.group) {
+    S.door.group.traverse(o => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.isMesh) {
+        const mats = Array.isArray(o.material) ? o.material : [o.material];
+        mats.forEach(m => { if (m.map) m.map.dispose(); m.dispose(); });
+      }
+    });
+    S.scene.remove(S.door.group);
+  }
   S.door = null; // clear cached door on location switch (Fix 8)
   const sp = S.DC.roomSpawn;
   if (!sp) return;
@@ -608,6 +633,10 @@ function populateCharacterPicker() {
       if (ch) { S.spawned = false; loadCharacter(ch); }
     });
     f.add({ toggle: () => toggleMode() }, "toggle").name("Toggle Perspective (1st/3rd)");
+    f.add(S, 'pixelScale', 0.3, 1.0).name('Quality').step(0.1).onChange(v => {
+      S.pixelScale = v;
+      S.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2) * v);
+    });
     f.open();
     S.playerGui = f;
     const pl = document.getElementById("dcPlayer"); if (pl) pl.style.display = "none";

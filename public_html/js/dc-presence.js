@@ -35,7 +35,7 @@
 
 	/* -------------------------- constants -------------------------- */
 
-	var THROTTLE_MS = 250;   // minimum interval between dc.presence.move sends
+	var THROTTLE_MS = 300;   // minimum interval between dc.presence.move sends
 	var LERP_SPEED  = 12;    // avatar position lerp factor per second (scene units)
 
 	/* -------------------------- shared geometry/materials (Fix 4) -------------------------- */
@@ -55,6 +55,9 @@
 	_nameCanvas.width = 256;
 	_nameCanvas.height = 48;
 	var _nameCtx = _nameCanvas.getContext('2d');
+
+	/** @type {Map<string, THREE.CanvasTexture>} Cache texture per username (Fix 1) */
+	var _nameSpriteCache = new Map();
 	/* eslint-enable no-undef */
 
 	/* -------------------------- state ---------------------------- */
@@ -178,6 +181,15 @@
 	 */
 	function makeNameSprite(name) {
 		/* eslint-disable no-undef */
+		// Return cached texture for this username (Fix 1)
+		if (_nameSpriteCache.has(name)) {
+			var cachedTex = _nameSpriteCache.get(name);
+			var cachedMat = new THREE.SpriteMaterial({ map: cachedTex, transparent: true, depthTest: false });
+			var cachedSprite = new THREE.Sprite(cachedMat);
+			cachedSprite.scale.set(1.6, 0.30, 1);
+			return cachedSprite;
+		}
+
 		var canvas = _nameCanvas;   // reuse the pooled canvas (Fix B)
 		var ctx = _nameCtx;         // reuse the pooled context
 		ctx.clearRect(0, 0, 256, 48); // clear residual from previous sprite
@@ -206,7 +218,8 @@
 		ctx.fillText(name, 128, 24);
 
 		var texture = new THREE.CanvasTexture(canvas);
-		var mat     = new THREE.SpriteMaterial({ map: texture, depthTest: false });
+		_nameSpriteCache.set(name, texture);
+		var mat     = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
 		var sprite  = new THREE.Sprite(mat);
 		sprite.scale.set(1.6, 0.30, 1);
 		/* eslint-enable no-undef */
@@ -280,16 +293,20 @@
 		var entry = state.remote.get(data.uid);
 		if (!entry) return;
 
+		// Dispose cached name sprite texture and clear from cache (Fix 2)
+		if (entry.name && _nameSpriteCache.has(entry.name)) {
+			var tex = _nameSpriteCache.get(entry.name);
+			tex.dispose();
+			_nameSpriteCache.delete(entry.name);
+		}
+
 		if (entry.group && sceneReady()) {
-			// Dispose name sprite canvas texture and material to prevent GPU memory leak (Fix #13)
 			entry.group.traverse(function (child) {
-				if (child.isSprite) {
-					if (child.material) {
-						if (child.material.map) {
-							child.material.map.dispose();
-						}
-						child.material.dispose();
+				if (child.isSprite && child.material) {
+					if (child.material.map) {
+						child.material.map.dispose();
 					}
+					child.material.dispose();
 				}
 			});
 			window.DC.scene.remove(entry.group);
@@ -307,6 +324,7 @@
 	 * @param {number} dt — delta time in seconds
 	 */
 	function tickAvatars(dt) {
+		if (document.hidden) return;
 		if (!_sceneReady) return;
 
 		state.remote.forEach(function (entry) {
@@ -440,13 +458,24 @@
 	 * Handle dc:auth-failure or dc:disconnected — nuke all remote avatars.
 	 */
 	function onAuthFailureOrDisconnect() {
-		pendingJoin = null;  // clear any pending join
+		pendingJoin = null;  // clear any pending join (Fix 2: top, before teardown)
+
 		// Remove all remote avatars from scene
 		if (sceneReady()) {
 			state.remote.forEach(function (entry) {
+				// Dispose cached name sprite texture (Fix 4)
+				if (entry.name && _nameSpriteCache.has(entry.name)) {
+					var tex = _nameSpriteCache.get(entry.name);
+					tex.dispose();
+					_nameSpriteCache.delete(entry.name);
+				}
 				if (entry.group) window.DC.scene.remove(entry.group);
 			});
 		}
+		// Clear name sprite cache (Fix 4)
+		_nameSpriteCache.forEach(function (tex) { tex.dispose(); });
+		_nameSpriteCache.clear();
+
 		state.remote.clear();
 		state.uid  = null;
 		state.name = null;

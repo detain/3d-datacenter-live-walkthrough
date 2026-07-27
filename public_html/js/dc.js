@@ -24,6 +24,7 @@ const _viewProxy = { view: 'overview' };   // bound to the GUI 'View' dropdown (
 let prevTime = performance.now();
 let racksShown = false, showServers = true;
 let objects = {instanced: [], network: null, rackLabels: [], labels: [], room: null, community: null}, models = { racks: {}, servers: {} }, locationNames = {};
+let sunCore = null, sunGlow = null;  // sun spheres (Fix #5 disposal)
 let rackColliders = []; // x/z footprints of placed racks (for collision)
 let roomBounds = null;  // {minX,maxX,minZ,maxZ} wall extents (collide against the walls)
 let roomSpawn = null;   // {x,y,z,lookX,lookZ} a safe spot inside the room to drop the player
@@ -76,6 +77,9 @@ const _signTextureCache = new Map();
 
 // Cache: seed → floor CanvasTexture (Fix #5)
 const _floorTextureCache = new Map();
+
+// Cache: seed → ceiling CanvasTexture (Fix #4)
+const _ceilingTextureCache = new Map();
 
 function _rackGridKey(x, z) {
     return Math.floor(x / RACK_GRID_CELL) * 10000 + Math.floor(z / RACK_GRID_CELL);
@@ -410,6 +414,8 @@ function clearScene() {
     _signTextureCache.clear();
     _floorTextureCache.forEach(tex => tex.dispose());
     _floorTextureCache.clear();
+    _ceilingTextureCache.forEach(tex => tex.dispose());
+    _ceilingTextureCache.clear();
     roomBounds = null; roomSpawn = null;
     // Multi-building LOD: dispose any neighbour FULL models (their group is added straight to the scene,
     // separate from objects.community). Geometry/material are shared cached templates -> only free each
@@ -475,6 +481,9 @@ function clearScene() {
         objects.community.traverse((n) => { if (n.isMesh) { n.geometry.dispose(); const m = n.material; if (m.map) m.map.dispose(); m.dispose(); } });
         objects.community = null;
     }
+    // Sun spheres (Fix #5)
+    if (sunCore) { scene.remove(sunCore); sunCore.geometry.dispose(); sunCore.material.dispose(); sunCore = null; }
+    if (sunGlow) { scene.remove(sunGlow); sunGlow.geometry.dispose(); sunGlow.material.dispose(); sunGlow = null; }
 }
 
 function convertRackCoordinatesToPosition(x, y) {
@@ -510,13 +519,16 @@ function collidesAt(x, z, r) {
     // walls: keep the player inside the room
     if (roomBounds && (x - r < roomBounds.minX || x + r > roomBounds.maxX || z - r < roomBounds.minZ || z + r > roomBounds.maxZ)) return true;
     // Fast spatial grid lookup: only check rack colliders in nearby cells (Fix #3)
-    const cellKey = Math.floor(x / RACK_GRID_CELL) * 10000 + Math.floor(z / RACK_GRID_CELL);
+    const cx = Math.floor(x / RACK_GRID_CELL);
+    const cz = Math.floor(z / RACK_GRID_CELL);
     const check = [];
     for (let dx = -1; dx <= 1; dx++) {
-        const cell = _rackGrid[cellKey + dx * 10000];
-        if (cell) {
-            for (const idx of cell) {
-                if (!check.includes(idx)) check.push(idx);
+        for (let dz = -1; dz <= 1; dz++) {
+            const cell = _rackGrid[(cx + dx) * 10000 + (cz + dz)];
+            if (cell) {
+                for (const idx of cell) {
+                    if (!check.includes(idx)) check.push(idx);
+                }
             }
         }
     }
@@ -620,6 +632,7 @@ function buildInstanced(model, placements, kind, sink) {
         inst.userData.modelBox = model.box;    // model-space bounds (highlight box size)
         container.add(inst);
         instList.push(inst);
+        inst.frustumCulled = false;  // Fix #8: instances spread wide -> loose bounding sphere
         created.push(inst);
     }
     // Racks are the only collidable furniture. model.box unions EVERY sub-mesh -- including the
@@ -888,7 +901,7 @@ const CABLE_OVERHEAD = 22; // y height of the overhead cable tray (above the rac
 const CABLE_END = 5;       // how far beyond a rack group's end racks the cables turn out
 const CABLE_SPREAD = 1.1;  // per-cable offset so bundled cables sit beside each other, not on one line
 const CABLE_RADIUS = 0.05;  // cable thickness in world units (true scale ~0.03; a touch thicker so it reads)
-const CABLE_RADIAL = 6;     // tube cross-section sides (6 = round-looking)
+const CABLE_RADIAL = 8;     // tube cross-section sides (8 = more circular at close range)
 // Cable colours: random-ish per cable for now (could key off link speed later). Blue-dominant
 // with blue + orange accents, like a real patch field.
 const CABLE_COLORS = [ // 60% yellow, 20% blue, 20% orange
@@ -1159,14 +1172,20 @@ const CEIL_TILE = 36 * UNITS_PER_INCH; // 3 ft drop-ceiling tiles
 
 // White drop-ceiling tile: a square panel with a slight recessed gap (the grid) around each edge,
 // so when repeated it reads as a suspended tile ceiling.
-function makeCeilingTexture() {
+function makeCeilingTexture(seed) {
+	if (_ceilingTextureCache.has(seed)) {
+		return _ceilingTextureCache.get(seed);
+	}
+	const rng = makeRng(seed ?? 0);
 	const px = 128, c = document.createElement('canvas'); c.width = c.height = px;
 	const g = c.getContext('2d');
 	g.fillStyle = '#fbfbfa'; g.fillRect(0, 0, px, px);       // white panel
 	g.fillStyle = '#cdcdc8'; const gap = 5;                  // slight recessed gap (the grid) between tiles
 	g.fillRect(0, 0, px, gap); g.fillRect(0, 0, gap, px); g.fillRect(0, px - gap, px, gap); g.fillRect(px - gap, 0, gap, px);
-	for (let i = 0; i < 120; i++) { g.fillStyle = Math.random() < 0.5 ? '#f3f3f1' : '#f6f6f4'; g.fillRect(Math.random() * px, Math.random() * px, 1, 1); } // very faint fibreboard speckle
-	const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAnisotropy || 1; return t;
+	for (let i = 0; i < 120; i++) { g.fillStyle = rng() < 0.5 ? '#f3f3f1' : '#f6f6f4'; g.fillRect(rng() * px, rng() * px, 1, 1); } // very faint fibreboard speckle
+	const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAnisotropy || 1;
+	_ceilingTextureCache.set(seed, t);
+	return t;
 }
 
 // "Lost cat" flyer for the bulletin board.
@@ -1906,7 +1925,7 @@ function buildNeighborInterior(group, b) {
 	const minX = b.minX, maxX = b.maxX, minZ = b.minZ, maxZ = b.maxZ;
 	const W = maxX - minX, D = maxZ - minZ, cx = (minX + maxX) / 2, cz = (minZ + maxZ) / 2;
 	// drop ceiling (faces down)
-	const ceilTex = makeCeilingTexture(); ceilTex.repeat.set(Math.max(1, Math.round(W / CEIL_TILE)), Math.max(1, Math.round(D / CEIL_TILE)));
+	const ceilTex = makeCeilingTexture(b.id); ceilTex.repeat.set(Math.max(1, Math.round(W / CEIL_TILE)), Math.max(1, Math.round(D / CEIL_TILE)));
 	const ceil = new THREE.Mesh(new THREE.PlaneGeometry(W, D), new THREE.MeshStandardMaterial({ map: ceilTex, color: 0xffffff, roughness: 0.95, emissive: 0x2a2a2a, side: THREE.DoubleSide }));
 	ceil.rotation.x = Math.PI / 2; ceil.position.set(cx, ROOM_CEIL_Y, cz); group.add(ceil);
 	// fluorescent troffers (one bright diffuser panel per 4-ft slot, dark housing frame). options.faultyLights
@@ -2045,7 +2064,7 @@ function buildRoom() {
 	group.add(walls); group.add(ceiling);
 
 	const wallMat = new THREE.MeshStandardMaterial({ color: 0xe9e2d2, roughness: 0.95, metalness: 0.0, side: THREE.DoubleSide }); // off-white / beige
-	const ceilTex = makeCeilingTexture();
+	const ceilTex = makeCeilingTexture(options.location);
 	ceilTex.repeat.set(Math.max(1, Math.round(W / CEIL_TILE)), Math.max(1, Math.round(D / CEIL_TILE)));
 	const ceilMat = new THREE.MeshStandardMaterial({ map: ceilTex, color: 0xffffff, roughness: 0.95, metalness: 0.0, emissive: 0x2a2a2a, side: THREE.DoubleSide });
 
@@ -2294,7 +2313,7 @@ const _hoverSize = new THREE.Vector3();
 // Fix #4: Camera forward direction helper and distance pre-check for raycastInstances
 const _camFwd = new THREE.Vector3();
 const _rcTempV = new THREE.Vector3();
-const MAX_RAYCAST_DIST = 30;  // only raycast instanced meshes within this distance
+const MAX_RAYCAST_DIST = 50;  // only raycast instanced meshes within this distance
 
 function _getCameraForward(cam) {
     cam.getWorldDirection(_camFwd);
@@ -2621,9 +2640,9 @@ function init() {
     scene.add(sun);
     // a big, glowing sun up in the sky (the directional light above is its illumination)
     const sunPos = new THREE.Vector3(560, 430, 360);
-    const sunCore = new THREE.Mesh(new THREE.SphereGeometry(42, 28, 20), new THREE.MeshBasicMaterial({ color: 0xfff4c8 }));
+    sunCore = new THREE.Mesh(new THREE.SphereGeometry(42, 28, 20), new THREE.MeshBasicMaterial({ color: 0xfff4c8 }));
     sunCore.position.copy(sunPos); sunCore.frustumCulled = false; scene.add(sunCore);
-    const sunGlow = new THREE.Mesh(new THREE.SphereGeometry(80, 28, 20), new THREE.MeshBasicMaterial({ color: 0xffeeaa, transparent: true, opacity: 0.32, depthWrite: false }));
+    sunGlow = new THREE.Mesh(new THREE.SphereGeometry(80, 28, 20), new THREE.MeshBasicMaterial({ color: 0xffeeaa, transparent: true, opacity: 0.32, depthWrite: false }));
     sunGlow.position.copy(sunPos); sunGlow.frustumCulled = false; scene.add(sunGlow);
     // flat ambient fill -> overall brighter room + lifts dark undersides the hemisphere misses
     scene.add(new THREE.AmbientLight(0xfff6ec, 0.5));
@@ -2793,7 +2812,7 @@ window.DC = {
     display: displayDatacenter,
     clear: clearScene,
     cull: updateLabels,
-    tick: function () { maybeFlicker(); updateDisco(); maybeCycleIdleView(); updateFlyTo(); updateHighlight(); updateLabels(); updateBlinds(); updateNeighborDoors(); updateRoomDoors(); updateLOD(); updateGuiPos(); renderer.render(scene, camera); if (stats) stats.update(); return renderer.info.render.calls; },
+    tick: function () { if (document.hidden) return; maybeFlicker(); updateDisco(); maybeCycleIdleView(); updateFlyTo(); updateHighlight(); updateLabels(); updateBlinds(); updateNeighborDoors(); updateRoomDoors(); updateLOD(); updateGuiPos(); renderer.render(scene, camera); if (stats) stats.update(); return renderer.info.render.calls; },
     pick: function () { return raycastInstances(_centerNdc); },
     info: showInfo,
     search: searchServers,
