@@ -39,6 +39,24 @@ const _IDLE_FRAME_THRESHOLD = 18000;
 let _tickSkippedFrames = 0;
 let _skipExpensiveUpdates = false;
 
+// --- FPS monitoring for automatic quality scaling ---
+let _fpsHistory = [];           // rolling window of frame times (ms)
+let _lastFrameTime = 0;         // timestamp of last frame
+let _qualityDowngradeTime = 0;  // when we last downgraded (debounce guard)
+const FPS_WINDOW = 60;          // frames to average over
+const FPS_TARGET = 55;          // FPS below this triggers a downgrade
+const FPS_RECOVERY = 65;        // FPS needed to suggest an upgrade
+const DOWNGRADE_COOLDOWN = 10000; // ms between downgrades (debounce)
+
+// Quality settings — progressively reduced when FPS drops. Exposed via DC.quality.
+const S = {
+    pixelScale: 1.0,    // renderer pixel ratio multiplier (1.0 = full, 0.75 = 75%, etc.)
+    shadowMapEnabled: true,
+    shadowMapSize: 2048, // shadow map resolution (reduced on quality downgrade)
+    lodBias: 0,         // LOD bias offset added to S.lodBias; >0 makes LOD more aggressive (culls sooner)
+};
+let _shadowMapSize = 2048; // internal shadow map size state (applied when shadows are active)
+
 function _gridKey(x, z) {
     return Math.floor(x / _gridCellSize) + ',' + Math.floor(z / _gridCellSize);
 }
@@ -271,6 +289,88 @@ const serverTypes = [
 	//["Cisco Catalyst 6506e", 11],
 	["Cisco Catalyst 4510r", 13],
 ];
+
+// --- FPS tracking for automatic quality scaling ---
+function _updateFPS(now) {
+    if (_lastFrameTime > 0) {
+        const delta = now - _lastFrameTime;
+        _fpsHistory.push(delta);
+        if (_fpsHistory.length > FPS_WINDOW) {
+            _fpsHistory.shift();
+        }
+    }
+    _lastFrameTime = now;
+}
+
+function _autoQualityScale(now) {
+    if (_fpsHistory.length < FPS_WINDOW) return; // not enough data yet
+    if (now - _qualityDowngradeTime < DOWNGRADE_COOLDOWN) return; // debounce: don't spam downgrades
+
+    const avgFrameTime = _fpsHistory.reduce((a, b) => a + b, 0) / _fpsHistory.length;
+    const fps = 1000 / avgFrameTime;
+
+    if (fps < FPS_TARGET) {
+        _qualityDowngradeTime = now;
+        _reduceQuality();
+    }
+}
+
+function _reduceQuality() {
+    // Step 1: reduce pixel scale (renderer resolution)
+    if (S.pixelScale > 0.5) {
+        S.pixelScale = Math.max(0.5, S.pixelScale - 0.25);
+        if (renderer) {
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio * S.pixelScale, 2));
+        }
+        _notifyQualityChange('pixelScale', S.pixelScale);
+        return;
+    }
+
+    // Step 2: halve the shadow map size
+    if (_shadowMapSize >= 1024) {
+        _shadowMapSize = Math.max(512, _shadowMapSize / 2);
+        S.shadowMapSize = _shadowMapSize;
+        // Re-configure the active shadow lights with the new map size
+        _applyShadowMapSize();
+        _notifyQualityChange('shadowMap', _shadowMapSize);
+        return;
+    }
+
+    // Step 3: make LOD more aggressive (higher bias = objects switch to low-LOD sooner)
+    S.lodBias = Math.min(S.lodBias + 0.5, 2);
+    _notifyQualityChange('lodBias', S.lodBias);
+}
+
+function _applyShadowMapSize() {
+    // Walk the scene and update any shadow-casting lights' shadow map size.
+    // Called when _shadowMapSize changes due to auto-quality scaling.
+    if (!scene) return;
+    scene.traverse((obj) => {
+        if (obj.isDirectionalLight || obj.isSpotLight) {
+            if (obj.shadow && obj.shadow.map) {
+                obj.shadow.mapSize.set(_shadowMapSize, _shadowMapSize);
+                obj.shadow.map.dispose();
+                obj.shadow.map = null;
+                if (obj.shadow.camera) obj.shadow.camera.updateProjectionMatrix();
+            }
+        }
+    });
+}
+
+function _notifyQualityChange(setting, value) {
+    const notification = document.createElement('div');
+    notification.style.cssText =
+        'position:fixed;bottom:20px;right:20px;background:#ff9800;color:#000;' +
+        'padding:8px 16px;border-radius:4px;font-family:sans-serif;font-size:12px;' +
+        'z-index:99999;opacity:0;transition:opacity 0.3s;';
+    notification.textContent = `\u26a0\ufe0f Auto-reduced quality: ${setting} \u2192 ${typeof value === 'number' ? value.toFixed(2) : value}`;
+    document.body.appendChild(notification);
+    requestAnimationFrame(() => { notification.style.opacity = '1'; });
+    setTimeout(() => {
+        notification.style.opacity = '0';
+        setTimeout(() => notification.remove(), 300);
+    }, 4000);
+}
 
 function displayDatacenter() {
     clearScene();
@@ -2723,18 +2823,24 @@ function init() {
 
 // Animation loop
 function animate() {
+    const now = performance.now();
+
     if (options.useFirstPerson == true) {
         controls.update( clock.getDelta() );
     } else {
-        const time = performance.now();
         // Update controls if locked
         if (controls.isLocked === true) {
-            updateControls(time);
+            updateControls(now);
         }
     }
     // Idle: auto-cycle the preset views while the "click to enable" prompt is up
     maybeCycleIdleView();
     maybeFlicker();
+
+    // FPS monitoring for automatic quality scaling
+    _updateFPS(now);
+    _autoQualityScale(now);
+
     // Phase 7: glide toward a search fly-to target, then highlight what we're looking at (throttled)
     updateFlyTo();
     if ((_hlFrame++ % 4) === 0) updateHighlight();
@@ -2858,6 +2964,11 @@ window.DC = {
     cull: updateLabels,
     tick: function () {
         if (document.hidden) return;
+        const now = performance.now();
+        // FPS monitoring for automatic quality scaling — runs every tick so the rolling average stays accurate
+        _updateFPS(now);
+        _autoQualityScale(now);
+
         // Idle skip: after _IDLE_FRAME_THRESHOLD idle frames, gate expensive per-frame updates; reset on player movement (via setLodFocus)
         if (_skipExpensiveUpdates) {
             renderer.render(scene, camera);
@@ -2891,6 +3002,8 @@ window.DC = {
     unitsPerInch: UNITS_PER_INCH,
     get roomBounds() { return roomBounds; },
     get roomSpawn() { return roomSpawn; },
+    // --- automatic quality scaling state (read-only snapshot; mutating S directly applies immediately) ---
+    get quality() { return { ...S, _fps: _fpsHistory.length >= FPS_WINDOW ? Math.round(1000 / (_fpsHistory.reduce((a, b) => a + b, 0) / _fpsHistory.length)) : null }; },
     // --- multi-building LOD + walk-between handles (used by dc-multi.js; inert for dc.html) ---
     collideWorld: collideWorld,                 // walls + current racks + neighbours' active interiors
     get buildings() { return dcBuildings; },    // wall/door rects for every building (current + neighbours)
