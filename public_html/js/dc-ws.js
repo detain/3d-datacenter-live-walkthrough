@@ -69,6 +69,10 @@
 		this._keepaliveTimer = null;
 	}
 
+	// Allow override via ?ws_keepalive=60 (seconds) in page URL
+	const _urlParams = new URLSearchParams(window.location.search);
+	const WS_KEEPALIVE_MS = (parseInt(_urlParams.get('ws_keepalive'), 10) * 1000) || 30000;
+
 	Client.prototype = {
 
 		_connect: function () {
@@ -85,13 +89,13 @@
 				self.reconnectDelay = 3000;
 				self._dispatchEvent(document, 'dc:connected');
 				self._hello();
-				// Keepalive: client sends ping to server every 30s
+				// Keepalive: client sends ping to server
 				if (self._keepaliveTimer) clearInterval(self._keepaliveTimer);
 				self._keepaliveTimer = setInterval(function () {
 					if (self.ws && self.ws.readyState === WebSocket.OPEN) {
 						self.send({v:1, op: 'ping', id: 'keepalive', ts: Date.now(), data: {}});
 					}
-				}, 30000);
+				}, WS_KEEPALIVE_MS);
 			};
 			this.ws.onmessage = function (e) { self._onFrame(e.data); };
 			this.ws.onclose = function () {

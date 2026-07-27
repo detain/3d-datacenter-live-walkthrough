@@ -35,7 +35,7 @@
 
 	/* -------------------------- constants -------------------------- */
 
-	var THROTTLE_MS = 300;   // minimum interval between dc.presence.move sends
+	var THROTTLE_MS = 150;   // minimum interval between dc.presence.move sends
 	var LERP_SPEED  = 12;    // avatar position lerp factor per second (scene units)
 
 	/* -------------------------- shared geometry/materials (Fix 4) -------------------------- */
@@ -58,6 +58,8 @@
 
 	/** @type {Map<string, THREE.CanvasTexture>} Cache texture per username (Fix 1) */
 	var _nameSpriteCache = new Map();
+	var _nameSpriteCacheOrder = [];
+	var MAX_NAME_SPRITE_CACHE = 64;
 	/* eslint-enable no-undef */
 
 	/* -------------------------- state ---------------------------- */
@@ -184,6 +186,10 @@
 		// Return cached texture for this username (Fix 1)
 		if (_nameSpriteCache.has(name)) {
 			var cachedTex = _nameSpriteCache.get(name);
+			// Move to end of order (most recently used)
+			var idx = _nameSpriteCacheOrder.indexOf(name);
+			if (idx !== -1) { _nameSpriteCacheOrder.splice(idx, 1); }
+			_nameSpriteCacheOrder.push(name);
 			var cachedMat = new THREE.SpriteMaterial({ map: cachedTex, transparent: true, depthTest: false });
 			var cachedSprite = new THREE.Sprite(cachedMat);
 			cachedSprite.scale.set(1.6, 0.30, 1);
@@ -218,6 +224,13 @@
 		ctx.fillText(name, 128, 24);
 
 		var texture = new THREE.CanvasTexture(canvas);
+		// LRU eviction: if at max capacity, dispose and remove oldest
+		if (_nameSpriteCacheOrder.length >= MAX_NAME_SPRITE_CACHE) {
+			var oldest = _nameSpriteCacheOrder.shift();
+			var oldTex = _nameSpriteCache.get(oldest);
+			if (oldTex) { oldTex.dispose(); _nameSpriteCache.delete(oldest); }
+		}
+		_nameSpriteCacheOrder.push(name);
 		_nameSpriteCache.set(name, texture);
 		var mat     = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
 		var sprite  = new THREE.Sprite(mat);
@@ -298,6 +311,8 @@
 			var tex = _nameSpriteCache.get(entry.name);
 			tex.dispose();
 			_nameSpriteCache.delete(entry.name);
+			var idx = _nameSpriteCacheOrder.indexOf(entry.name);
+			if (idx !== -1) _nameSpriteCacheOrder.splice(idx, 1);
 		}
 
 		if (entry.group && sceneReady()) {
@@ -377,10 +392,11 @@
 			_sceneReady = true;
 
 			// Register tickAvatars into DC's tick callback array — no chaining (Fix 1)
+			// Gate at registration level: skip entirely when tab is hidden (avoids call overhead)
 			if (window.DC._presenceTicks) {
-				window.DC._presenceTicks.push(tickAvatars);
+				window.DC._presenceTicks.push(function (dt) { if (document.hidden) return; tickAvatars(dt); });
 			} else {
-				window.DC._presenceTicks = [tickAvatars];
+				window.DC._presenceTicks = [function (dt) { if (document.hidden) return; tickAvatars(dt); }];
 				// First presence module to register: wrap DC.tick to iterate the array
 				var origTick = window.DC.tick.bind(window.DC);
 				window.DC.tick = function (dt) {
@@ -475,6 +491,7 @@
 		// Clear name sprite cache (Fix 4)
 		_nameSpriteCache.forEach(function (tex) { tex.dispose(); });
 		_nameSpriteCache.clear();
+		_nameSpriteCacheOrder = [];
 
 		state.remote.clear();
 		state.uid  = null;

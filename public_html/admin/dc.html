@@ -76,13 +76,16 @@
 		#dcPresenceLabel { color: #aabbd0; }
 		#dcPresenceCount { font-weight: bold; color: #fff; margin-left: 2px; }
 	</style>
-	<!-- Preload Three.js module to reduce HTTP RTTs on first load -->
+	<!-- DC: Three.js scene via importmap, see dc.php -->
 	<link rel="modulepreload" href="/lib/three/build/three.module.js">
-	<link rel="dns-prefetch" href="https://mystage.interserver.net">
 	<link rel="modulepreload" href="/lib/three/examples/jsm/controls/PointerLockControls.js">
 	<link rel="modulepreload" href="/lib/three/examples/jsm/loaders/GLTFLoader.js">
 	<link rel="modulepreload" href="/lib/three/examples/jsm/loaders/DRACOLoader.js">
 	<link rel="modulepreload" href="/lib/three/examples/jsm/utils/BufferGeometryUtils.js">
+	<link rel="modulepreload" href="/lib/three/examples/jsm/controls/FirstPersonControls.js">
+	<link rel="modulepreload" href="/lib/three/examples/jsm/environments/RoomEnvironment.js">
+	<link rel="modulepreload" href="/lib/three/examples/jsm/libs/meshopt_decoder.module.js">
+	<link rel="modulepreload" href="/lib/three/examples/jsm/libs/stats.module.js">
 </head>
 <body>
 	<div id="dcLoading">Loading datacenter…</div>

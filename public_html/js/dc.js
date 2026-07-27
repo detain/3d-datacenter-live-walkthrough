@@ -34,6 +34,11 @@ let lodBuildings = [];  // per-neighbour state {id, foot, dx,dz, wall rect, door
 const _spatialGrid = {};
 const _gridCellSize = 50;  // units per grid cell
 
+// Idle-frame skip tracking: after 18000 idle frames (5 min at 60fps), skip expensive per-frame updates
+const _IDLE_FRAME_THRESHOLD = 18000;
+let _tickSkippedFrames = 0;
+let _skipExpensiveUpdates = false;
+
 function _gridKey(x, z) {
     return Math.floor(x / _gridCellSize) + ',' + Math.floor(z / _gridCellSize);
 }
@@ -81,6 +86,31 @@ const _floorTextureCache = new Map();
 // Cache: seed → ceiling CanvasTexture (Fix #4)
 const _ceilingTextureCache = new Map();
 
+// LRU eviction for texture caches (Fix #19)
+const MAX_TEXTURE_CACHE = 128;
+const _cacheOrder = {
+    label: [], poster: [], sign: [], floor: [], ceiling: []
+};
+
+function cacheWithEvict(cacheMap, key, value, orderArray) {
+    if (cacheMap.has(key)) {
+        // move to end (most recently used)
+        const idx = orderArray.indexOf(key);
+        if (idx !== -1) orderArray.splice(idx, 1);
+        orderArray.push(key);
+        cacheMap.set(key, value);
+        return;
+    }
+    if (cacheMap.size >= MAX_TEXTURE_CACHE) {
+        const oldest = orderArray.shift();
+        const oldVal = cacheMap.get(oldest);
+        if (oldVal && oldVal.dispose) oldVal.dispose();
+        cacheMap.delete(oldest);
+    }
+    orderArray.push(key);
+    cacheMap.set(key, value);
+}
+
 function _rackGridKey(x, z) {
     return Math.floor(x / RACK_GRID_CELL) * 10000 + Math.floor(z / RACK_GRID_CELL);
 }
@@ -124,6 +154,7 @@ let lodFocus = null;    // {x,z} the player's ground position (set by dc-multi);
 const LOD_ENTER_PAD = 28; // a neighbour swaps to FULL models when the focus point is within this many units of its walls
 const LOD_EXIT_PAD = 80;  // ...and back to BLOCKS once beyond this (hysteresis stops thrashing at the threshold)
 const LOD_MAX_FULL = 1;   // neighbours at full detail at once (the current building is always full -> budget is 2 buildings)
+let _lodDistanceMult = 1.0; // GUI-adjustable multiplier for LOD distance thresholds (updateLOD applies this at runtime)
 const options = {
     useFirstPerson: false,
     showLabels: true,
@@ -146,7 +177,7 @@ const options = {
 	scaleX: 8,  // Scale factor for x position
 	scaleZ: 9,  // Scale factor for z position
 };
-const timer = new THREE.Timer();
+const clock = new THREE.Clock();
 const velocity = new THREE.Vector3();
 const direction = new THREE.Vector3();
 const vertex = new THREE.Vector3();
@@ -302,6 +333,10 @@ function displayGui() {
     moveFolder.add( options, 'collisionMovement');
     const gc = moveFolder.add( options, 'gravityMs2', 1.6, 14, 0.1 ).onChange(() => valLabel(gc, 'Gravity', options.gravityMs2 + ' m/s²'));
     valLabel(gc, 'Gravity', options.gravityMs2 + ' m/s²');
+    const lodFolder = gui.addFolder('LOD');
+    lodFolder.add({ distanceMult: 1.0 }, 'distanceMult', 0.5, 2.0).name('LOD Distance').step(0.1).onChange(v => {
+        _lodDistanceMult = v;
+    });
     // height + waist: the formatted value lives in the controller label (colourised) and refreshes on change.
     const hLbl = (i) => `${Math.floor(i / 12)}' ${i % 12}"`;
     const hc = moveFolder.add( options, 'heightInches', 42, 96, 1 ).onChange(() => { camera.position.y = eyeHeight(); valLabel(hc, 'height', hLbl(options.heightInches)); });
@@ -396,6 +431,9 @@ function loadDatacenter() {
 }
 
 function clearScene() {
+    // Reset idle skip state (Bug #2: clearScene must not leave stale skip mode from a previous scene)
+    _tickSkippedFrames = 0;
+    _skipExpensiveUpdates = false;
     rackColliders = []; // rebuilt as racks are re-placed
     // Reset spatial grids (Fix #3)
     for (const k in _rackGrid) delete _rackGrid[k];
@@ -416,6 +454,7 @@ function clearScene() {
     _floorTextureCache.clear();
     _ceilingTextureCache.forEach(tex => tex.dispose());
     _ceilingTextureCache.clear();
+    Object.keys(_cacheOrder).forEach(k => _cacheOrder[k] = []);
     roomBounds = null; roomSpawn = null;
     // Multi-building LOD: dispose any neighbour FULL models (their group is added straight to the scene,
     // separate from objects.community). Geometry/material are shared cached templates -> only free each
@@ -852,7 +891,7 @@ function makeLabelTexture(text) {
     const texture = new THREE.CanvasTexture(canvas);
     texture.colorSpace = THREE.SRGBColorSpace;
     texture.anisotropy = maxAnisotropy || 1; // sharpen at oblique viewing angles
-    _labelTextureCache.set(text, texture);
+    cacheWithEvict(_labelTextureCache, text, texture, _cacheOrder.label);
     return texture;
 }
 
@@ -1147,8 +1186,8 @@ function makeFloorTexture(seed) {
 	t.wrapS = t.wrapT = THREE.RepeatWrapping;
 	t.colorSpace = THREE.SRGBColorSpace;
 	t.anisotropy = maxAnisotropy || 1;
-	_floorTextureCache.set(seed, t);
-	return t;
+    cacheWithEvict(_floorTextureCache, seed, t, _cacheOrder.floor);
+    return t;
 }
 
 function loadFloor() {
@@ -1184,8 +1223,8 @@ function makeCeilingTexture(seed) {
 	g.fillRect(0, 0, px, gap); g.fillRect(0, 0, gap, px); g.fillRect(0, px - gap, px, gap); g.fillRect(px - gap, 0, gap, px);
 	for (let i = 0; i < 120; i++) { g.fillStyle = rng() < 0.5 ? '#f3f3f1' : '#f6f6f4'; g.fillRect(rng() * px, rng() * px, 1, 1); } // very faint fibreboard speckle
 	const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAnisotropy || 1;
-	_ceilingTextureCache.set(seed, t);
-	return t;
+    cacheWithEvict(_ceilingTextureCache, seed, t, _cacheOrder.ceiling);
+    return t;
 }
 
 // "Lost cat" flyer for the bulletin board.
@@ -1289,8 +1328,8 @@ function makePosterTexture(spec) {
 	const words = spec.blurb.split(' '); let line = '', y = iy + ih + 112;
 	for (const wd of words) { const t = line ? line + ' ' + wd : wd; if (g.measureText(t).width > W - 64 && line) { g.fillText(line, W / 2, y); line = wd; y += 28; } else line = t; }
 	if (line) g.fillText(line, W / 2, y);
-	const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = maxAnisotropy || 1;
-	_posterTextureCache.set(cacheKey, tex);
+    const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = maxAnisotropy || 1;
+	cacheWithEvict(_posterTextureCache, cacheKey, tex, _cacheOrder.poster);
 	return tex;
 }
 // Hang the 4 posters on the inside walls of a building (near corners, where the wall is solid). parent =
@@ -1341,7 +1380,7 @@ function makeSignTexture(text) {
 	while (g.measureText(text).width > w - 20 && fs > 10) { fs -= 2; g.font = 'bold ' + fs + 'px Arial'; }
 	g.fillText(text, w / 2, h / 2 + 2);
 	const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAnisotropy || 1;
-	_signTextureCache.set(text, t);
+	cacheWithEvict(_signTextureCache, text, t, _cacheOrder.sign);
 	return t;
 }
 const WIN_SZ = 96 * UNITS_PER_INCH;     // 8 ft windows
@@ -2037,9 +2076,11 @@ function updateLOD() {
 	const fx = lodFocus ? lodFocus.x : camera.position.x, fz = lodFocus ? lodFocus.z : camera.position.z;
 	let fullCount = 0;
 	for (const b of lodBuildings) { b._dist = distToRect(fx, fz, b); if (b.full) fullCount++; }
-	for (const b of lodBuildings) { if (b.full && b._dist > LOD_EXIT_PAD) { exitFull(b); fullCount--; } }
+	const exitThresh = LOD_EXIT_PAD * _lodDistanceMult;
+	const enterThresh = LOD_ENTER_PAD * _lodDistanceMult;
+	for (const b of lodBuildings) { if (b.full && b._dist > exitThresh) { exitFull(b); fullCount--; } }
 	if (fullCount < LOD_MAX_FULL) {
-		const near = lodBuildings.filter((b) => !b.full && !b.loading && b._dist < LOD_ENTER_PAD).sort((a, c) => a._dist - c._dist);
+		const near = lodBuildings.filter((b) => !b.full && !b.loading && b._dist < enterThresh).sort((a, c) => a._dist - c._dist);
 		for (const b of near) { if (fullCount >= LOD_MAX_FULL) break; enterFull(b); fullCount++; }
 	}
 }
@@ -2680,9 +2721,8 @@ function init() {
 
 // Animation loop
 function animate() {
-    timer.update();
     if (options.useFirstPerson == true) {
-        controls.update( timer.getDelta() );
+        controls.update( clock.getDelta() );
     } else {
         const time = performance.now();
         // Update controls if locked
@@ -2812,7 +2852,31 @@ window.DC = {
     display: displayDatacenter,
     clear: clearScene,
     cull: updateLabels,
-    tick: function () { if (document.hidden) return; maybeFlicker(); updateDisco(); maybeCycleIdleView(); updateFlyTo(); updateHighlight(); updateLabels(); updateBlinds(); updateNeighborDoors(); updateRoomDoors(); updateLOD(); updateGuiPos(); renderer.render(scene, camera); if (stats) stats.update(); return renderer.info.render.calls; },
+    tick: function () {
+        if (document.hidden) return;
+        // Idle skip: after _IDLE_FRAME_THRESHOLD idle frames, gate expensive per-frame updates; reset on player movement (via setLodFocus)
+        if (_skipExpensiveUpdates) {
+            updateGuiPos();
+            renderer.render(scene, camera);
+            if (stats) stats.update();
+            return renderer.info.render.calls;
+        }
+        maybeFlicker();
+        updateDisco();
+        maybeCycleIdleView();
+        updateFlyTo();
+        updateHighlight();
+        updateLabels();
+        updateBlinds();
+        updateNeighborDoors();
+        updateRoomDoors();
+        updateLOD();
+        updateGuiPos();
+        renderer.render(scene, camera);
+        if (stats) stats.update();
+        if (++_tickSkippedFrames > _IDLE_FRAME_THRESHOLD) _skipExpensiveUpdates = true;
+        return renderer.info.render.calls;
+    },
     pick: function () { return raycastInstances(_centerNdc); },
     info: showInfo,
     search: searchServers,
@@ -2828,7 +2892,7 @@ window.DC = {
     // --- multi-building LOD + walk-between handles (used by dc-multi.js; inert for dc.html) ---
     collideWorld: collideWorld,                 // walls + current racks + neighbours' active interiors
     get buildings() { return dcBuildings; },    // wall/door rects for every building (current + neighbours)
-    setLodFocus: function (x, z) { lodFocus = { x, z }; },   // dc-multi feeds the player ground pos each frame
+    setLodFocus: function (x, z) { lodFocus = { x, z }; _tickSkippedFrames = 0; _skipExpensiveUpdates = false; },   // dc-multi feeds the player ground pos each frame
     lodState: function () { return lodBuildings.map((b) => ({ id: b.id, full: !!b.full, loading: b.loading, dist: Math.round(b._dist) })); },
 };
 

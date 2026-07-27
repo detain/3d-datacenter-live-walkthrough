@@ -26,7 +26,14 @@ let _lastCollisionCamDir = null;  // "x,y,z" rounded to 1 decimal (camera world 
 let _cachedLogoTexture = null;
 let _cachedGlassMaterial = null;
 
-let pixelScale = 0.8;  // quality scale factor for renderer pixel ratio
+let pixelScale = 0.8;  // quality scale factor for renderer pixel ratio (module-level storage for S.pixelScale)
+
+// Pixel scale setter — clamps to slider range and syncs renderer pixel ratio
+function setPixelScale(v) {
+    pixelScale = Math.min(Math.max(v, 0.3), 1.0); // clamp to slider range [0.3, 1.0]
+    if (S && S.renderer) S.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2) * pixelScale);
+    if (S) S.pixelScale = pixelScale;
+}
 
 const S = {
   DC: null, scene: null, camera: null, renderer: null, controls: null, options: null,
@@ -47,10 +54,16 @@ const S = {
   spawned: false,
   camDist: 11,                    // third-person follow distance (scene units)
   pixelScale,                     // exposed for GUI control
+  fov: 75,                        // camera field of view (degrees), adjustable via GUI
+  walkSpeed: WALK,                // walk speed (scene units/sec), synced with module-level WALK
+  runSpeed: RUN,                  // run speed (scene units/sec), synced with module-level RUN
+  powerPreference: 'high-performance', // GPU power preference (display-only; set at renderer creation)
 };
 
 // movement tuning (scene units/sec). dc.js's own walk terminal speed is ~40 u/s; match-ish.
-const WALK = 14, RUN = 34, RUN_THRESH = 22, GRAVITY = 980, JUMP_V = 130, EYE_FRAC = 0.94;
+// WALK/RUN are exposed via GUI sliders and update the module-level vars.
+let WALK = 14, RUN = 34;
+const RUN_THRESH = 22, GRAVITY = 980, JUMP_V = 130, EYE_FRAC = 0.94;
 const G_PER_MS2 = 100;   // scene gravity units per 1 m/s²  (so 9.8 m/s² -> 980 = the Earth default)
 // Mouse-wheel camera dolly. Scroll out: the camera pulls back AND up together up to CAM_MAX; scroll
 // in: it comes closer until it crosses CAM_MIN ("inside the body"), then snaps to first-person.
@@ -89,7 +102,7 @@ whenReady(async () => {
   S.loader.setDRACOLoader(_draco);
   // render at a slightly lower internal resolution for FPS headroom (the datacenter is fill-heavy)
   // pixelScale factor is adjustable via GUI (0.3–1.0): balances visual quality vs FPS on GPU-limited frames
-  S.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2) * S.pixelScale);
+  setPixelScale(S.pixelScale);
   S.renderer.setSize(window.innerWidth, window.innerHeight);
 
   try {
@@ -140,7 +153,14 @@ async function loadCharacter(ch) {
       }
     });
   }
-  S.actions = {}; S.current = null; S.mixer = null; S.model = null;
+  S.actions = {}; S.current = null;
+  if (S.mixer) {
+    S.mixer.stopAllAction();
+    if (S.model) S.mixer.uncacheRoot(S.model);
+    S.mixer = null;
+  }
+  S.model = null;
+  S.headBone = null;
 
   log("loading character", ch.name, ch.model);
   const cb = (S.manifest && S.manifest.generated_at) ? ('?m=' + encodeURIComponent(S.manifest.generated_at)) : '';
@@ -633,10 +653,14 @@ function populateCharacterPicker() {
       if (ch) { S.spawned = false; loadCharacter(ch); }
     });
     f.add({ toggle: () => toggleMode() }, "toggle").name("Toggle Perspective (1st/3rd)");
-    f.add(S, 'pixelScale', 0.3, 1.0).name('Quality').step(0.1).onChange(v => {
-      S.pixelScale = v;
-      S.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2) * v);
+    f.add(S, 'pixelScale', 0.3, 1.0).name('Quality').step(0.1).onChange(v => { setPixelScale(v); });
+    f.add(S, 'fov', 30, 120).name('FOV').step(1).onChange(v => {
+        if (S.camera) { S.camera.fov = v; S.camera.updateProjectionMatrix(); }
     });
+    // powerPreference is set at renderer creation and can't be changed afterwards — display-only
+    f.add({ 'GPU Mode': S.powerPreference }, 'GPU Mode').name('GPU Mode').enable(false);
+    f.add(S, 'walkSpeed', 1, 30).name('Walk Speed').step(0.5).onChange(v => { WALK = v; });
+    f.add(S, 'runSpeed', 5, 60).name('Run Speed').step(0.5).onChange(v => { RUN = v; });
     f.open();
     S.playerGui = f;
     const pl = document.getElementById("dcPlayer"); if (pl) pl.style.display = "none";
