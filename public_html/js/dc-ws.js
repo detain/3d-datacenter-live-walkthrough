@@ -85,6 +85,7 @@
 		// IDEA-1: presence batching
 		this._presenceBatch = null;
 		this._batchRaf = null;
+		this._lastFlush = null;  // Fix #9: setTimeout fallback for backgrounded tabs
 		// IDEA-7: latency tracking
 		this._latencyHistory = [];
 		// IDEA-3: viewport update throttle
@@ -174,6 +175,18 @@
 			if (op.startsWith('dc.presence.')) {
 				if (!this._presenceBatch) this._presenceBatch = [];
 				this._presenceBatch.push({ op: op, data: data || {} });
+				// Fix #9: batch size cap - flush immediately if too many pending
+				if (this._presenceBatch.length > 100) {
+					this._flushPresence();
+					return;
+				}
+				// Fix #9: setTimeout fallback when tab is backgrounded (RAF doesn't fire)
+				const now = Date.now();
+				if (this._lastFlush && now - this._lastFlush > 500) {
+					this._flushPresence();
+					return;
+				}
+				this._lastFlush = now;
 				if (!this._batchRaf) {
 					const self = this;
 					this._batchRaf = requestAnimationFrame(function () {
@@ -206,6 +219,7 @@
 				this._presenceBatch = [];
 			}
 			this._batchRaf = null;
+			this._lastFlush = Date.now();  // Fix #9: track last flush for setTimeout fallback
 		},
 
 		/** Handle an incoming JSON frame. */

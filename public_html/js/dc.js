@@ -97,6 +97,8 @@ const RACK_GRID_CELL = 10;  // 10-unit cells for racks (smaller than building-sc
 
 // Cache: locationId → { geometry, tubeCount } for cable geometry (Fix #10)
 const _cableGeometryCache = new Map();
+const _cableCacheOrder = [];
+const MAX_CABLE_CACHE = 3;
 
 // Cache: poster spec string → CanvasTexture (Fix #11)
 const _posterTextureCache = new Map();
@@ -300,10 +302,10 @@ const serverTypes = [
 function _updateFPS(now) {
     if (_lastFrameTime > 0) {
         const delta = now - _lastFrameTime;
-        _fpsHistory.push(delta);
-        if (_fpsHistory.length > FPS_WINDOW) {
+        if (_fpsHistory.length >= FPS_WINDOW) {
             _fpsHistory.shift();
         }
+        _fpsHistory.push(delta);
     }
     _lastFrameTime = now;
 }
@@ -592,6 +594,8 @@ function clearScene() {
     _floorTextureCache.clear();
     _ceilingTextureCache.forEach(tex => tex.dispose());
     _ceilingTextureCache.clear();
+    _labelTextureCache.forEach(tex => tex.dispose());
+    _labelTextureCache.clear();
     Object.keys(_cacheOrder).forEach(k => _cacheOrder[k] = []);
     roomBounds = null; roomSpawn = null;
     // Multi-building LOD: dispose any neighbour FULL models (their group is added straight to the scene,
@@ -1321,6 +1325,17 @@ function displaySwitches(locId, dx, dz, sink) {
         (requestIdleCallback || setTimeout)(() => {
             const geometry = BufferGeometryUtils.mergeGeometries(_tubes, false);
             _tubes.forEach((g) => g.dispose());
+            // Fix #8: LRU eviction for cable geometry cache
+            if (_cableGeometryCache.has(_locId)) {
+                const idx = _cableCacheOrder.indexOf(_locId);
+                if (idx !== -1) _cableCacheOrder.splice(idx, 1);
+            } else if (_cableGeometryCache.size >= MAX_CABLE_CACHE) {
+                const oldest = _cableCacheOrder.shift();
+                const oldVal = _cableGeometryCache.get(oldest);
+                if (oldVal) oldVal.geometry.dispose();
+                _cableGeometryCache.delete(oldest);
+            }
+            _cableCacheOrder.push(_locId);
             _cableGeometryCache.set(_locId, { geometry: geometry.clone(), tubeCount: _tubes.length });
             if (objects.network) {
                 scene.remove(objects.network);
@@ -1331,8 +1346,8 @@ function displaySwitches(locId, dx, dz, sink) {
             const cables = new THREE.Mesh(geometry, material);
             cables.visible = options.showNetwork;
             cables.frustumCulled = false;
-            scene.add(cables);
-            objects.network = cables;
+            (sink ? sink.group : scene).add(cables);
+            if (sink) sink.network = cables; else objects.network = cables;
         }, { timeout: 2000 });
         return;
     }
@@ -1341,7 +1356,18 @@ function displaySwitches(locId, dx, dz, sink) {
     const geometry = BufferGeometryUtils.mergeGeometries(tubes, false);
     tubes.forEach((g) => g.dispose());
     // Fix #10: Cache the merged cable geometry for the main building (not neighbours)
+    // Fix #8: LRU eviction for cable geometry cache
     if (!sink) {
+        if (_cableGeometryCache.has(locId)) {
+            const idx = _cableCacheOrder.indexOf(locId);
+            if (idx !== -1) _cableCacheOrder.splice(idx, 1);
+        } else if (_cableGeometryCache.size >= MAX_CABLE_CACHE) {
+            const oldest = _cableCacheOrder.shift();
+            const oldVal = _cableGeometryCache.get(oldest);
+            if (oldVal) oldVal.geometry.dispose();
+            _cableGeometryCache.delete(oldest);
+        }
+        _cableCacheOrder.push(locId);
         _cableGeometryCache.set(locId, { geometry: geometry.clone(), tubeCount: tubes.length });
     }
     // matte plastic base + a clearcoat layer for a slight gloss / rounded depth on the cables
@@ -2913,7 +2939,6 @@ function init() {
     scene.add(new THREE.AmbientLight(0xfff6ec, 0.5));
     // Set up the renderer
     renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(window.innerWidth, window.innerHeight);
     document.body.appendChild(renderer.domElement);
     maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
@@ -3054,6 +3079,12 @@ function animate() {
 
     const now = performance.now();
 
+    // Track idle frames and enable skip mode after threshold (Fix #6)
+    _tickSkippedFrames++;
+    if (_tickSkippedFrames >= _IDLE_FRAME_THRESHOLD) {
+        _skipExpensiveUpdates = true;
+    }
+
     if (options.useFirstPerson == true) {
         controls.update( clock.getDelta() );
     } else {
@@ -3072,10 +3103,10 @@ function animate() {
 
     // Phase 7: glide toward a search fly-to target, then highlight what we're looking at (throttled)
     updateFlyTo();
-    if ((_hlFrame++ % 4) === 0) updateHighlight();
-    // Distance-cull + lazily build labels, then render the scene
-    updateLabels();
-    updateBlinds();
+    if (!_skipExpensiveUpdates && (_hlFrame++ % 4) === 0) updateHighlight();
+    // Distance-cull + lazily build labels, then render the scene (guarded by _skipExpensiveUpdates)
+    if (!_skipExpensiveUpdates) updateLabels();
+    if (!_skipExpensiveUpdates) updateBlinds();
     renderer.render(scene, camera);
     // Update stats monitor
     stats.update();

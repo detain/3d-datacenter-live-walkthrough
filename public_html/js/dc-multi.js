@@ -636,6 +636,7 @@ function setupInput() {
       case "KeyG": cycleGesture(1); break;                    // cycle forward through ALL gestures
       case "KeyH": cycleGesture(-1); break;                   // cycle backward
       case "Backquote": case "Digit0": endGesture(); break;   // return to normal / stop the gesture
+      case "KeyR": trySpawn(); break;                       // reset player to spawn
     }
   });
   document.addEventListener("keyup", (e) => {

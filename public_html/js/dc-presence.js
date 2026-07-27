@@ -221,8 +221,8 @@
 		ctx.fillText(name, 128, 24);
 
 		var texture = new THREE.CanvasTexture(canvas);
-		// LRU eviction: if over max capacity, dispose and remove oldest (CRIT-4: was >=, now >)
-		if (_nameSpriteCacheOrder.length > MAX_NAME_SPRITE_CACHE) {
+		// LRU eviction: if at or over max capacity, dispose and remove oldest
+		if (_nameSpriteCacheOrder.length >= MAX_NAME_SPRITE_CACHE) {
 			var oldest = _nameSpriteCacheOrder.shift();
 			var oldEntry = _nameSpriteCache.get(oldest);
 			if (oldEntry) {
