@@ -16,7 +16,7 @@
  * State (window.DC_PRESENCE)
  *   uid       — our own numeric uid
  *   name      — our own display name
- *   remote    — Map<uid, {x, z, yaw, name, group, avatar, targetX, targetZ}>
+ *   remote    — Map<uid, {x, z, yaw, name, ts, vx, vy, lastUpdateTime, targetX, targetZ, group, avatar}>
  *
  * UI element
  *   #dcPresence — floating HUD badge top-right showing connected-user count
@@ -268,6 +268,10 @@
 			x:      data.x || 0,
 			z:      data.z || 0,
 			yaw:    data.yaw || 0,
+			ts:     data.ts ?? null,
+			lastUpdateTime: performance.now(),
+			vx:     0,
+			vy:     0,
 			targetX: data.x || 0,
 			targetZ: data.z || 0,
 			group:  null,
@@ -346,24 +350,67 @@
 		state.remote.forEach(function (entry) {
 			if (!entry.group) return;
 
-			// Use real dt; fall back to 1/60 if not provided (Fix 3)
-			var speed = (typeof dt === 'number' && dt > 0) ? dt : (1 / 60);
-			var lerpFactor = LERP_SPEED * speed;
+			var now = performance.now();
 
-			// Lerp X
-			var dx = entry.targetX - entry.group.position.x;
-			if (Math.abs(dx) > 0.001) {
-				entry.group.position.x += dx * Math.min(1, lerpFactor);
+			// Backwards compatible: if no velocity data, use simple lerp
+			if (entry.vx === undefined || entry.vy === undefined || entry.lastUpdateTime === undefined) {
+				var speed = (typeof dt === 'number' && dt > 0) ? dt : (1 / 60);
+				var lerpFactor = LERP_SPEED * speed;
+
+				var dx = entry.targetX - entry.group.position.x;
+				if (Math.abs(dx) > 0.001) {
+					entry.group.position.x += dx * Math.min(1, lerpFactor);
+				}
+
+				var dz = entry.targetZ - entry.group.position.z;
+				if (Math.abs(dz) > 0.001) {
+					entry.group.position.z += dz * Math.min(1, lerpFactor);
+				}
+
+				entry.group.rotation.y = entry.yaw;
+				return;
 			}
 
-			// Lerp Z
-			var dz = entry.targetZ - entry.group.position.z;
-			if (Math.abs(dz) > 0.001) {
-				entry.group.position.z += dz * Math.min(1, lerpFactor);
+			// Extrapolation: predict where avatar would be based on velocity
+			// Only extrapolate if we haven't received an update in a while (50-500ms)
+			var timeSinceUpdate = (now - entry.lastUpdateTime) / 1000;  // seconds
+			var maxExtrapolationTime = 0.5;  // stop extrapolating after 500ms
+
+			// Target position: either the last known position (interpolated) or extrapolated
+			var targetX, targetZ;
+
+			if (timeSinceUpdate < maxExtrapolationTime) {
+				// Extrapolate: predict position based on velocity
+				// Clamp extrapolation time to avoid runaway prediction
+				var extrapTime = Math.min(timeSinceUpdate, 0.3);  // max 300ms of extrapolation
+				targetX = entry.x + entry.vx * extrapTime;
+				targetZ = entry.z + entry.vy * extrapTime;
+			} else {
+				// No recent update — use last known position, no movement
+				targetX = entry.x;
+				targetZ = entry.z;
 			}
 
-			// Apply yaw (instant, not lerped — keeps rotation snappy)
-			entry.group.rotation.y = entry.yaw;
+			// Interpolation factor based on time since last update
+			// Higher factor = faster catch-up to target
+			var lerpFactor = Math.min(1.0, (timeSinceUpdate * LERP_SPEED * 2.0));
+
+			var dx = targetX - entry.group.position.x;
+			var dz = targetZ - entry.group.position.z;
+
+			entry.group.position.x += dx * lerpFactor;
+			entry.group.position.z += dz * lerpFactor;
+
+			// Yaw interpolation (shorter lerp distance, same concept)
+			if (entry.yaw !== undefined) {
+				var targetYaw = entry.yaw;
+				var currentYaw = entry.group.rotation.y;
+				var yawDiff = targetYaw - currentYaw;
+				// Normalize yaw difference to [-PI, PI]
+				while (yawDiff > Math.PI) yawDiff -= Math.PI * 2;
+				while (yawDiff < -Math.PI) yawDiff += Math.PI * 2;
+				entry.group.rotation.y += yawDiff * Math.min(1.0, lerpFactor * 0.5);
+			}
 		});
 	}
 
@@ -517,19 +564,45 @@
 		} else if (op === 'dc.presence.updated') {
 			onUpdated(data);
 		} else if (op === 'dc.presence.batch_updated') {
-			// data is { uid1: {x,z,yaw,name,...}, uid2: {...}, ... }
+			// data is { uid1: {x,z,yaw,name,ts,...}, uid2: {...}, ... }
 			// emitted by Events.php when 2+ clients move within a 50ms window
 			if (data && typeof data === 'object') {
+				var now = performance.now();
 				for (var uid in data) {
 					if (!Object.prototype.hasOwnProperty.call(data, uid)) continue;
 					if (uid === String(state.uid)) continue;  // skip self
 					var entry = data[uid];
 					var remoteEntry = state.remote.get(uid);
 					if (remoteEntry) {
-						// Update lerp targets for smooth transition
+						// Preserve server timestamp if available
+						if (entry.ts !== undefined) remoteEntry.ts = entry.ts;
+
+						// Calculate velocity from position delta / time delta (backwards compatible)
+						var prevX = remoteEntry.x;
+						var prevZ = remoteEntry.z;
+						var prevT = remoteEntry.lastUpdateTime || now;
+						var dt = (now - prevT) / 1000;  // seconds since last update
+
+						if (dt > 0) {
+							var dvx = entry.x !== undefined ? (entry.x - prevX) / dt : 0;
+							var dvy = entry.z !== undefined ? (entry.z - prevZ) / dt : 0;
+							// Clamp velocity to prevent runaway extrapolation (max 50 units/sec)
+							var MAX_VELOCITY = 50;
+							remoteEntry.vx = Math.max(-MAX_VELOCITY, Math.min(MAX_VELOCITY, dvx));
+							remoteEntry.vy = Math.max(-MAX_VELOCITY, Math.min(MAX_VELOCITY, dvy));
+						}
+
+						// Update position
+						if (entry.x !== undefined) remoteEntry.x = entry.x;
+						if (entry.z !== undefined) remoteEntry.z = entry.z;
+						if (entry.yaw !== undefined) remoteEntry.yaw = entry.yaw;
+
+						// Set interpolation target
 						if (entry.x !== undefined) remoteEntry.targetX = entry.x;
 						if (entry.z !== undefined) remoteEntry.targetZ = entry.z;
-						if (entry.yaw !== undefined) remoteEntry.yaw = entry.yaw;
+
+						remoteEntry.lastUpdateTime = now;
+
 						// name might have changed
 						if (entry.name) remoteEntry.name = entry.name;
 					}
