@@ -38,6 +38,25 @@
 	var THROTTLE_MS = 250;   // minimum interval between dc.presence.move sends
 	var LERP_SPEED  = 12;    // avatar position lerp factor per second (scene units)
 
+	/* -------------------------- shared geometry/materials (Fix 4) -------------------------- */
+	/* eslint-disable no-undef */
+	var AVATAR_BODY_GEO = new THREE.CylinderGeometry(0.12, 0.12, 0.28, 8);
+	var AVATAR_HEAD_GEO = new THREE.SphereGeometry(0.10, 12, 8);
+	var BODY_MAT = new THREE.MeshLambertMaterial({ color: 0x2255cc });
+	var HEAD_MAT = new THREE.MeshLambertMaterial({ color: 0xf0f4ff });
+	/* eslint-enable no-undef */
+
+	/* -------------------------- scene-ready flag (Fix 5) -------------------------- */
+	var _sceneReady = false;
+
+	/* -------------------------- name-sprite canvas pool (Fix B) -------------------------- */
+	/* eslint-disable no-undef */
+	var _nameCanvas = document.createElement('canvas');
+	_nameCanvas.width = 256;
+	_nameCanvas.height = 48;
+	var _nameCtx = _nameCanvas.getContext('2d');
+	/* eslint-enable no-undef */
+
 	/* -------------------------- state ---------------------------- */
 
 	/** @type {{uid:number|null, name:string|null, remote:Map}} */
@@ -123,17 +142,13 @@
 		var scene   = window.DC.scene;
 		var isLocal = hasLocalUid() && String(uid) === String(state.uid);
 
-		// Cylinder body (blue)
-		var bodyGeo = new THREE.CylinderGeometry(0.12, 0.12, 0.28, 8);
-		var bodyMat = new THREE.MeshLambertMaterial({ color: 0x2255cc });
-		var body    = new THREE.Mesh(bodyGeo, bodyMat);
+		// Cylinder body (blue) — use shared geometry/material (Fix 4)
+		var body    = new THREE.Mesh(AVATAR_BODY_GEO, BODY_MAT);
 		body.position.y = 0.14;  // sit on ground (y=0)
 		body.castShadow = true;
 
-		// Sphere head (white)
-		var headGeo = new THREE.SphereGeometry(0.10, 12, 8);
-		var headMat = new THREE.MeshLambertMaterial({ color: 0xf0f4ff });
-		var head    = new THREE.Mesh(headGeo, headMat);
+		// Sphere head (white) — use shared geometry/material (Fix 4)
+		var head    = new THREE.Mesh(AVATAR_HEAD_GEO, HEAD_MAT);
 		head.position.y = 0.38;  // top of cylinder + small gap
 		head.castShadow = true;
 
@@ -163,10 +178,9 @@
 	 */
 	function makeNameSprite(name) {
 		/* eslint-disable no-undef */
-		var canvas  = document.createElement('canvas');
-		canvas.width  = 256;
-		canvas.height = 48;
-		var ctx = canvas.getContext('2d');
+		var canvas = _nameCanvas;   // reuse the pooled canvas (Fix B)
+		var ctx = _nameCtx;         // reuse the pooled context
+		ctx.clearRect(0, 0, 256, 48); // clear residual from previous sprite
 
 		// Pill-shaped background
 		ctx.fillStyle = 'rgba(18,22,32,0.82)';
@@ -267,7 +281,19 @@
 		if (!entry) return;
 
 		if (entry.group && sceneReady()) {
+			// Dispose name sprite canvas texture and material to prevent GPU memory leak (Fix #13)
+			entry.group.traverse(function (child) {
+				if (child.isSprite) {
+					if (child.material) {
+						if (child.material.map) {
+							child.material.map.dispose();
+						}
+						child.material.dispose();
+					}
+				}
+			});
 			window.DC.scene.remove(entry.group);
+			entry.group = null;
 		}
 		state.remote.delete(data.uid);
 		updateIndicator();
@@ -277,25 +303,29 @@
 
 	/**
 	 * Lerp all remote avatars toward their target positions each animation frame.
-	 * Called from dc-multi's render loop via DC_PRESENCE_TICK.
+	 * Called from dc-multi's render loop via DC.tick array iteration.
 	 * @param {number} dt — delta time in seconds
 	 */
 	function tickAvatars(dt) {
-		if (!sceneReady()) return;
+		if (!_sceneReady) return;
 
 		state.remote.forEach(function (entry) {
 			if (!entry.group) return;
 
+			// Use real dt; fall back to 1/60 if not provided (Fix 3)
+			var speed = (typeof dt === 'number' && dt > 0) ? dt : (1 / 60);
+			var lerpFactor = LERP_SPEED * speed;
+
 			// Lerp X
 			var dx = entry.targetX - entry.group.position.x;
 			if (Math.abs(dx) > 0.001) {
-				entry.group.position.x += dx * Math.min(1, LERP_SPEED * dt);
+				entry.group.position.x += dx * Math.min(1, lerpFactor);
 			}
 
 			// Lerp Z
 			var dz = entry.targetZ - entry.group.position.z;
 			if (Math.abs(dz) > 0.001) {
-				entry.group.position.z += dz * Math.min(1, LERP_SPEED * dt);
+				entry.group.position.z += dz * Math.min(1, lerpFactor);
 			}
 
 			// Apply yaw (instant, not lerped — keeps rotation snappy)
@@ -325,13 +355,21 @@
 				pendingJoin = null;
 			}
 
-			// Wire per-frame avatar lerp into dc-multi's tick
-			if (window.DC && typeof window.DC.tick === 'function') {
-				var origTick = window.DC.tick;
-				window.DC.tick = function () {
-					origTick.apply(this, arguments);
-					// estimate ~60fps so dt≈1/60
-					tickAvatars(1 / 60);
+			// Mark scene ready so tickAvatars runs each frame (Fix 5)
+			_sceneReady = true;
+
+			// Register tickAvatars into DC's tick callback array — no chaining (Fix 1)
+			if (window.DC._presenceTicks) {
+				window.DC._presenceTicks.push(tickAvatars);
+			} else {
+				window.DC._presenceTicks = [tickAvatars];
+				// First presence module to register: wrap DC.tick to iterate the array
+				var origTick = window.DC.tick.bind(window.DC);
+				window.DC.tick = function (dt) {
+					origTick(dt);
+					for (var i = 0; i < window.DC._presenceTicks.length; i++) {
+						window.DC._presenceTicks[i](dt);
+					}
 				};
 			}
 		};
@@ -402,6 +440,7 @@
 	 * Handle dc:auth-failure or dc:disconnected — nuke all remote avatars.
 	 */
 	function onAuthFailureOrDisconnect() {
+		pendingJoin = null;  // clear any pending join
 		// Remove all remote avatars from scene
 		if (sceneReady()) {
 			state.remote.forEach(function (entry) {
@@ -411,7 +450,6 @@
 		state.remote.clear();
 		state.uid  = null;
 		state.name = null;
-		pendingJoin = null;
 		updateIndicator();
 	}
 
@@ -427,6 +465,26 @@
 			onJoined(data);
 		} else if (op === 'dc.presence.updated') {
 			onUpdated(data);
+		} else if (op === 'dc.presence.batch_updated') {
+			// data is { uid1: {x,z,yaw,name,...}, uid2: {...}, ... }
+			// emitted by Events.php when 2+ clients move within a 50ms window
+			if (data && typeof data === 'object') {
+				for (var uid in data) {
+					if (!Object.prototype.hasOwnProperty.call(data, uid)) continue;
+					if (uid === String(state.uid)) continue;  // skip self
+					var entry = data[uid];
+					var remoteEntry = state.remote.get(uid);
+					if (remoteEntry) {
+						// Update lerp targets for smooth transition
+						if (entry.x !== undefined) remoteEntry.targetX = entry.x;
+						if (entry.z !== undefined) remoteEntry.targetZ = entry.z;
+						if (entry.yaw !== undefined) remoteEntry.yaw = entry.yaw;
+						// name might have changed
+						if (entry.name) remoteEntry.name = entry.name;
+					}
+					// else: unknown uid, ignore (could be a stale broadcast)
+				}
+			}
 		} else if (op === 'dc.presence.left') {
 			onLeft(data);
 		}

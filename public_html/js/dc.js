@@ -29,6 +29,86 @@ let roomBounds = null;  // {minX,maxX,minZ,maxZ} wall extents (collide against t
 let roomSpawn = null;   // {x,y,z,lookX,lookZ} a safe spot inside the room to drop the player
 // --- multi-building LOD: neighbours show cheap rack BLOCKS, swapped to full models on approach ---
 let lodBuildings = [];  // per-neighbour state {id, foot, dx,dz, wall rect, door, blocks, blockColliders, full, loading}
+// Spatial hash for fast LOD building lookup (Fix A: collideWorld spatial grid)
+const _spatialGrid = {};
+const _gridCellSize = 50;  // units per grid cell
+
+function _gridKey(x, z) {
+    return Math.floor(x / _gridCellSize) + ',' + Math.floor(z / _gridCellSize);
+}
+
+function _insertIntoGrid(building) {
+    // A building spans multiple grid cells. Insert into all cells it overlaps.
+    // building has minX, maxX, minZ, maxZ directly on it (not .bounds)
+    const minCx = Math.floor((building.minX - 1) / _gridCellSize);
+    const maxCx = Math.floor((building.maxX + 1) / _gridCellSize);
+    const minCz = Math.floor((building.minZ - 1) / _gridCellSize);
+    const maxCz = Math.floor((building.maxZ + 1) / _gridCellSize);
+    for (let cx = minCx; cx <= maxCx; cx++) {
+        for (let cz = minCz; cz <= maxCz; cz++) {
+            const key = cx + ',' + cz;
+            if (!_spatialGrid[key]) _spatialGrid[key] = [];
+            _spatialGrid[key].push(building);
+        }
+    }
+}
+
+function _rebuildSpatialGrid() {
+    // eslint-disable-next-line no-unused-vars
+    for (const k in _spatialGrid) delete _spatialGrid[k];
+    for (const nb of lodBuildings) {
+        _insertIntoGrid(nb);
+    }
+}
+
+// Spatial grid for rackColliders — keyed by grid cell, value is array of collider indices (Fix #3)
+const _rackGrid = {};
+const RACK_GRID_CELL = 10;  // 10-unit cells for racks (smaller than building-scale GRID_CELL=50)
+
+// Cache: locationId → { geometry, tubeCount } for cable geometry (Fix #10)
+const _cableGeometryCache = new Map();
+
+// Cache: poster spec string → CanvasTexture (Fix #11)
+const _posterTextureCache = new Map();
+
+// Cache: location name string → sign CanvasTexture (Fix #18)
+const _signTextureCache = new Map();
+
+// Cache: seed → floor CanvasTexture (Fix #5)
+const _floorTextureCache = new Map();
+
+function _rackGridKey(x, z) {
+    return Math.floor(x / RACK_GRID_CELL) * 10000 + Math.floor(z / RACK_GRID_CELL);
+}
+
+function _insertRackCollider(c, idx) {
+    // A rack collider spans from c.minX to c.maxX, c.minZ to c.maxZ
+    const minCx = Math.floor((c.minX - 0.5) / RACK_GRID_CELL);
+    const maxCx = Math.floor((c.maxX + 0.5) / RACK_GRID_CELL);
+    const minCz = Math.floor((c.minZ - 0.5) / RACK_GRID_CELL);
+    const maxCz = Math.floor((c.maxZ + 0.5) / RACK_GRID_CELL);
+    for (let cx = minCx; cx <= maxCx; cx++) {
+        for (let cz = minCz; cz <= maxCz; cz++) {
+            const key = cx * 10000 + cz;
+            if (!_rackGrid[key]) _rackGrid[key] = [];
+            if (!_rackGrid[key].includes(idx)) _rackGrid[key].push(idx);
+        }
+    }
+}
+
+// Set of already-inserted collider indices to avoid duplicates when rebuilding during async loads
+const _rackCollidersInserted = new Set();
+
+function _rebuildRackGrid() {
+    // Accumulate colliders: only insert new ones that aren't already in the grid
+    for (let i = 0; i < rackColliders.length; i++) {
+        if (!_rackCollidersInserted.has(i)) {
+            _insertRackCollider(rackColliders[i], i);
+            _rackCollidersInserted.add(i);
+        }
+    }
+}
+
 let dcBuildings = [];   // wall/door descriptor for EVERY building (current + neighbours) -> walk-between collision
 let wallColliders = []; // thin AABB slabs for all building walls (door gaps open) + the lot perimeter
 let neighborBlinds = []; // venetian-blind handles for the neighbour windows (slats+cords InstancedMeshes), animated by updateBlinds
@@ -185,6 +265,12 @@ function updateGuiPos() {
     for (const c of _posCtrls) valLabel(c, c._ax, Math.round(camera.position[c._ax]));
 }
 function displayGui() {
+    // Fix #17: Dispose old gui before creating a new one to prevent ghost DOM elements
+    if (gui) {
+        gui.domElement.remove();
+        gui.destroy();
+        gui = null;
+    }
     gui = new GUI();
     gui.add( options, 'location', locationNames).listen().onChange( () => { switchLocation(); });
     const displayFolder = gui.addFolder( 'Display' );
@@ -307,6 +393,23 @@ function loadDatacenter() {
 
 function clearScene() {
     rackColliders = []; // rebuilt as racks are re-placed
+    // Reset spatial grids (Fix #3)
+    for (const k in _rackGrid) delete _rackGrid[k];
+    _rackCollidersInserted.clear();
+    // Clear cable geometry cache (Fix #10)
+    for (const [, cached] of _cableGeometryCache) {
+        cached.geometry.dispose();
+    }
+    _cableGeometryCache.clear();
+    // Clear texture caches (Fix #5, #7, #11, #18)
+    _labelTextureCache.forEach(tex => tex.dispose());
+    _labelTextureCache.clear();
+    _posterTextureCache.forEach(tex => tex.dispose());
+    _posterTextureCache.clear();
+    _signTextureCache.forEach(tex => tex.dispose());
+    _signTextureCache.clear();
+    _floorTextureCache.forEach(tex => tex.dispose());
+    _floorTextureCache.clear();
     roomBounds = null; roomSpawn = null;
     // Multi-building LOD: dispose any neighbour FULL models (their group is added straight to the scene,
     // separate from objects.community). Geometry/material are shared cached templates -> only free each
@@ -406,7 +509,27 @@ function playerRadius() { return Math.max(0.2, (options.waistInches / (2 * Math.
 function collidesAt(x, z, r) {
     // walls: keep the player inside the room
     if (roomBounds && (x - r < roomBounds.minX || x + r > roomBounds.maxX || z - r < roomBounds.minZ || z + r > roomBounds.maxZ)) return true;
-    for (const c of rackColliders) {
+    // Fast spatial grid lookup: only check rack colliders in nearby cells (Fix #3)
+    const cellKey = Math.floor(x / RACK_GRID_CELL) * 10000 + Math.floor(z / RACK_GRID_CELL);
+    const check = [];
+    for (let dx = -1; dx <= 1; dx++) {
+        const cell = _rackGrid[cellKey + dx * 10000];
+        if (cell) {
+            for (const idx of cell) {
+                if (!check.includes(idx)) check.push(idx);
+            }
+        }
+    }
+    if (check.length === 0) {
+        // Fallback: rack grid empty (shouldn't happen), use full scan
+        for (const c of rackColliders) {
+            if (x + r > c.minX && x - r < c.maxX && z + r > c.minZ && z - r < c.maxZ) return true;
+        }
+        return false;
+    }
+    for (const idx of check) {
+        const c = rackColliders[idx];
+        if (!c) continue;
         if (x + r > c.minX && x - r < c.maxX && z + r > c.minZ && z - r < c.maxZ) return true;
     }
     return false;
@@ -645,6 +768,7 @@ function displayRacks(modelIdx) {
         }
     }
     buildInstanced(models.racks[modelIdx], placements, 'rack');
+    _rebuildRackGrid(); // Update spatial grid with new rack colliders (Fix #3)
 }
 
 function displayServers(modelIdx) {
@@ -678,7 +802,13 @@ const LABEL_DISTANCE_SQ = LABEL_DISTANCE * LABEL_DISTANCE;
 const _labelCamPos = new THREE.Vector3();
 const LABEL_GEO = new THREE.PlaneGeometry(1, 1);           // shared quad for every flat label (never disposed)
 
+// Cache: hostname string → CanvasTexture (Fix #7)
+const _labelTextureCache = new Map();
+
 function makeLabelTexture(text) {
+    if (_labelTextureCache.has(text)) {
+        return _labelTextureCache.get(text);
+    }
     const scale = 3; // supersample the label canvas so the text stays crisp up close
     const w = 320 * scale, h = 32 * scale;
     const fontFamily = 'Verdana, "Segoe UI", Arial, sans-serif';
@@ -709,6 +839,7 @@ function makeLabelTexture(text) {
     const texture = new THREE.CanvasTexture(canvas);
     texture.colorSpace = THREE.SRGBColorSpace;
     texture.anisotropy = maxAnisotropy || 1; // sharpen at oblique viewing angles
+    _labelTextureCache.set(text, texture);
     return texture;
 }
 
@@ -828,6 +959,24 @@ function displaySwitches(locId, dx, dz, sink) {
     dx = dx || 0; dz = dz || 0;
     const intraOnly = !!sink;   // neighbours: only draw cables whose endpoints are inside THIS building
     const racks = (locations[locId] || {}).racks; if (!racks) return;
+
+    // Fix #10: Cache cable geometry per location for the main building (not neighbours)
+    if (!sink && _cableGeometryCache.has(locId)) {
+        const cached = _cableGeometryCache.get(locId);
+        // Reuse cached merged geometry (clone so dispose doesn't affect cache)
+        const geo = cached.geometry.clone();
+        if (objects.network) {
+            scene.remove(objects.network);
+            objects.network.geometry.dispose();
+            objects.network.material.dispose();
+        }
+        objects.network = new THREE.Mesh(geo, new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: 0.6, metalness: 0.0, clearcoat: 0.6, clearcoatRoughness: 0.25 }));
+        objects.network.visible = options.showNetwork;
+        objects.network.frustumCulled = false;
+        scene.add(objects.network);
+        return;
+    }
+
     const tubes = [];
     const addCable = (pts, hex, off, seed) => {
         const vecs = [];
@@ -946,6 +1095,10 @@ function displaySwitches(locId, dx, dz, sink) {
     if (tubes.length === 0) { if (!sink) objects.network = null; return; }
     const geometry = BufferGeometryUtils.mergeGeometries(tubes, false);
     tubes.forEach((g) => g.dispose());
+    // Fix #10: Cache the merged cable geometry for the main building (not neighbours)
+    if (!sink) {
+        _cableGeometryCache.set(locId, { geometry: geometry.clone(), tubeCount: tubes.length });
+    }
     // matte plastic base + a clearcoat layer for a slight gloss / rounded depth on the cables
     const material = new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: 0.6, metalness: 0.0, clearcoat: 0.6, clearcoatRoughness: 0.25 });
     const cables = new THREE.Mesh(geometry, material);
@@ -957,25 +1110,31 @@ function displaySwitches(locId, dx, dz, sink) {
 
 // Procedural floor tile: slightly off-white tiles with seams + sporadic tiny speckles. Drawn as a
 // block of tiles so the speckle pattern doesn't visibly repeat tile-to-tile.
-function makeFloorTexture() {
+function makeFloorTexture(seed) {
+    if (_floorTextureCache.has(seed)) {
+        return _floorTextureCache.get(seed);
+    }
+	// Fix #12: Use seeded RNG so the same location always produces the same floor pattern
+	const rng = makeRng(seed || 0);
 	const tiles = 4, px = 128, size = tiles * px;
 	const c = document.createElement('canvas'); c.width = c.height = size;
 	const g = c.getContext('2d');
 	g.fillStyle = '#cfcabc'; g.fillRect(0, 0, size, size);     // grey-beige base (darker -> tiles don't blow out white)
 	for (let ty = 0; ty < tiles; ty++) for (let tx = 0; tx < tiles; tx++) {   // slight per-tile shade variation
-		const v = ((Math.random() * 14) | 0) - 7; g.fillStyle = `rgb(${207 + v},${202 + v},${188 + v})`; g.fillRect(tx * px + 2, ty * px + 2, px - 4, px - 4);
+		const v = ((rng() * 14) | 0) - 7; g.fillStyle = `rgb(${207 + v},${202 + v},${188 + v})`; g.fillRect(tx * px + 2, ty * px + 2, px - 4, px - 4);
 	}
 	g.strokeStyle = '#938e7f'; g.lineWidth = 3;                // distinctly darker grout so the squares read
 	for (let i = 0; i <= tiles; i++) { const p = i * px; g.beginPath(); g.moveTo(p, 0); g.lineTo(p, size); g.moveTo(0, p); g.lineTo(size, p); g.stroke(); }
 	for (let i = 0; i < 720; i++) {                            // random speckles, mixed light + dark for contrast
-		const x = Math.random() * size, y = Math.random() * size, r = Math.random() * 1.7 + 0.5;
-		g.fillStyle = Math.random() < 0.5 ? '#86816f' : '#c7c2b2';
+		const x = rng() * size, y = rng() * size, r = rng() * 1.7 + 0.5;
+		g.fillStyle = rng() < 0.5 ? '#86816f' : '#c7c2b2';
 		g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill();
 	}
 	const t = new THREE.CanvasTexture(c);
 	t.wrapS = t.wrapT = THREE.RepeatWrapping;
 	t.colorSpace = THREE.SRGBColorSpace;
 	t.anisotropy = maxAnisotropy || 1;
+	_floorTextureCache.set(seed, t);
 	return t;
 }
 
@@ -1091,6 +1250,10 @@ const POSTERS = [
 	{ title: 'Make It Happen', blurb: 'Deploy on a Friday. The on-call engineer believes in you.',                                         icon: 'ethernet' },
 ];
 function makePosterTexture(spec) {
+	const cacheKey = JSON.stringify(spec);
+	if (_posterTextureCache.has(cacheKey)) {
+		return _posterTextureCache.get(cacheKey);
+	}
 	const W = 460, H = 576, c = document.createElement('canvas'); c.width = W; c.height = H;
 	const g = c.getContext('2d');
 	g.fillStyle = '#0b0b0c'; g.fillRect(0, 0, W, H);
@@ -1107,7 +1270,9 @@ function makePosterTexture(spec) {
 	const words = spec.blurb.split(' '); let line = '', y = iy + ih + 112;
 	for (const wd of words) { const t = line ? line + ' ' + wd : wd; if (g.measureText(t).width > W - 64 && line) { g.fillText(line, W / 2, y); line = wd; y += 28; } else line = t; }
 	if (line) g.fillText(line, W / 2, y);
-	const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = maxAnisotropy || 1; return tex;
+	const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = maxAnisotropy || 1;
+	_posterTextureCache.set(cacheKey, tex);
+	return tex;
 }
 // Hang the 4 posters on the inside walls of a building (near corners, where the wall is solid). parent =
 // the building's walls/group; b = its {minX,maxX,minZ,maxZ} bounds.
@@ -1145,6 +1310,9 @@ function locationFootprint(id) {
 	return { w: (maxX - minX) + 2 * pad, d: (maxZ - minZ) + 2 * pad, cx: (minX + maxX) / 2, cz: (minZ + maxZ) / 2 };
 }
 function makeSignTexture(text) {
+	if (_signTextureCache.has(text)) {
+		return _signTextureCache.get(text);
+	}
 	const w = 256, h = 64, c = document.createElement('canvas'); c.width = w; c.height = h;
 	const g = c.getContext('2d');
 	g.fillStyle = '#1d2430'; g.fillRect(0, 0, w, h);
@@ -1153,7 +1321,9 @@ function makeSignTexture(text) {
 	let fs = 30; g.font = 'bold ' + fs + 'px Arial';
 	while (g.measureText(text).width > w - 20 && fs > 10) { fs -= 2; g.font = 'bold ' + fs + 'px Arial'; }
 	g.fillText(text, w / 2, h / 2 + 2);
-	const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAnisotropy || 1; return t;
+	const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAnisotropy || 1;
+	_signTextureCache.set(text, t);
+	return t;
 }
 const WIN_SZ = 96 * UNITS_PER_INCH;     // 8 ft windows
 const WIN_BOTTOM = 18 * UNITS_PER_INCH; // sill ~1.5 ft off the ground
@@ -1539,6 +1709,8 @@ function updateRoomDoors() {
 }
 function buildCommunity() {
 	lodBuildings = []; dcBuildings = []; wallColliders = []; neighborBlinds = []; neighborDoors = [];
+	// eslint-disable-next-line no-unused-vars
+	for (const k in _spatialGrid) delete _spatialGrid[k]; // clear spatial hash (Fix A)
 	const ids = Object.keys(locationNames).map((n) => Number(locationNames[n])).filter((id) => locationLoaded(id));
 	ids.sort((a, b) => locName(a).localeCompare(locName(b)));
 	// the CURRENT building's walls/door go in the descriptor list too (walkability + lot perimeter)
@@ -1591,6 +1763,7 @@ function buildCommunity() {
 				blocks: blk ? blk.mesh : null, blockColliders: blk ? blk.colliders : [], full: null, loading: false, _dist: Infinity });
 			dcBuildings.push({ id: Number(id), kind: 'neighbor', minX: px - f.w / 2, maxX: px + f.w / 2, minZ: pz - f.d / 2, maxZ: pz + f.d / 2, doorSide, doorC, doorHalf });
 		}
+		_rebuildSpatialGrid(); // build spatial hash for collideWorld (Fix A)
 		scene.add(grp); objects.community = grp;
 	}
 	buildWallColliders();
@@ -1635,7 +1808,25 @@ function collideWorld(x, z, r) {
 	const hit = (c) => x + r > c.minX && x - r < c.maxX && z + r > c.minZ && z - r < c.maxZ;
 	for (const c of wallColliders) if (hit(c)) return true;
 	for (const c of rackColliders) if (hit(c)) return true;     // current building furniture (live)
-	for (const b of lodBuildings) {
+	// Use spatial grid to get only nearby buildings (Fix A)
+	const cx = Math.floor(x / _gridCellSize);
+	const cz = Math.floor(z / _gridCellSize);
+	const nearby = [];
+	// Collect from the 3x3 neighborhood of cells
+	for (let dx = -1; dx <= 1; dx++) {
+		for (let dz = -1; dz <= 1; dz++) {
+			const cell = _spatialGrid[(cx + dx) + ',' + (cz + dz)];
+			if (cell) {
+				for (const nb of cell) {
+					// Avoid duplicates if building spans multiple cells
+					if (!nearby.includes(nb)) nearby.push(nb);
+				}
+			}
+		}
+	}
+	// Fallback: if grid is empty (shouldn't happen), fall back to full scan
+	if (nearby.length === 0) nearby.push(...lodBuildings);
+	for (const b of nearby) {
 		if (x < b.minX - r - 1 || x > b.maxX + r + 1 || z < b.minZ - r - 1 || z > b.maxZ + r + 1) continue; // far from this plot -> skip its interior
 		const cols = b.full ? b.full.colliders : b.blockColliders;
 		for (let i = 0; i < cols.length; i++) if (hit(cols[i])) return true;
@@ -1774,8 +1965,8 @@ function buildNeighborInterior(group, b) {
 	const flyer = new THREE.Mesh(new THREE.PlaneGeometry(3.4, 4.3), new THREE.MeshBasicMaterial({ map: makeLostCatTexture() })); flyer.rotation.y = Math.PI; flyer.position.set(bdX, 12.2, maxZ - 0.55); group.add(flyer);
 	const cal = new THREE.Mesh(new THREE.PlaneGeometry(3, 4.6), new THREE.MeshBasicMaterial({ map: makeCalendarTexture() })); cal.rotation.y = Math.PI / 2; cal.position.set(minX + 0.75, 11.5, cz + D * 0.22); group.add(cal);
 	addPosters(group, { minX, maxX, minZ, maxZ });   // funny tech motivational posters on the walls
-	// tiled interior floor
-	const floorTex = makeFloorTexture(), tu = 24 * UNITS_PER_INCH;
+	// tiled interior floor (seeded by location so the pattern is stable across visits)
+	const floorTex = makeFloorTexture(b.id), tu = 24 * UNITS_PER_INCH;
 	floorTex.repeat.set(Math.max(1, Math.round(W / (4 * tu))), Math.max(1, Math.round(D / (4 * tu))));
 	const floor = new THREE.Mesh(new THREE.PlaneGeometry(W, D), new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.9 }));
 	floor.rotation.x = -Math.PI / 2; floor.position.set(cx, 0, cz); group.add(floor);
@@ -1989,7 +2180,7 @@ function buildRoom() {
 	baseboard('z', maxX, minZ, maxZ, -1, null, 0);      // right wall: continuous (no door)
 
 	// interior tile floor for this building (sits on top of the outdoor asphalt)
-	const floorTex = makeFloorTexture();
+	const floorTex = makeFloorTexture(options.location);
 	const tu = 24 * UNITS_PER_INCH;
 	floorTex.repeat.set(Math.max(1, Math.round(W / (4 * tu))), Math.max(1, Math.round(D / (4 * tu))));
 	const floor = new THREE.Mesh(new THREE.PlaneGeometry(W, D), new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.9 }));
@@ -2100,6 +2291,16 @@ const _centerNdc = new THREE.Vector2(0, 0);   // screen centre = "what you're lo
 const _hoverMatrix = new THREE.Matrix4();
 const _hoverPos = new THREE.Vector3();
 const _hoverSize = new THREE.Vector3();
+// Fix #4: Camera forward direction helper and distance pre-check for raycastInstances
+const _camFwd = new THREE.Vector3();
+const _rcTempV = new THREE.Vector3();
+const MAX_RAYCAST_DIST = 30;  // only raycast instanced meshes within this distance
+
+function _getCameraForward(cam) {
+    cam.getWorldDirection(_camFwd);
+    return _camFwd;
+}
+
 let highlightBox = null;
 let hovered = null;                            // { mesh, instanceId, kind, asset }
 let _hlFrame = 0;
@@ -2122,8 +2323,17 @@ function ensureHighlightBox() {
 
 function raycastInstances(ndc) {
     if (objects.instanced.length === 0) return null;
+    // Fix #4: Fast distance pre-check — only test instanced meshes within MAX_RAYCAST_DIST
+    const nearbyInstanced = objects.instanced.filter(mesh => {
+        if (!mesh.isMesh) return false;
+        _rcTempV.copy(mesh.position).sub(camera.position);
+        const dot = _rcTempV.dot(_getCameraForward(camera));
+        if (dot < 0 || dot > MAX_RAYCAST_DIST) return false;  // behind camera or too far
+        return true;
+    });
+    if (nearbyInstanced.length === 0) return null;
     raycaster.setFromCamera(ndc, camera);
-    const hits = raycaster.intersectObjects(objects.instanced, false);
+    const hits = raycaster.intersectObjects(nearbyInstanced, false);
     for (const hit of hits) {
         if (hit.instanceId === undefined || hit.instanceId === null) continue;
         const ud = hit.object.userData;

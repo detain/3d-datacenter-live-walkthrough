@@ -16,6 +16,16 @@ import { DRACOLoader } from "three/addons/loaders/DRACOLoader.js";
 
 const MANIFEST_URL = "/images/3d/mixamo/manifest.json";
 
+// Camera collision cache — avoids re-running the expensive collision loop when player hasn't moved (Fix 6)
+// Includes camera direction to skip re-computation during mouse-look rotation (Fix 9)
+let _lastSafeDist = 11;  // default; will be set to S.camDist when first used
+const _lastPlayerPos = new THREE.Vector3();
+let _lastCollisionCamPos = null;  // "x,z" rounded to 1 decimal
+let _lastCollisionCamDir = null;  // "x,y,z" rounded to 1 decimal (camera world direction)
+// Logo and glass material caches (Fix 15, Fix 16)
+let _cachedLogoTexture = null;
+let _cachedGlassMaterial = null;
+
 const S = {
   DC: null, scene: null, camera: null, renderer: null, controls: null, options: null,
   loader: new GLTFLoader(),
@@ -75,11 +85,12 @@ whenReady(async () => {
   const _draco = new DRACOLoader(); _draco.setDecoderPath('/lib/three/examples/jsm/libs/draco/');
   S.loader.setDRACOLoader(_draco);
   // render at a slightly lower internal resolution for FPS headroom (the datacenter is fill-heavy)
+  // 0.8 factor is intentional: balances visual quality vs FPS on GPU-limited frames
   S.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2) * 0.8);
   S.renderer.setSize(window.innerWidth, window.innerHeight);
 
   try {
-    const res = await fetch(MANIFEST_URL, { cache: "no-store" });
+    const res = await fetch(MANIFEST_URL, { cache: "default" });
     if (res.ok) S.manifest = await res.json();
   } catch (e) { /* manifest may not exist yet */ }
 
@@ -255,7 +266,7 @@ function frame() {
   if (S.controls.isLocked) placeCamera();
   else if (S.model) S.model.visible = false;
   // hand off to dc.js for fly-to glide, look-highlight, label culling, and the actual render
-  if (S.DC.tick) S.DC.tick(); else S.renderer.render(S.scene, S.camera);
+  if (S.DC.tick) S.DC.tick(dt); else S.renderer.render(S.scene, S.camera);
 }
 
 function chooseAnimation(moving, speed) {
@@ -288,13 +299,26 @@ function placeCamera() {
   _head.set(S.player.position.x, S.player.position.y + eye * 0.95, S.player.position.z);
   S.camera.getWorldDirection(_dir).normalize();      // current mouse-look direction
   // pull the camera in if a rack/wall is between head and the ideal position (any building's, now)
-  let dist = S.camDist;
-  const collide = S.DC.collideWorld || S.DC.collidesAt, rad = (S.DC.playerRadius ? S.DC.playerRadius() : 1.0);
-  if (collide) {
-    for (let d = 2; d <= S.camDist; d += 1.5) {
-      const cx = _head.x - _dir.x * d, cz = _head.z - _dir.z * d;
-      if (collide(cx, cz, rad * 0.6)) { dist = Math.max(2.5, d - 1.5); break; }
+  // Skip expensive collision loop if player hasn't moved, camera hasn't rotated, and camDist unchanged (Fix 6, Fix 9)
+  const _posKey = S.player.position.x.toFixed(1) + ',' + S.player.position.z.toFixed(1);
+  const _camDirKey = Math.round(_dir.x * 10) + ',' + Math.round(_dir.y * 10) + ',' + Math.round(_dir.z * 10);
+  let dist;
+  const playerMoved = !_lastPlayerPos.equals(S.player.position);
+  if (!playerMoved && _posKey === _lastCollisionCamPos && _camDirKey === _lastCollisionCamDir && S.camDist === _lastSafeDist) {
+    dist = _lastSafeDist;
+  } else {
+    dist = S.camDist;
+    const collide = S.DC.collideWorld || S.DC.collidesAt, rad = (S.DC.playerRadius ? S.DC.playerRadius() : 1.0);
+    if (collide) {
+      for (let d = 2; d <= S.camDist; d += 1.5) {
+        const cx = _head.x - _dir.x * d, cz = _head.z - _dir.z * d;
+        if (collide(cx, cz, rad * 0.6)) { dist = Math.max(2.5, d - 1.5); break; }
+      }
     }
+    _lastSafeDist = dist;
+    _lastPlayerPos.copy(S.player.position);
+    _lastCollisionCamPos = _posKey;
+    _lastCollisionCamDir = _camDirKey;
   }
   // Position the camera `dist` behind the head ALONG the current view direction, so the head
   // sits at screen-centre. Do NOT lookAt() — orientation is owned by PointerLockControls (the
@@ -337,7 +361,9 @@ function wallBlocked(x, z, r) {
 }
 
 // InterServer "iS" mark on a transparent canvas: orange i-stem + blue square dot + blue swoosh S.
+// Cached after first creation (Fix 15)
 function makeLogoTexture() {
+  if (_cachedLogoTexture) return _cachedLogoTexture;
   const s = 256, c = document.createElement('canvas'); c.width = c.height = s;
   const g = c.getContext('2d'), blue = '#2E8BCE', orange = '#F39019';
   g.fillStyle = orange; g.fillRect(s * 0.20, s * 0.30, s * 0.075, s * 0.55);   // i stem
@@ -347,7 +373,21 @@ function makeLogoTexture() {
   g.bezierCurveTo(s * 0.46, s * 0.13, s * 0.40, s * 0.45, s * 0.62, s * 0.52);
   g.bezierCurveTo(s * 0.86, s * 0.60, s * 0.72, s * 0.92, s * 0.34, s * 0.78);
   g.stroke();
-  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  _cachedLogoTexture = t;
+  return t;
+}
+
+// Glass material for the door — cached since appearance is constant (Fix 16)
+function makeGlassMaterial() {
+  if (_cachedGlassMaterial) return _cachedGlassMaterial;
+  const mat = new THREE.MeshPhysicalMaterial({
+    color: 0x9fb6c4, metalness: 0, roughness: 0.06,
+    transparent: true, opacity: 0.32, reflectivity: 0.6,
+    clearcoat: 0.6, clearcoatRoughness: 0.05, side: THREE.DoubleSide
+  });
+  _cachedGlassMaterial = mat;
+  return mat;
 }
 
 // Build a taller double glass door at the room's front doorway, hiding dc.js's plain single door.
@@ -362,8 +402,7 @@ function buildDoor() {
         && o.position.y > 0.4 && o.position.y < head + 1) o.visible = false;
   });
   const grp = new THREE.Group();
-  const glassMat = new THREE.MeshPhysicalMaterial({ color: 0x9fb6c4, metalness: 0, roughness: 0.06,
-    transparent: true, opacity: 0.32, reflectivity: 0.6, clearcoat: 0.6, clearcoatRoughness: 0.05, side: THREE.DoubleSide });
+  const glassMat = makeGlassMaterial();
   const frameMat = new THREE.MeshStandardMaterial({ color: 0x20242a, metalness: 0.7, roughness: 0.4 });
   const logoTex = makeLogoTexture();
   // transom header capping the opening above the leaves (so there's no see-through slot)
@@ -406,6 +445,7 @@ function updateDoor(dt) {
 }
 
 function trySpawn() {
+  S.door = null; // clear cached door on location switch (Fix 8)
   const sp = S.DC.roomSpawn;
   if (!sp) return;
   S.player.position.set(sp.x, 0, sp.z);

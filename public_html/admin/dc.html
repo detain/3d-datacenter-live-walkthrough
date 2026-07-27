@@ -4,7 +4,7 @@
 	<meta charset="UTF-8">
 	<title>InterServer DataCenter</title>
 	<meta name="viewport" content="width=device-width, initial-scale=1">
-	<meta http-equiv="Cache-Control" content="no-store, max-age=0">
+	<meta http-equiv="Cache-Control" content="max-age=0, must-revalidate">
 	<script type="importmap">
 		{
 		"imports": {
@@ -14,7 +14,6 @@
 		}
 	}
 </script>
-	<link rel="stylesheet" href="/css/dc.css?v=p45">
 	<style>
 		#dcSearch { position: fixed; top: 10px; left: 170px; z-index: 30; width: 240px;
 			padding: 7px 10px; border: 1px solid #888; border-radius: 4px; font: 14px Arial, sans-serif;
@@ -48,8 +47,6 @@
 		#dcLocations button:hover .dc-loc-short { visibility: hidden; }
 		#dcLocations button:hover .dc-loc-full { display: block; position: absolute; left: -1px; top: -1px; padding: 6px 10px;
 			background: #ffe9a8; border: 1px solid #888; border-radius: 5px; white-space: nowrap; z-index: 2; }
-		#dcViews button.active { background: #ffcc33; border-color: #cc9900; font-weight: bold; }
-
 		/* --- player (third-person) controls --- */
 		#dcPlayer { position: fixed; top: 10px; right: 12px; z-index: 32; display: flex; gap: 6px; align-items: center; }
 		#dcPlayer button, #dcPlayer select { padding: 7px 11px; border: 1px solid #888; border-radius: 5px; cursor: pointer;
@@ -61,7 +58,7 @@
 		/* Fade the left (locations) + bottom (views) controls; a group snaps to full opacity when the mouse is near it. */
 		#dcLocations button, #dcViews button { opacity: 0.4; transition: opacity 0.22s ease; }
 		#dcLocations:hover button, #dcViews:hover button { opacity: 1; }
-		#dcLocations button.active, #dcViews button.active { opacity: 0.82; }
+		#dcLocations button.active, #dcViews button.active { background: #ffcc33; border-color: #cc9900; font-weight: bold; opacity: 0.82; }
 		#dcLocations:hover button.active, #dcViews:hover button.active { opacity: 1; }
 		/* GUI sliders: drop the right-hand number box and show the value in the left label instead
 		   (the controllers set their own "label (value)" / "label value-unit" name). Widen the name
@@ -79,6 +76,12 @@
 		#dcPresenceLabel { color: #aabbd0; }
 		#dcPresenceCount { font-weight: bold; color: #fff; margin-left: 2px; }
 	</style>
+	<!-- Preload Three.js module to reduce HTTP RTTs on first load -->
+	<link rel="modulepreload" href="/lib/three/build/three.module.js">
+	<link rel="modulepreload" href="/lib/three/examples/jsm/controls/PointerLockControls.js">
+	<link rel="modulepreload" href="/lib/three/examples/jsm/loaders/GLTFLoader.js">
+	<link rel="modulepreload" href="/lib/three/examples/jsm/loaders/DRACOLoader.js">
+	<link rel="modulepreload" href="/lib/three/examples/jsm/utils/BufferGeometryUtils.js">
 </head>
 <body>
 	<div id="dcLoading">Loading datacenter…</div>

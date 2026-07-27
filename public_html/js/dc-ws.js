@@ -105,8 +105,8 @@
 				if (!self.closedByUs && self.reconnectAttempts < self.maxReconnectAttempts) {
 					self.reconnectAttempts++;
 					setTimeout(function () { self._connect(); }, self.reconnectDelay);
-					// exponential backoff: double each attempt, cap at 30s
-					self.reconnectDelay = Math.min(self.reconnectDelay * 2, 30000);
+					// exponential backoff: double each attempt, add jitter, cap at 30s
+					self.reconnectDelay = Math.min(self.reconnectDelay * 2 + Math.random() * 500, 30000);
 				} else if (!self.closedByUs) {
 					// exhausted reconnect attempts
 					self._setStatus('exhausted');
@@ -214,7 +214,9 @@
 		},
 
 		_setStatus: function (status) {
-			// Could log status for debugging; intentionally quiet in production
+			if (typeof window.DC_DEBUG !== 'undefined' && window.DC_DEBUG) {
+				console.debug('[dc-ws]', status);
+			}
 		},
 
 		/** Close the socket and suppress the reconnect loop. */
