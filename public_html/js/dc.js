@@ -43,8 +43,16 @@ let _skipExpensiveUpdates = false;
 let _contextLost = false;
 let _sessionBackup = null;
 
+// --- requestIdleCallback polyfill (MAJOR-8: fix broken fallback) ---
+const _ric = requestIdleCallback
+    ? (cb, opts) => requestIdleCallback(cb, opts)
+    : (cb) => setTimeout(cb, 2000);  // Safari lacks rIC; 2s delay is a reasonable idle guess
+
 // --- FPS monitoring for automatic quality scaling ---
-let _fpsHistory = [];           // rolling window of frame times (ms)
+// MAJOR-3: Use a ring buffer (fixed-size array + head index) for O(1) insert instead of O(n) Array.shift()
+const _fpsHistory = new Array(FPS_WINDOW);  // rolling window of frame times (ms)
+let _fpsHead = 0;                 // index of oldest slot (wraps around)
+let _fpsCount = 0;                // how many slots are filled (max FPS_WINDOW)
 let _lastFrameTime = 0;         // timestamp of last frame
 let _qualityDowngradeTime = 0;  // when we last downgraded (debounce guard)
 let _lastUpgradeTime = 0;       // when we last upgraded (debounce guard)
@@ -108,6 +116,9 @@ const _signTextureCache = new Map();
 
 // Cache: seed → floor CanvasTexture (Fix #5)
 const _floorTextureCache = new Map();
+
+// Cache: hostname string → CanvasTexture (Fix #7 / CRIT-12: moved to module scope to avoid TDZ)
+const _labelTextureCache = new Map();
 
 // Cache: seed → ceiling CanvasTexture (Fix #4)
 const _ceilingTextureCache = new Map();
@@ -302,18 +313,25 @@ const serverTypes = [
 function _updateFPS(now) {
     if (_lastFrameTime > 0) {
         const delta = now - _lastFrameTime;
-        if (_fpsHistory.length >= FPS_WINDOW) {
-            _fpsHistory.shift();
-        }
-        _fpsHistory.push(delta);
+        // MAJOR-3: Ring buffer — O(1) insert instead of O(n) Array.shift()
+        _fpsHistory[_fpsHead] = delta;
+        _fpsHead = (_fpsHead + 1) % FPS_WINDOW;
+        if (_fpsCount < FPS_WINDOW) _fpsCount++;
     }
     _lastFrameTime = now;
 }
 
 function _autoQualityScale(now) {
-    if (_fpsHistory.length < FPS_WINDOW) return; // not enough data yet
+    if (_fpsCount < FPS_WINDOW) return; // not enough data yet
 
-    const avgFrameTime = _fpsHistory.reduce((a, b) => a + b, 0) / _fpsHistory.length;
+    // MAJOR-3: Iterate over the correct ring buffer slots (not the whole array)
+    // Buffer is full: oldest is at _fpsHead, iterate all FPS_WINDOW slots in order
+    let sum = 0;
+    for (let i = 0; i < FPS_WINDOW; i++) {
+        const idx = (_fpsHead + i) % FPS_WINDOW;
+        sum += _fpsHistory[idx];
+    }
+    const avgFrameTime = sum / FPS_WINDOW;
     const fps = 1000 / avgFrameTime;
 
     if (fps < FPS_TARGET) {
@@ -574,6 +592,8 @@ function clearScene() {
     // Reset idle skip state (Bug #2: clearScene must not leave stale skip mode from a previous scene)
     _tickSkippedFrames = 0;
     _skipExpensiveUpdates = false;
+    // MINOR-5: Detach key handlers on scene clear to prevent stale listeners after location switch
+    detachKeyHandlers();
     rackColliders = []; // rebuilt as racks are re-placed
     // Reset spatial grids (Fix #3)
     for (const k in _rackGrid) delete _rackGrid[k];
@@ -1003,8 +1023,8 @@ const _labelCamPos = new THREE.Vector3();
 // New label quads reuse this same geometry instance (scaled via label.scale.set).
 const LABEL_GEO = new THREE.PlaneGeometry(1, 1);
 
+// _labelTextureCache is declared at module scope (see CRIT-12 fix)
 // Cache: hostname string → CanvasTexture (Fix #7)
-const _labelTextureCache = new Map();
 
 function makeLabelTexture(text) {
     if (_labelTextureCache.has(text)) {
@@ -1322,7 +1342,7 @@ function displaySwitches(locId, dx, dz, sink) {
     if (tubes.length > 150 && !sink) {
         const _tubes = tubes;
         const _locId = locId;
-        (requestIdleCallback || setTimeout)(() => {
+        _ric(() => {
             const geometry = BufferGeometryUtils.mergeGeometries(_tubes, false);
             _tubes.forEach((g) => g.dispose());
             // Fix #8: LRU eviction for cable geometry cache
@@ -1348,7 +1368,7 @@ function displaySwitches(locId, dx, dz, sink) {
             cables.frustumCulled = false;
             (sink ? sink.group : scene).add(cables);
             if (sink) sink.network = cables; else objects.network = cables;
-        }, { timeout: 2000 });
+        });
         return;
     }
 
@@ -1447,6 +1467,7 @@ function makeCeilingTexture(seed) {
 }
 
 // "Lost cat" flyer for the bulletin board.
+// MINOR-7 Note: Not cached — generated fresh each call. Should be cached per location+neighbor if perf is an issue.
 function makeLostCatTexture() {
 	const w = 300, h = 380, c = document.createElement('canvas'); c.width = w; c.height = h;
 	const g = c.getContext('2d');
@@ -1467,6 +1488,7 @@ function makeLostCatTexture() {
 }
 
 // Old-fashioned pin-up calendar (a tasteful retro silhouette + a month grid) for the back of a door.
+// MINOR-7 Note: Not cached — generated fresh each call. Should be cached per location+neighbor if perf is an issue.
 function makeCalendarTexture() {
 	const w = 220, h = 340, c = document.createElement('canvas'); c.width = w; c.height = h;
 	const g = c.getContext('2d');
@@ -2088,22 +2110,23 @@ function collideWorld(x, z, r) {
 	// Use spatial grid to get only nearby buildings (Fix A)
 	const cx = Math.floor(x / _gridCellSize);
 	const cz = Math.floor(z / _gridCellSize);
-	const nearby = [];
+	// MAJOR-2: Use a Set for O(1) deduplication instead of O(n) .includes() per item
+	const nearbySet = new Set();
 	// Collect from the 3x3 neighborhood of cells
 	for (let dx = -1; dx <= 1; dx++) {
 		for (let dz = -1; dz <= 1; dz++) {
 			const cell = _spatialGrid[(cx + dx) + ',' + (cz + dz)];
 			if (cell) {
 				for (const nb of cell) {
-					// Avoid duplicates if building spans multiple cells
-					if (!nearby.includes(nb)) nearby.push(nb);
+					// Avoid duplicates if building spans multiple cells — O(1) with Set
+					nearbySet.add(nb);
 				}
 			}
 		}
 	}
 	// Fallback: if grid is empty (shouldn't happen), fall back to full scan
-	if (nearby.length === 0) nearby.push(...lodBuildings);
-	for (const b of nearby) {
+	if (nearbySet.size === 0) for (const nb of lodBuildings) nearbySet.add(nb);
+	for (const b of nearbySet) {
 		if (x < b.minX - r - 1 || x > b.maxX + r + 1 || z < b.minZ - r - 1 || z > b.maxZ + r + 1) continue; // far from this plot -> skip its interior
 		const cols = b.full ? b.full.colliders : b.blockColliders;
 		for (let i = 0; i < cols.length; i++) if (hit(cols[i])) return true;
@@ -3097,9 +3120,11 @@ function animate() {
     maybeCycleIdleView();
     maybeFlicker();
 
-    // FPS monitoring for automatic quality scaling
-    _updateFPS(now);
-    _autoQualityScale(now);
+    // FPS monitoring for automatic quality scaling (MINOR-6: skip during idle mode)
+    if (!_skipExpensiveUpdates) {
+        _updateFPS(now);
+        _autoQualityScale(now);
+    }
 
     // Phase 7: glide toward a search fly-to target, then highlight what we're looking at (throttled)
     updateFlyTo();
@@ -3239,9 +3264,6 @@ window.DC = {
     tick: function () {
         if (document.hidden) return;
         const now = performance.now();
-        // FPS monitoring for automatic quality scaling — runs every tick so the rolling average stays accurate
-        _updateFPS(now);
-        _autoQualityScale(now);
 
         // Idle skip: after _IDLE_FRAME_THRESHOLD idle frames, gate expensive per-frame updates; reset on player movement (via setLodFocus)
         if (_skipExpensiveUpdates) {
@@ -3249,6 +3271,9 @@ window.DC = {
             if (stats) stats.update();
             return renderer.info.render.calls;
         }
+        // MINOR-6: FPS monitoring — only runs when not in idle skip mode
+        _updateFPS(now);
+        _autoQualityScale(now);
         maybeFlicker();
         updateDisco();
         maybeCycleIdleView();
