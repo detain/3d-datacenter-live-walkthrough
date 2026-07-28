@@ -137,16 +137,21 @@ whenReady(async () => {
     if (_cachedLogoTexture) { _cachedLogoTexture.dispose(); _cachedLogoTexture = null; }
     if (_cachedGlassMaterial) { _cachedGlassMaterial.dispose(); _cachedGlassMaterial = null; }
   });
-  // Clear DC_PRESENCE_JOIN on disconnect/auth-failure to prevent stale coordinate calls (MAJOR-4)
-  document.addEventListener('dc:disconnected', () => { window.DC_PRESENCE_JOIN = null; });
-  document.addEventListener('dc:auth-failure', () => { window.DC_PRESENCE_JOIN = null; });
+  // Disable presence on disconnect/auth-failure; re-enabled on auth-success (MAJOR-6)
+  document.addEventListener('dc:disconnected', () => { window.DC_PRESENCE_ENABLED = false; });
+  document.addEventListener('dc:auth-failure', () => { window.DC_PRESENCE_ENABLED = false; });
+  document.addEventListener('dc:auth-success', () => { window.DC_PRESENCE_ENABLED = true; });
 
   // IDEA-2: Context loss handling (IDEA-2)
   document.addEventListener('dc:context-lost', () => {
     log('GPU context lost');
   });
   document.addEventListener('dc:context-restored', () => {
-    log('GPU context restored');
+    log('GPU context restored — player state may need refresh');
+    // If player was visible, trigger respawn to sync position (MAJOR-9)
+    if (S.player && S.spawned) {
+      trySpawn(S.player.position.x, S.player.position.z, S.facing);
+    }
   });
 });
 
@@ -494,7 +499,11 @@ function updateDoor(dt) {
   d.left.rotation.y = -a; d.right.rotation.y = a;
 }
 
-function trySpawn() {
+function trySpawn(x, z, facing) {
+  // Use passed values or fall back to roomSpawn
+  const spawnX = (x !== undefined) ? x : S.DC.roomSpawn.x;
+  const spawnZ = (z !== undefined) ? z : S.DC.roomSpawn.z;
+  const spawnFacing = (facing !== undefined) ? facing : Math.atan2(S.DC.roomSpawn.lookX - S.DC.roomSpawn.x, S.DC.roomSpawn.lookZ - S.DC.roomSpawn.z);
   if (S.door && S.door.group) {
     S.door.group.traverse(o => {
       if (o.geometry) o.geometry.dispose();
@@ -508,16 +517,16 @@ function trySpawn() {
   S.door = null; // clear cached door on location switch (Fix 8)
   const sp = S.DC.roomSpawn;
   if (!sp) return;
-  S.player.position.set(sp.x, 0, sp.z);
-  S.facing = Math.atan2(sp.lookX - sp.x, sp.lookZ - sp.z);
+  S.player.position.set(spawnX, 0, spawnZ);
+  S.facing = spawnFacing;
   S.player.rotation.y = S.facing;
   // seed an over-the-shoulder third-person orientation (one-time; mouse takes over once locked)
   const eye = S.DC.eyeHeight ? S.DC.eyeHeight() : 15;
-  S.camera.position.set(sp.x - Math.sin(S.facing) * S.camDist, eye * 0.95 + 3, sp.z - Math.cos(S.facing) * S.camDist);
-  S.camera.lookAt(sp.x, eye * 0.95, sp.z);
+  S.camera.position.set(spawnX - Math.sin(S.facing) * S.camDist, eye * 0.95 + 3, spawnZ - Math.cos(S.facing) * S.camDist);
+  S.camera.lookAt(spawnX, eye * 0.95, spawnZ);
   S.spawned = true;
-  log("spawned player at", sp.x.toFixed(1), sp.z.toFixed(1));
-  if (typeof window.DC_PRESENCE_JOIN === 'function') {
+  log("spawned player at", spawnX.toFixed(1), spawnZ.toFixed(1));
+  if (typeof window.DC_PRESENCE_JOIN === 'function' && window.DC_PRESENCE_ENABLED !== false) {
     window.DC_PRESENCE_JOIN(S.player.position.x, S.player.position.z, S.facing);
   }
 }
