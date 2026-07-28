@@ -606,7 +606,19 @@
 
 						remoteEntry.lastUpdateTime = now;
 
-						// name might have changed
+						// MINOR-10: name might have changed — evict old cache entry so it rebuilds with new name
+						if (entry.name && remoteEntry.name !== entry.name) {
+							var oldName = remoteEntry.name;
+							if (oldName && _nameSpriteCache.has(oldName)) {
+								var oldCacheEntry = _nameSpriteCache.get(oldName);
+								oldCacheEntry.sprite.parent?.remove(oldCacheEntry.sprite);
+								oldCacheEntry.sprite.material.map?.dispose();
+								oldCacheEntry.sprite.material.dispose();
+								_nameSpriteCache.delete(oldName);
+								var oldIdx = _nameSpriteCacheOrder.indexOf(oldName);
+								if (oldIdx !== -1) _nameSpriteCacheOrder.splice(oldIdx, 1);
+							}
+						}
 						if (entry.name) remoteEntry.name = entry.name;
 					}
 					// else: unknown uid, ignore (could be a stale broadcast)
