@@ -48,18 +48,33 @@
 
 	/* -------------------------- helpers -------------------------- */
 
-	function uuid() {
-		return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
-			var r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
-			return v.toString(16);
-		});
-	}
+	const uuid = () => (typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+		const r = Math.random() * 16 | 0;
+		return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+	}));
 
 	/* -------------------------- URL param helpers -------------------------- */
 
-	// Allow override via ?ws_url=<wss://url:port> in page URL
+	// Allow override via ?ws_url=<wss://url:port> in page URL (restricted to known hosts)
 	const _urlParams = new URLSearchParams(window.location.search);
-	const _wsUrlOverride = _urlParams.get('ws_url');
+	let _wsUrlOverride = _urlParams.get('ws_url');
+	if (_wsUrlOverride) {
+		// Only allow if it's the same host as the default or an allowed test host
+		try {
+			const parsed = new URL(_wsUrlOverride);
+			const allowedHosts = ['mystage.interserver.net', 'localhost', '127.0.0.1'];
+			if (parsed.protocol !== 'wss:') {
+				console.warn('DC_WS: ws_url must use wss:// protocol, using default');
+				_wsUrlOverride = null;
+			} else if (!allowedHosts.includes(parsed.hostname)) {
+				console.warn('DC_WS: Invalid ws_url host, using default');
+				_wsUrlOverride = null;
+			}
+		} catch (e) {
+			console.warn('DC_WS: Invalid ws_url format, using default');
+			_wsUrlOverride = null;
+		}
+	}
 	const wsUrl = _wsUrlOverride || 'wss://mystage.interserver.net:7272';
 
 	// Default 30s. URL param ?ws_keepalive=<seconds> overrides (clamped 5-300s). // Example: ?ws_keepalive=60 → 60s interval
@@ -175,24 +190,33 @@
 			if (op.startsWith('dc.presence.')) {
 				if (!this._presenceBatch) this._presenceBatch = [];
 				this._presenceBatch.push({ op: op, data: data || {} });
-				// Fix #9: batch size cap - flush immediately if too many pending
-				if (this._presenceBatch.length > 100) {
-					this._flushPresence();
-					return;
-				}
-				// Fix #9: setTimeout fallback when tab is backgrounded (RAF doesn't fire)
-				const now = Date.now();
-				if (this._lastFlush && now - this._lastFlush > 500) {
-					this._flushPresence();
-					return;
-				}
+            // Fix #9: batch size cap - flush immediately if too many pending
+                if (this._presenceBatch.length > 100) {
+                    if (this._batchRaf) {
+                        cancelAnimationFrame(this._batchRaf);
+                        this._batchRaf = null;
+                    }
+                    this._flushPresence();
+                    return;
+                }
+                // Fix #9: setTimeout fallback when tab is backgrounded (RAF doesn't fire)
+                const now = Date.now();
+                if (this._lastFlush && now - this._lastFlush > 500) {
+                    if (this._batchRaf) {
+                        cancelAnimationFrame(this._batchRaf);
+                        this._batchRaf = null;
+                    }
+                    this._flushPresence();
+                    return;
+                }
 				this._lastFlush = now;
-				if (!this._batchRaf) {
-					const self = this;
-					this._batchRaf = requestAnimationFrame(function () {
-						self._flushPresence();
-					});
-				}
+			if (this._batchRaf) {
+				cancelAnimationFrame(this._batchRaf);
+			}
+			const self = this;
+			this._batchRaf = requestAnimationFrame(function () {
+				self._flushPresence();
+			});
 				return;
 			}
 			this._sendRaw({
@@ -228,6 +252,7 @@
 			try {
 				envelope = JSON.parse(raw);
 			} catch (e) {
+				console.warn('DC_WS: Failed to parse message:', raw?.substring?.(0, 100));
 				return;
 			}
 			var op = envelope.op;
@@ -344,12 +369,15 @@
 				clearInterval(this._keepaliveTimer);
 				this._keepaliveTimer = null;
 			}
-			// IDEA-1: cancel any pending presence batch flush
+			// IDEA-1: flush any pending presence batch before destroy
 			if (this._batchRaf) {
 				cancelAnimationFrame(this._batchRaf);
 				this._batchRaf = null;
-				this._presenceBatch = null;
 			}
+			if (this._presenceBatch && this._presenceBatch.length) {
+				this._flushPresence();
+			}
+			this._presenceBatch = null;
 			// IDEA-3: cancel any pending viewport throttle timer
 			if (this._viewportSendTimer) {
 				clearTimeout(this._viewportSendTimer);
