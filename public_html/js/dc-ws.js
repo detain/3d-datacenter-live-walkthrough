@@ -62,7 +62,7 @@
 		// Only allow if it's the same host as the default or an allowed test host
 		try {
 			const parsed = new URL(_wsUrlOverride);
-			const allowedHosts = ['mystage.interserver.net', 'localhost', '127.0.0.1'];
+			const allowedHosts = ['mystage.interserver.net'];
 			if (parsed.protocol !== 'wss:') {
 				console.warn('DC_WS: ws_url must use wss:// protocol, using default');
 				_wsUrlOverride = null;
@@ -151,7 +151,7 @@
 					self.reconnectAttempts++;
 					setTimeout(function () { self._connect(); }, self.reconnectDelay);
 					// exponential backoff: double each attempt, cap at 30s, then add jitter
-					self.reconnectDelay = Math.min(self.reconnectDelay * 2, 30000) + Math.random() * 500;
+					self.reconnectDelay = Math.min(self.reconnectDelay * 2, 30000) * (0.5 + Math.random() * 0.5);
 				} else if (!self.closedByUs) {
 					// exhausted reconnect attempts
 					self._setStatus('exhausted');
@@ -357,7 +357,7 @@
 					id: uuid(),
 					op: 'dc.viewport.update',
 					ts: Math.floor(Date.now() / 1000),
-					data: data
+					data: this._viewport
 				});
 			}, 500);
 		},

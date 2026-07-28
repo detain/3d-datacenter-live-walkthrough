@@ -30,6 +30,8 @@
  *   dc:v1-event       — {op, data} for dc.presence.joined/updated/left
  */
 
+import * as THREE from "/lib/three/build/three.module.js";
+
 (function () {
 	'use strict';
 
@@ -38,13 +40,11 @@
 	var THROTTLE_MS = 150;   // minimum interval between dc.presence.move sends
 	var LERP_SPEED  = 12;    // avatar position lerp factor per second (scene units)
 
-	/* -------------------------- shared geometry/materials (Fix 4) -------------------------- */
-	/* eslint-disable no-undef */
+	/* -------------------------- shared geometry/materials -------------------------- */
 	var AVATAR_BODY_GEO = new THREE.CylinderGeometry(0.12, 0.12, 0.28, 8);
 	var AVATAR_HEAD_GEO = new THREE.SphereGeometry(0.10, 12, 8);
 	var BODY_MAT = new THREE.MeshLambertMaterial({ color: 0x2255cc });
 	var HEAD_MAT = new THREE.MeshLambertMaterial({ color: 0xf0f4ff });
-	/* eslint-enable no-undef */
 
 	/* -------------------------- scene-ready flag (Fix 5) -------------------------- */
 	var _sceneReady = false;
@@ -531,23 +531,31 @@
 		if (sceneReady()) {
 			state.remote.forEach(function (entry) {
 				// Dispose cached name sprite texture+sprite (Fix 1)
-				if (entry.name && _nameSpriteCache.has(entry.name)) {
+				if (entry.name) {
 					var cached = _nameSpriteCache.get(entry.name);
-					cached.texture.dispose();
-					if (cached.sprite.material) cached.sprite.material.dispose();
-					_nameSpriteCache.delete(entry.name);
+					if (cached) {
+						cached.sprite.parent?.remove(cached.sprite);
+						cached.texture.dispose();
+						if (cached.sprite.material) cached.sprite.material.dispose();
+						_nameSpriteCache.delete(entry.name);
+						var idx = _nameSpriteCacheOrder.indexOf(entry.name);
+						if (idx !== -1) _nameSpriteCacheOrder.splice(idx, 1);
+					}
 				}
-				if (entry.group) window.DC.scene.remove(entry.group);
+				if (entry.group && entry.group.parent === window.DC.scene) {
+				entry.group.traverse(function(child) {
+					if (child.isSprite && child.material) {
+						if (child.material.map) {
+							child.material.map.dispose();
+						}
+						child.material.dispose();
+					}
+				});
+				window.DC.scene.remove(entry.group);
+				entry.group = null;
+			}
 			});
 		}
-		// Clear name sprite cache (Fix 1: dispose both texture and sprite material)
-		_nameSpriteCache.forEach(function (cached) {
-			cached.texture.dispose();
-			if (cached.sprite.material) cached.sprite.material.dispose();
-		});
-		_nameSpriteCache.clear();
-		_nameSpriteCacheOrder = [];
-
 		state.remote.clear();
 		state.uid  = null;
 		state.name = null;

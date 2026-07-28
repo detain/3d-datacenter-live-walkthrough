@@ -42,6 +42,32 @@ let _skipExpensiveUpdates = false;
 // IDEA-2: WebGL context loss state (set by context loss/restored event listeners in init())
 let _contextLost = false;
 let _sessionBackup = null;
+// Animation loop callback storage (Fix: module-level declaration for setAnimationLoop)
+let _animationLoopCb = null;
+// three.js WebGLAnimation re-arms requestAnimationFrame AFTER invoking the loop callback:
+//     onAnimationFrame() { animationLoop(time, frame); requestId = requestAnimationFrame(onAnimationFrame); }
+// so ONE exception escaping the callback permanently stops rendering — the scene freezes on the last
+// drawn frame with no console trace beyond the error itself, which looks exactly like "I clicked and
+// nothing happens". Always hand the renderer a guarded wrapper so a transient per-frame error costs one
+// frame instead of the whole session, and shout about it so the real bug is visible.
+let _loopErrorCount = 0;
+const _LOOP_ERROR_LOG_LIMIT = 10;
+function _guardLoop(cb) {
+    if (typeof cb !== 'function') return cb;
+    return function (time, frame) {
+        try {
+            cb(time, frame);
+        } catch (err) {
+            _loopErrorCount++;
+            if (_loopErrorCount <= _LOOP_ERROR_LOG_LIMIT) {
+                console.error('[dc] render-loop error #' + _loopErrorCount + ' (frame skipped, loop kept alive):', err);
+                if (_loopErrorCount === _LOOP_ERROR_LOG_LIMIT) {
+                    console.error('[dc] further render-loop errors will be counted in DC.loopErrors but not logged');
+                }
+            }
+        }
+    };
+}
 
 // --- requestIdleCallback polyfill (MAJOR-8: fix broken fallback) ---
 const _ric = requestIdleCallback
@@ -49,14 +75,14 @@ const _ric = requestIdleCallback
     : (cb) => setTimeout(cb, 2000);  // Safari lacks rIC; 2s delay is a reasonable idle guess
 
 // --- FPS monitoring for automatic quality scaling ---
+const FPS_WINDOW = 60;          // frames to average over (must be before ring buffer)
 // MAJOR-3: Use a ring buffer (fixed-size array + head index) for O(1) insert instead of O(n) Array.shift()
-const _fpsHistory = new Array(FPS_WINDOW);  // rolling window of frame times (ms)
+const _fpsHistory = new Array(FPS_WINDOW).fill(0);  // rolling window of frame times (ms)
 let _fpsHead = 0;                 // index of oldest slot (wraps around)
 let _fpsCount = 0;                // how many slots are filled (max FPS_WINDOW)
 let _lastFrameTime = 0;         // timestamp of last frame
 let _qualityDowngradeTime = 0;  // when we last downgraded (debounce guard)
 let _lastUpgradeTime = 0;       // when we last upgraded (debounce guard)
-const FPS_WINDOW = 60;          // frames to average over
 const FPS_TARGET = 55;          // FPS below this triggers a downgrade
 const FPS_RECOVERY = 65;        // FPS needed to suggest an upgrade
 const DOWNGRADE_COOLDOWN = 10000; // ms between downgrades (debounce)
@@ -325,7 +351,7 @@ function _autoQualityScale(now) {
     if (_fpsCount < FPS_WINDOW) return; // not enough data yet
 
     // MAJOR-3: Iterate over the correct ring buffer slots (not the whole array)
-    // Buffer is full: oldest is at _fpsHead, iterate all FPS_WINDOW slots in order
+    // Buffer is full: oldest is at _fpsHead, iterate all FPS_WINDOW slots in order (oldest → newest)
     let sum = 0;
     for (let i = 0; i < FPS_WINDOW; i++) {
         const idx = (_fpsHead + i) % FPS_WINDOW;
@@ -438,6 +464,7 @@ function displayDatacenter() {
     displaySwitches();
     buildCommunity(); // the other datacenters as exterior shells around this one
     spawnInside();    // place the player within the walls on load / location change
+    attachKeyHandlers(); // Bug #1: re-attach key handlers after scene rebuild
 }
 
 function setNetworkVisible(visible) {
@@ -592,8 +619,9 @@ function clearScene() {
     // Reset idle skip state (Bug #2: clearScene must not leave stale skip mode from a previous scene)
     _tickSkippedFrames = 0;
     _skipExpensiveUpdates = false;
-    // MINOR-5: Detach key handlers on scene clear to prevent stale listeners after location switch
-    detachKeyHandlers();
+    // NOTE: do NOT detachKeyHandlers() here. attachKeyHandlers() is already idempotent (guarded by
+    // keyHandlersAttached), so a rebuild could never stack duplicate listeners — detaching only opened a
+    // window where WASD was dead until something re-attached, which is worse than the problem it "fixed".
     rackColliders = []; // rebuilt as racks are re-placed
     // Reset spatial grids (Fix #3)
     for (const k in _rackGrid) delete _rackGrid[k];
@@ -638,6 +666,10 @@ function clearScene() {
     }
     for (const h of neighborBlinds) { if (h.inst) h.inst.dispose(); if (h.cords) h.cords.dispose(); } // free instanceMatrix; the meshes live in objects.community (disposed below)
     lodBuildings = []; dcBuildings = []; wallColliders = []; neighborBlinds = []; neighborDoors = []; roomDoors = []; roomSideDoors = [];
+    // The building spatial hash indexes the objects we just dropped. Leaving it populated makes
+    // collideWorld keep colliding against the PREVIOUS location's buildings (invisible walls), so it
+    // has to be cleared with lodBuildings, not only where it is rebuilt.
+    for (const k in _spatialGrid) delete _spatialGrid[k];
     // Instanced model meshes: detach + dispose the per-instance buffer. Their geometry and
     // material are the cached model templates in models.* (shared across rebuilds), so they
     // are kept; InstancedMesh.dispose() only frees the instanceMatrix buffer.
@@ -1141,7 +1173,13 @@ const _cdir2 = new THREE.Vector3();
 
 function makeRng(seed) {
     // deterministic per-cable RNG (so sag is varied but stable across rebuilds)
-    let s = (seed >>> 0) || 1;
+    let s = (seed >>> 0);
+    if (s === 0) {
+        // Hash the seed string to get a non-zero value, preserving some entropy
+        const str = String(seed);
+        for (let i = 0; i < str.length; i++) s = Math.imul(s ^ str.charCodeAt(i), 2660689);
+        s = (s >>> 0) || 1;
+    }
     return () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s / 4294967296; };
 }
 
@@ -2127,8 +2165,12 @@ function collideWorld(x, z, r) {
 	// Fallback: if grid is empty (shouldn't happen), fall back to full scan
 	if (nearbySet.size === 0) for (const nb of lodBuildings) nearbySet.add(nb);
 	for (const b of nearbySet) {
+		if (!b) continue;
 		if (x < b.minX - r - 1 || x > b.maxX + r + 1 || z < b.minZ - r - 1 || z > b.maxZ + r + 1) continue; // far from this plot -> skip its interior
-		const cols = b.full ? b.full.colliders : b.blockColliders;
+		// A neighbour mid-swap (enterFull/exitFull run from async model loads, between frames) can be
+		// missing its collider list. collideWorld is called from the render loop, and an exception there
+		// kills the loop outright, so never assume the array is there.
+		const cols = (b.full ? b.full.colliders : b.blockColliders) || [];
 		for (let i = 0; i < cols.length; i++) if (hit(cols[i])) return true;
 	}
 	return false;
@@ -2513,6 +2555,10 @@ function spawnInside() {
     camera.position.set(sx, eyeHeight(), sz);
     camera.lookAt(roomSpawn.lookX, eyeHeight(), roomSpawn.lookZ);
     velocity.set(0, 0, 0);
+    // Tell the third-person overlay (dc-multi.js) where the camera landed so it can bring the
+    // character along. NOTE: `S` in this file is the quality-settings object, not dc-multi's state,
+    // so poking S.player here silently does nothing — this event is the only working channel.
+    document.dispatchEvent(new CustomEvent('dc:respawn', { detail: { x: sx, z: sz } }));
     // IDEA-3: notify server of viewport after spawn/camera move
     if (window.DC_WS && window.DC_WS._updateViewport) {
         const dir = new THREE.Vector3();
@@ -2531,7 +2577,7 @@ function spawnInside() {
 // Scan the open margin band around the racks for the first spot a player of radius r fits.
 function findOpenSpawn(r) {
     if (!roomBounds) return null;
-    const m = ROOM_MARGIN, step = 4;
+    const m = ROOM_MARGIN, step = 2; // Bug #4: reduced step from 4 to 2 for finer sampling
     for (const z of [roomBounds.maxZ - m * 0.5, roomBounds.minZ + m * 0.5]) {  // along the z walls
         for (let x = roomBounds.minX + m; x <= roomBounds.maxX - m; x += step) {
             if (!collidesAt(x, z, r)) return { x, z };
@@ -2542,7 +2588,18 @@ function findOpenSpawn(r) {
             if (!collidesAt(x, z, r)) return { x, z };
         }
     }
-    return { x: (roomBounds.minX + roomBounds.maxX) / 2, z: (roomBounds.minZ + roomBounds.maxZ) / 2 };
+    // Bug #2: center fallback - verify it's not colliding before using it
+    const cx = (roomBounds.minX + roomBounds.maxX) / 2;
+    const cz = (roomBounds.minZ + roomBounds.maxZ) / 2;
+    if (!collidesAt(cx, cz, r)) return { x: cx, z: cz };
+    // Center also colliding - iterate at finer granularity to find a valid spot
+    const fineStep = 1;
+    for (let z = roomBounds.minZ + m; z <= roomBounds.maxZ - m; z += fineStep) {
+        for (let x = roomBounds.minX + m; x <= roomBounds.maxX - m; x += fineStep) {
+            if (!collidesAt(x, z, r)) return { x, z };
+        }
+    }
+    return null; // no valid spawn found - caller should handle null return
 }
 
 let keyHandlersAttached = false;
@@ -2584,6 +2641,7 @@ function setupControls() {
             blocker.style.display = "none";
             // stop any in-progress demo fly + reset motion so the first movement frame doesn't jolt
             flyTo.active = false;
+            flyTo.t = 0;
             velocity.set(0, 0, 0);
             prevTime = performance.now();
             // if locked from a demo view that left us outside the walls, up high, or INSIDE a rack
@@ -2752,6 +2810,7 @@ function flyTransition(toLoc) {
     flyTo.onDone = () => {
         options.location = toLoc;
         displayDatacenter();                                 // rebuild the new location (spawns inside)
+        attachKeyHandlers(); // Bug #1: re-attach key handlers after fly transition rebuild
         const s = roomSpawn || { x: 0, z: 0, lookX: 0, lookZ: 0 };
         camera.position.set(s.x, 175, s.z);                  // start high above the new building...
         flyTo.from.copy(camera.position);
@@ -2967,7 +3026,7 @@ function init() {
     maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
 
     // IDEA-2: WebGL context loss handling
-    let _animationLoopCb = animate;  // stored callback; honoured on restore
+    _animationLoopCb = animate;  // stored callback; honoured on restore
 
     function _backupSession() {
         _sessionBackup = {
@@ -3065,7 +3124,7 @@ function init() {
                 _reconnectAndRejoin(_sessionBackup);
             }
         }
-        renderer.setAnimationLoop(_animationLoopCb);
+        renderer.setAnimationLoop(_guardLoop(_animationLoopCb));
         _hideContextLostOverlay();
         document.dispatchEvent(new CustomEvent('dc:context-restored', { bubbles: true }));
     }, false);
@@ -3081,7 +3140,22 @@ function init() {
     const instructionsEl = document.getElementById("instructions");
     if (instructionsEl) {
         instructionsEl.addEventListener("click", function () {
-            if (controls && typeof controls.lock === "function") controls.lock();
+            if (!controls || typeof controls.lock !== "function") return;
+            // Pointer lock needs a focused document. Browser extensions can hold focus in their own
+            // frame, which makes requestPointerLock reject with "The document is not focused" — try
+            // to take focus back first, then proceed either way.
+            try { document.body.focus(); } catch (e) { /* body may not be focusable; harmless */ }
+            try {
+                // lock() returns a Promise in newer PointerLockControls, undefined in older ones.
+                const lockResult = controls.lock();
+                if (lockResult && typeof lockResult.catch === 'function') {
+                    lockResult.catch(function (err) {
+                        console.warn('[dc] pointer lock rejected:', err && err.message);
+                    });
+                }
+            } catch (err) {
+                console.warn('[dc] pointer lock failed:', err && err.message);
+            }
         });
     }
     // Load floor
@@ -3112,7 +3186,7 @@ function animate() {
         controls.update( clock.getDelta() );
     } else {
         // Update controls if locked
-        if (controls.isLocked === true) {
+        if (controls.isLocked === true && !flyTo.active) {
             updateControls(now);
         }
     }
@@ -3285,6 +3359,14 @@ window.DC = {
         updateRoomDoors();
         updateLOD();
         updateGuiPos();
+        // DRAW THE FRAME. dc-multi.js delegates its whole frame to this tick ("...and the actual
+        // render"), so this call is the only thing painting the canvas once the third-person overlay
+        // takes over the animation loop from animate(). When the idle-skip fast path was added, this
+        // render was MOVED into that branch rather than duplicated, which left the normal path
+        // updating everything and drawing nothing: the scene silently froze on the last frame
+        // animate() had drawn, while the camera, player, doors and location switches all kept
+        // updating invisibly. Keep this here.
+        renderer.render(scene, camera);
         if (stats) stats.update();
         if (++_tickSkippedFrames > _IDLE_FRAME_THRESHOLD) _skipExpensiveUpdates = true;
         return renderer.info.render.calls;
@@ -3302,17 +3384,28 @@ window.DC = {
     get roomBounds() { return roomBounds; },
     get roomSpawn() { return roomSpawn; },
     // --- automatic quality scaling state (read-only snapshot; mutating S directly applies immediately) ---
-    get quality() { return { ...S, _fps: _fpsHistory.length >= FPS_WINDOW ? Math.round(1000 / (_fpsHistory.reduce((a, b) => a + b, 0) / _fpsHistory.length)) : null }; },
+    get quality() {
+        if (_fpsCount < FPS_WINDOW) return { ...S, _fps: null };
+        let fpsSum = 0;
+        for (let i = 0; i < _fpsCount; i++) {
+            const idx = (_fpsHead + i) % FPS_WINDOW;
+            fpsSum += _fpsHistory[idx];
+        }
+        const _fps = Math.round(1000 / (fpsSum / _fpsCount));
+        return { ...S, _fps };
+    },
     // --- multi-building LOD + walk-between handles (used by dc-multi.js; inert for dc.html) ---
     collideWorld: collideWorld,                 // walls + current racks + neighbours' active interiors
     get buildings() { return dcBuildings; },    // wall/door rects for every building (current + neighbours)
     setLodFocus: function (x, z) { lodFocus = { x, z }; _tickSkippedFrames = 0; _skipExpensiveUpdates = false; },   // dc-multi feeds the player ground pos each frame
     setAnimationLoop: function (cb) {
         _animationLoopCb = cb || animate;
-        if (renderer) renderer.setAnimationLoop(_animationLoopCb);
+        if (renderer) renderer.setAnimationLoop(_guardLoop(_animationLoopCb));
     },
+    get loopErrors() { return _loopErrorCount; },
     lodState: function () { return lodBuildings.map((b) => ({ id: b.id, full: !!b.full, loading: b.loading, dist: Math.round(b._dist) })); },
 };
 
 init();
-renderer.setAnimationLoop(animate);
+_animationLoopCb = animate;
+renderer.setAnimationLoop(_guardLoop(animate));

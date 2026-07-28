@@ -31,7 +31,7 @@ let pixelScale = 0.8;  // quality scale factor for renderer pixel ratio (module-
 // Pixel scale setter — clamps to slider range and syncs renderer pixel ratio
 function setPixelScale(v) {
     pixelScale = Math.min(Math.max(v, 0.5), 1.0); // clamp to slider range [0.5, 1.0]
-    if (S && S.renderer) S.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2) * pixelScale);
+    if (S.DC && S.DC.renderer) S.DC.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2) * pixelScale);
     if (S) S.pixelScale = pixelScale;
 }
 
@@ -52,6 +52,11 @@ const S = {
   facing: 0,                      // character yaw (radians)
   gestureUntil: 0,                // ms timestamp; while > now a gesture overrides locomotion
   spawned: false,
+  // Last camera position WE set (placeCamera/trySpawn). Lets syncPlayerFromCamera tell a plain re-lock
+  // (camera still ours -> keep the character put) from a lock out of the idle demo (camera hijacked by
+  // dc.js's view presets -> the character must not be teleported there).
+  camPlaced: new THREE.Vector3(),
+  camPlacedValid: false,
   camDist: 11,                    // third-person follow distance (scene units)
   pixelScale,                     // exposed for GUI control
   fov: 75,                        // camera field of view (degrees), adjustable via GUI
@@ -123,9 +128,17 @@ whenReady(async () => {
   setupInput();
   applyMode();                                    // sets visibility for the starting mode
   // Re-sync the player anchor whenever pointer-lock engages (dc may have re-spawned the camera).
-  S.controls.addEventListener && S.controls.addEventListener("lock", syncPlayerFromCamera);
-  S.controls.addEventListener && S.controls.addEventListener("unlock", function () {
+  S.controls.addEventListener("lock", syncPlayerFromCamera);
+  S.controls.addEventListener("unlock", function () {
     if (typeof window.DC_PRESENCE_LEAVE === 'function') window.DC_PRESENCE_LEAVE();
+  });
+  // dc.js re-spawns the camera on its own (lock from a demo view, location switch). Follow it so the
+  // character never gets left behind in the previous room.
+  document.addEventListener('dc:respawn', function (e) {
+    const d = (e && e.detail) || {};
+    if (typeof d.x !== 'number' || typeof d.z !== 'number') return;
+    S.player.position.set(d.x, 0, d.z);
+    S.vy = 0; S.spawned = true;
   });
   // Take over the loop: drive the player, then let dc render (flyTo + highlight + labels + render).
   if (S.DC.setAnimationLoop) S.DC.setAnimationLoop(frame);
@@ -180,11 +193,19 @@ async function loadCharacter(ch) {
     S.mixer = null;
   }
   S.model = null;
+  S.modelLoadFailed = false;
   S.headBone = null;
 
   log("loading character", ch.name, ch.model);
   const cb = (S.manifest && S.manifest.generated_at) ? ('?m=' + encodeURIComponent(S.manifest.generated_at)) : '';
-  const gltf = await S.loader.loadAsync(ch.model + cb);
+  try {
+    var gltf = await S.loader.loadAsync(ch.model + cb);
+  } catch (e) {
+    S.modelLoadFailed = true;
+    console.error("[dc-multi] model load failed:", e);
+    hud("Character model failed to load — movement enabled without character");
+    return;
+  }
   const root = gltf.scene;
   root.traverse(o => { if (o.isMesh) { o.castShadow = true; o.frustumCulled = false; } });
 
@@ -281,8 +302,12 @@ function frame() {
   // open), the current building's racks, and each neighbour's active interior (blocks, or full racks
   // once swapped) — so you can leave, cross the streets, and walk into another building. The current
   // building's openable front door is the one exception: its gap is always-open in collideWorld, so we
-  // re-close it here while the door is shut.
-  if (moving && S.model) {
+  // re-close it here while the door is shut. Movement is SKIPPED when the model is not yet loaded to
+  // prevent position desync (player's accumulated movement would otherwise "teleport" the model when
+  // it finally appears).
+  if (moving && !S.model && !S.modelLoadFailed) {
+    /* model still streaming in — hold position so it doesn't pop in mid-stride */
+  } else if (moving) {
     const world = S.DC.collideWorld;
     const blocked = (bx, bz) => {
       if (currentDoorShutBlocks(bx, bz, rad)) return true;
@@ -308,7 +333,8 @@ function frame() {
   }
 
   // Throttled presence update — dc-presence.js enforces the 250ms throttle internally
-  if (typeof window.DC_PRESENCE_MOVE === 'function') {
+  // Bug #3: only send moves if DC_PRESENCE_ENABLED is not false (join must have succeeded first)
+  if (typeof window.DC_PRESENCE_MOVE === 'function' && window.DC_PRESENCE_ENABLED !== false) {
     window.DC_PRESENCE_MOVE(S.player.position.x, S.player.position.z, S.facing);
   }
 
@@ -346,6 +372,8 @@ function placeCamera() {
       if (Math.hypot(_dir.x, _dir.z) > 0.05) S.facing = S.player.rotation.y = Math.atan2(_dir.x, _dir.z);
     }
     if (S.headBone) S.headBone.scale.setScalar(1e-4);
+    S.camPlaced.copy(S.camera.position);
+    S.camPlacedValid = true;
     return;
   }
   // third person: orbit behind the player along the current look direction
@@ -365,9 +393,16 @@ function placeCamera() {
     dist = S.camDist;
     const collide = S.DC.collideWorld || S.DC.collidesAt, rad = (S.DC.playerRadius ? S.DC.playerRadius() : 1.0);
     if (collide) {
+      // collideWorld deliberately leaves the front doorway GAP open so you can walk out. That means a
+      // player standing in the doorway had nothing to stop the camera reeling back THROUGH the shut
+      // door — it ended up outside the building staring at the door, which reads as "clicking did
+      // nothing". Block on the shut door and on leaving the room, exactly like movement does.
+      const inside = insideRoom(S.player.position.x, S.player.position.z, 0);
       for (let d = 2; d <= S.camDist; d += 1.5) {
         const cx = _head.x - _dir.x * d, cz = _head.z - _dir.z * d;
-        if (collide(cx, cz, rad * 0.6)) { dist = Math.max(2.5, d - 1.5); break; }
+        if (collide(cx, cz, rad * 0.6)
+          || currentDoorShutBlocks(cx, cz, rad * 0.6)
+          || (inside && !insideRoom(cx, cz, rad * 0.6))) { dist = Math.max(2.5, d - 1.5); break; }
       }
     }
     _lastSafeDist = dist;
@@ -382,6 +417,8 @@ function placeCamera() {
   // Pull back along the view dir, and ALSO rise with distance so zooming out lifts to a high/far view.
   _camTarget.set(_head.x - _dir.x * dist, _head.y - _dir.y * dist + dist * CAM_UP_RATIO, _head.z - _dir.z * dist);
   S.camera.position.lerp(_camTarget, 0.3);
+  S.camPlaced.copy(S.camera.position);   // remember it's ours, so a re-lock doesn't respawn the player
+  S.camPlacedValid = true;
 }
 
 // ---------------------------------------------------------------- helpers
@@ -500,6 +537,7 @@ function updateDoor(dt) {
 }
 
 function trySpawn(x, z, facing) {
+  if (!S.DC.roomSpawn) { S.spawned = true; return; }
   // Use passed values or fall back to roomSpawn
   const spawnX = (x !== undefined) ? x : S.DC.roomSpawn.x;
   const spawnZ = (z !== undefined) ? z : S.DC.roomSpawn.z;
@@ -524,6 +562,8 @@ function trySpawn(x, z, facing) {
   const eye = S.DC.eyeHeight ? S.DC.eyeHeight() : 15;
   S.camera.position.set(spawnX - Math.sin(S.facing) * S.camDist, eye * 0.95 + 3, spawnZ - Math.cos(S.facing) * S.camDist);
   S.camera.lookAt(spawnX, eye * 0.95, spawnZ);
+  S.camPlaced.copy(S.camera.position);
+  S.camPlacedValid = true;
   S.spawned = true;
   log("spawned player at", spawnX.toFixed(1), spawnZ.toFixed(1));
   if (typeof window.DC_PRESENCE_JOIN === 'function' && window.DC_PRESENCE_ENABLED !== false) {
@@ -531,10 +571,42 @@ function trySpawn(x, z, facing) {
   }
 }
 
+// Is (x,z) inside the current building's walls, with `pad` of clearance?
+function insideRoom(x, z, pad) {
+  const b = S.DC.roomBounds;
+  if (!b) return false;
+  return x - pad > b.minX && x + pad < b.maxX && z - pad > b.minZ && z + pad < b.maxZ;
+}
+
+// A spot is playable if the character fits there AND there is room behind the head for the
+// third-person camera. Standing in the shut doorway satisfies the first but not the second.
+function playableSpot(x, z) {
+  const rad = S.DC.playerRadius ? S.DC.playerRadius() : 1.0;
+  const collide = S.DC.collideWorld || S.DC.collidesAt;
+  if (collide && collide(x, z, rad)) return false;
+  if (currentDoorShutBlocks(x, z, rad)) return false;
+  // Outside the building is legitimate roaming — only enforce camera clearance while indoors.
+  if (!insideRoom(x, z, 0)) return true;
+  return insideRoom(x, z, CAM_MIN);
+}
+
+// Pointer lock just engaged. The camera may be ours (a re-lock after Escape, so leave the character
+// where it stands) or it may have been parked somewhere by dc.js's idle "attract mode" demo, which
+// glides the camera through preset views. Blindly adopting the demo camera's spot used to teleport the
+// character into the front doorway / against a rack — from there the follow camera had nowhere to go
+// and the screen barely changed, which is what "clicking only clears the overlay" looked like.
 function syncPlayerFromCamera() {
-  S.player.position.x = S.camera.position.x;
-  S.player.position.z = S.camera.position.z;
-  S.player.position.y = 0; S.vy = 0; S.spawned = true;
+  const cam = S.camera.position;
+  const ours = S.camPlacedValid && cam.distanceToSquared(S.camPlaced) < 1;
+  if (ours) { S.player.position.y = 0; S.vy = 0; S.spawned = true; return; }
+  if (playableSpot(cam.x, cam.z)) {
+    S.player.position.set(cam.x, 0, cam.z);
+    S.vy = 0; S.spawned = true;
+    return;
+  }
+  // Demo camera left us somewhere unplayable — drop in at the room's proper spawn instead.
+  S.vy = 0;
+  trySpawn();
 }
 
 function lerpAngle(a, b, t) {
