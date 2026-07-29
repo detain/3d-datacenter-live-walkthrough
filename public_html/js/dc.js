@@ -3255,9 +3255,9 @@ function resetDisco() {   // back to plain white (disco toggled off)
                 dl.light.intensity = DISCO_LIGHT_NORMAL;
                 dl.nextPulse = 0;
                 dl.color.set(1, 1, 1);
+                // Detach Lensflare so it's hidden when disco is toggled back on
                 if (dl.light.children[0] instanceof Lensflare) {
-                    const lf = dl.light.children[0];
-                    for (const elem of lf.elements) elem.color.set(1, 1, 1);
+                    dl.light.remove(dl.light.children[0]);
                 }
             }
         }
