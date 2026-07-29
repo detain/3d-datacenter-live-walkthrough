@@ -2335,9 +2335,11 @@ function buildNeighborInterior(group, b) {
 	if (housings.length) { const m = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(housings), new THREE.MeshStandardMaterial({ color: 0x2c2f35, roughness: 0.6, metalness: 0.3 })); housings.forEach((g) => g.dispose()); group.add(m); }
 	let nbBulbDisco = null;
 	if (bulbs.length) { const m = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(bulbs), new THREE.MeshBasicMaterial({ color: 0xffffff })); bulbs.forEach((g) => g.dispose()); group.add(m); nbBulbDisco = makeBulbDisco(m, bulbs.length); }
-	// Disco PointLights — one per fixture slot
+	// Disco PointLights — one per fixture slot (CAPPED to MAX_NEIGHBOR_DISCO_LIGHTS for performance)
 	const discoLights = [];
-	for (const s of slots) {
+	const neighborLightStep = Math.max(1, Math.floor(slots.length / MAX_NEIGHBOR_DISCO_LIGHTS));
+	for (let i = 0; i < slots.length && discoLights.length < MAX_NEIGHBOR_DISCO_LIGHTS; i += neighborLightStep) {
+		const s = slots[i];
 		const light = new THREE.PointLight(0xffffff, DISCO_LIGHT_NORMAL, DISCO_LIGHT_DIST, DISCO_LIGHT_DECAY);
 		light.position.set(s.x, bulbY, s.z);
 		group.add(light);
@@ -2544,9 +2546,11 @@ function buildRoom() {
 	housings.forEach((g) => g.dispose()); ceiling.add(housingMesh);
 	let roomBulbDisco = null;
 	if (bulbs.length) { const bulbMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(bulbs), new THREE.MeshBasicMaterial({ color: 0xffffff })); bulbs.forEach((g) => g.dispose()); ceiling.add(bulbMesh); roomBulbDisco = makeBulbDisco(bulbMesh, bulbs.length); }
-	// Disco PointLights for main room — one per fixture slot
+	// Disco PointLights for main room — CAPPED to MAX_ROOM_DISCO_LIGHTS for performance (PointLights are expensive)
 	const roomDiscoLights = [];
-	for (const s of slots) {
+	const roomLightStep = Math.max(1, Math.floor(slots.length / MAX_ROOM_DISCO_LIGHTS));
+	for (let i = 0; i < slots.length && roomDiscoLights.length < MAX_ROOM_DISCO_LIGHTS; i += roomLightStep) {
+		const s = slots[i];
 		const light = new THREE.PointLight(0xffffff, DISCO_LIGHT_NORMAL, DISCO_LIGHT_DIST, DISCO_LIGHT_DECAY);
 		light.position.set(s.x, bulbY, s.z);
 		ceiling.add(light);
@@ -3011,6 +3015,12 @@ const DISCO_LIGHT_MIN = 0.3;       // breathing dim floor
 const DISCO_LIGHT_MAX = 4.0;       // breathing bright ceiling
 const DISCO_LIGHT_DIST = 22;       // falloff distance (scene units)
 const DISCO_LIGHT_DECAY = 2;       // physically correct 1/d² decay
+
+// PERFORMANCE FIX: Cap active PointLights per building to prevent GPU overload
+// PointLights are extremely expensive in Three.js (per-pixel lighting calculations)
+// 165+ lights × every frame = massive GPU/CPU load causing browser lockup
+const MAX_ROOM_DISCO_LIGHTS = 8;      // max PointLights in main room
+const MAX_NEIGHBOR_DISCO_LIGHTS = 4;  // max PointLights per neighbor building
 
 // Procedural lens flare textures (no external files needed)
 function _makeFlareTexture(size, innerAlpha = 0.9, outerAlpha = 0.0, color = [255, 255, 255]) {
