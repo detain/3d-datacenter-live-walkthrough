@@ -61,6 +61,10 @@ const S = {
   pixelScale,                     // exposed for GUI control
   fov: 75,                        // camera field of view (degrees), adjustable via GUI
   powerPreference: 'high-performance', // GPU power preference (display-only; set at renderer creation)
+  // Presence update deduplication — only send DC_PRESENCE_MOVE when position or facing changes
+  _lastPresenceX: null,
+  _lastPresenceZ: null,
+  _lastPresenceF: null,
 };
 
 // movement tuning (scene units/sec). dc.js's own walk terminal speed is ~40 u/s; match-ish.
@@ -380,12 +384,16 @@ function frame() {
     if (S.model) S.player.rotation.y = S.facing;
   }
 
-  // Throttled presence update — dc-presence.js enforces the 250ms throttle internally
-  // Bug #3: only send moves if DC_PRESENCE_ENABLED is not false (join must have succeeded first)
-  // MAJOR-10: only send if model is loaded
+  // Throttled presence update — only send when position or facing actually changes
   if (typeof window.DC_PRESENCE_MOVE === 'function' && window.DC_PRESENCE_ENABLED !== false) {
     if (S.model && !S.modelLoadFailed) {
-      window.DC_PRESENCE_MOVE(S.player.position.x, S.player.position.z, S.facing);
+      const px = S.player.position.x, pz = S.player.position.z, f = S.facing;
+      // Rounded comparison to avoid floating-point noise triggering updates
+      const kx = px.toFixed(2), kz = pz.toFixed(2), kf = f.toFixed(3);
+      if (kx !== S._lastPresenceX || kz !== S._lastPresenceZ || kf !== S._lastPresenceF) {
+        S._lastPresenceX = kx; S._lastPresenceZ = kz; S._lastPresenceF = kf;
+        window.DC_PRESENCE_MOVE(px, pz, f);
+      }
     }
   }
 
