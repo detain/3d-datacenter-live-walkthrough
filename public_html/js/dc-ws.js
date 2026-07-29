@@ -37,7 +37,7 @@
  * ---------------------------------------------------------------------------
  *   dc:connected     — socket opened, auth.hello sent
  *   dc:disconnected  — socket closed (after reconnect exhaustion or destroy)
- *   dc:auth-success  — auth.welcome received; detail = {uid, name, session, hub_time}
+ *   dc:auth-success  — auth.welcome received; detail = {uid, clientId, name, session, hub_time}
  *   dc:auth-failure   — auth.rejected received; detail = {error:{code,message}}
  *   dc:v1-event       — any incoming dc.*, channel.*, chat.* op;
  *                       detail = {op, data} (the raw envelope sans v/version)
@@ -317,8 +317,17 @@
 				this.authed = true;
 				window.DC_AUTHED = true;
 				window.DC_UID = data.uid;
+				/**
+				 * Unique identifier for this WebSocket connection (this browser tab).
+				 * Used to distinguish multiple tabs sharing the same session (same uid).
+				 * Stored per-connection, not per-user, enabling multi-tab presence awareness.
+				 * Falls back to uid if server does not assign a separate clientId.
+				 * @type {number|string}
+				 */
+				window.DC_CLIENT_ID = data.clientId || data.uid;
 				window.DC_PRESENCE = {
 					uid: data.uid,
+					clientId: window.DC_CLIENT_ID,
 					name: data.name,
 					session: data.session,
 					hub_time: data.hub_time
@@ -504,7 +513,7 @@
 			return;
 		}
 		if (window.DC_WS && window.DC_WS.connected()) {
-			window.DC_WS.send('dc.presence.move', { x: x, z: z, facing: facing });
+			window.DC_WS.send('dc.presence.move', { x: x, z: z, facing: facing, clientId: window.DC_CLIENT_ID });
 		}
 	};
 

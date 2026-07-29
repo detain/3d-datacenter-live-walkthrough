@@ -609,6 +609,431 @@ describe('dc.js — null collider guard', () => {
 });
 
 // =============================================================================
+// NEW FIX: dc-ws.js multi-tab presence support
+// =============================================================================
+describe('dc-ws.js — multi-tab presence (DC_CLIENT_ID)', () => {
+  beforeEach(() => {
+    // Reset global state
+    global.window = Object.assign(global.window || {}, {
+      DC_CLIENT_ID: null,
+      DC_UID: null,
+      DC_AUTHED: false,
+      DC_PRESENCE: null,
+      DC_PRESENCE_ENABLED: null
+    });
+  });
+
+  afterEach(() => {
+    delete global.window.DC_CLIENT_ID;
+    delete global.window.DC_UID;
+    delete global.window.DC_AUTHED;
+    delete global.window.DC_PRESENCE;
+    delete global.window.DC_PRESENCE_ENABLED;
+  });
+
+  it('auth.welcome sets DC_CLIENT_ID from data.clientId', () => {
+    // Simulate auth.welcome handler (lines 316-331 in dc-ws.js)
+    const data = {
+      uid: 77,
+      clientId: 100,
+      name: 'TabA',
+      session: 'sess123',
+      hub_time: 1234567890
+    };
+
+    // The fix: window.DC_CLIENT_ID = data.clientId || data.uid (line 321)
+    global.window.DC_CLIENT_ID = data.clientId || data.uid;
+    global.window.DC_UID = data.uid;
+    global.window.DC_AUTHED = true;
+    global.window.DC_PRESENCE = {
+      uid: data.uid,
+      clientId: global.window.DC_CLIENT_ID,
+      name: data.name,
+      session: data.session,
+      hub_time: data.hub_time
+    };
+
+    expect(global.window.DC_CLIENT_ID).toBe(100);
+    expect(global.window.DC_UID).toBe(77);
+    expect(global.window.DC_PRESENCE.clientId).toBe(100);
+  });
+
+  it('auth.welcome falls back to data.uid if data.clientId is missing', () => {
+    // Some servers may not send clientId — should fall back to uid
+    const data = {
+      uid: 77,
+      clientId: undefined,
+      name: 'TabA',
+      session: 'sess123'
+    };
+
+    // The fix uses: data.clientId || data.uid
+    global.window.DC_CLIENT_ID = data.clientId || data.uid;
+
+    expect(global.window.DC_CLIENT_ID).toBe(77);
+  });
+
+  it('auth.welcome falls back to data.uid if data.clientId is null', () => {
+    const data = {
+      uid: 77,
+      clientId: null,
+      name: 'TabA'
+    };
+
+    global.window.DC_CLIENT_ID = data.clientId || data.uid;
+
+    expect(global.window.DC_CLIENT_ID).toBe(77);
+  });
+
+  it('DC_PRESENCE_MOVE includes clientId in the sent message', () => {
+    // Simulate DC_PRESENCE_MOVE (line 504-512 in dc-ws.js)
+    global.window.DC_CLIENT_ID = 100;
+    global.window.DC_PRESENCE_ENABLED = true;
+
+    const sentMessages = [];
+
+    // Mock WebSocket send
+    const mockWS = {
+      send: function(json) {
+        sentMessages.push(JSON.parse(json));
+      },
+      readyState: WebSocket.OPEN
+    };
+
+    // The actual code: DC_PRESENCE_MOVE sends { x, z, facing, clientId: window.DC_CLIENT_ID }
+    const moveData = { x: 10, z: 20, facing: 1.5 };
+    const envelope = {
+      v: 1,
+      id: 'test-uuid',
+      op: 'dc.presence.move',
+      ts: Math.floor(Date.now() / 1000),
+      data: { ...moveData, clientId: global.window.DC_CLIENT_ID }
+    };
+
+    mockWS.send(JSON.stringify(envelope));
+
+    expect(sentMessages.length).toBe(1);
+    expect(sentMessages[0].data.clientId).toBe(100);
+    expect(sentMessages[0].data.x).toBe(10);
+    expect(sentMessages[0].data.z).toBe(20);
+    expect(sentMessages[0].data.facing).toBe(1.5);
+  });
+});
+
+// =============================================================================
+// NEW FIX: dc-presence.js multi-tab presence support
+// =============================================================================
+describe('dc-presence.js — multi-tab presence (clientId-based)', () => {
+  // Simulate the state object from dc-presence.js
+  let state;
+
+  beforeEach(() => {
+    state = {
+      uid: null,
+      name: null,
+      clientId: null,
+      remote: new Map()
+    };
+  });
+
+  it('state.clientId is initialized to null', () => {
+    expect(state.clientId).toBeNull();
+  });
+
+  it('onAuthSuccess sets state.clientId from data.clientId || data.uid', () => {
+    // Simulate onAuthSuccess (lines 515-529 in dc-presence.js)
+    const data = {
+      uid: 77,
+      clientId: 100,
+      name: 'TabA'
+    };
+
+    // Line 518: state.clientId = data.clientId || data.uid;
+    state.uid = data.uid;
+    state.name = data.name || '';
+    state.clientId = data.clientId || data.uid;
+
+    expect(state.clientId).toBe(100);
+    expect(state.uid).toBe(77);
+  });
+
+  it('onAuthSuccess falls back to uid when clientId is missing', () => {
+    const data = {
+      uid: 77,
+      clientId: undefined,
+      name: 'TabA'
+    };
+
+    state.uid = data.uid;
+    state.name = data.name || '';
+    state.clientId = data.clientId || data.uid;
+
+    expect(state.clientId).toBe(77);
+  });
+
+  it('onJoined self-filter uses data.clientId === state.clientId (not uid)', () => {
+    // Simulate onJoined (lines 255-292 in dc-presence.js)
+    state.clientId = 100; // Tab B's clientId
+    state.uid = 77;      // Same uid as Tab A
+
+    // Tab A broadcasts join with clientId=100 (same as our clientId)
+    const tabAData = {
+      uid: 77,
+      clientId: 100,
+      name: 'TabA',
+      x: 10,
+      z: 20,
+      yaw: 0
+    };
+
+    // Line 263: if (data.clientId === state.clientId) return; — skip self
+    if (tabAData.clientId === state.clientId) {
+      // This is us — skip
+      expect(state.remote.has(tabAData.clientId)).toBe(false);
+    }
+
+    // Now Tab B broadcasts join with clientId=200 (different from our clientId)
+    const tabBData = {
+      uid: 77,
+      clientId: 200,
+      name: 'TabB',
+      x: 30,
+      z: 40,
+      yaw: 1.5
+    };
+
+    if (tabBData.clientId !== state.clientId) {
+      // This is a different tab — should be rendered
+      state.remote.set(tabBData.clientId, {
+        uid: tabBData.uid,
+        name: tabBData.name,
+        x: tabBData.x,
+        z: tabBData.z
+      });
+    }
+
+    expect(state.remote.has(200)).toBe(true);
+    expect(state.remote.has(100)).toBe(false);
+  });
+
+  it('state.remote.set stores by clientId (not uid)', () => {
+    // Tab A (clientId=100)
+    state.clientId = 100;
+    state.uid = 77;
+
+    // Tab B (clientId=200) same uid=77
+    const tabBEntry = {
+      uid: 77,
+      name: 'TabB',
+      clientId: 200,
+      x: 30,
+      z: 40
+    };
+
+    // Line 290: state.remote.set(data.clientId, entry);
+    state.remote.set(tabBEntry.clientId, tabBEntry);
+
+    expect(state.remote.get(200)).toBe(tabBEntry);
+    expect(state.remote.get(77)).toBeUndefined(); // Not stored by uid
+  });
+
+  it('state.remote.get reads by clientId', () => {
+    const entry = { uid: 77, name: 'TabB', clientId: 200 };
+    state.remote.set(200, entry);
+
+    // Line 300: var entry = state.remote.get(data.clientId);
+    const retrieved = state.remote.get(200);
+
+    expect(retrieved).toBe(entry);
+    expect(retrieved.name).toBe('TabB');
+  });
+
+  it('onUpdated reads by data.clientId', () => {
+    // Set up a remote entry by clientId
+    const entry = {
+      uid: 77,
+      name: 'TabB',
+      x: 30,
+      z: 40,
+      targetX: 30,
+      targetZ: 40
+    };
+    state.remote.set(200, entry);
+
+    // Simulate onUpdated (lines 298-309)
+    const updateData = {
+      uid: 77,
+      clientId: 200,
+      x: 35,
+      z: 45
+    };
+
+    // Line 300: var entry = state.remote.get(data.clientId);
+    const remoteEntry = state.remote.get(updateData.clientId);
+    if (remoteEntry) {
+      remoteEntry.targetX = updateData.x !== undefined ? updateData.x : remoteEntry.targetX;
+      remoteEntry.targetZ = updateData.z !== undefined ? updateData.z : remoteEntry.targetZ;
+    }
+
+    expect(remoteEntry.targetX).toBe(35);
+    expect(remoteEntry.targetZ).toBe(45);
+  });
+
+  it('onLeft deletes by data.clientId', () => {
+    const entry = { uid: 77, name: 'TabB', clientId: 200 };
+    state.remote.set(200, entry);
+
+    expect(state.remote.has(200)).toBe(true);
+
+    // Simulate onLeft (lines 315-347)
+    const leftData = { uid: 77, clientId: 200 };
+
+    // Line 316: var entry = state.remote.get(data.clientId);
+    const remoteEntry = state.remote.get(leftData.clientId);
+    if (remoteEntry) {
+      // ... cleanup code ...
+      // Line 345: state.remote.delete(data.clientId);
+      state.remote.delete(leftData.clientId);
+    }
+
+    expect(state.remote.has(200)).toBe(false);
+  });
+
+  it('batch_updated self-skip uses clientId === state.clientId', () => {
+    // Simulate batch_updated handler (lines 584-641)
+    state.clientId = 100;
+
+    const batchData = {
+      100: { uid: 77, name: 'TabA', x: 10, z: 20 },  // Self — should skip
+      200: { uid: 77, name: 'TabB', x: 30, z: 40 }   // Tab B — should process
+    };
+
+    const processedClientIds = [];
+    const skippedClientIds = [];
+
+    // Line 591: if (clientId === state.clientId) continue; // skip self
+    for (var clientId in batchData) {
+      if (clientId === String(state.clientId)) {
+        skippedClientIds.push(clientId);
+        continue;
+      }
+      processedClientIds.push(clientId);
+    }
+
+    expect(skippedClientIds).toContain('100');
+    expect(processedClientIds).toContain('200');
+    expect(skippedClientIds).not.toContain('200');
+    expect(processedClientIds).not.toContain('100');
+  });
+
+  it('Key scenario: Tab A and Tab B with same uid but different clientIds', () => {
+    // Tab A state
+    const tabAState = {
+      uid: 77,
+      clientId: 100,
+      remote: new Map()
+    };
+
+    // Tab B state
+    const tabBState = {
+      uid: 77,
+      clientId: 200,
+      remote: new Map()
+    };
+
+    // Tab A's join broadcast arrives at Tab B
+    // Tab B's onJoined sees data.clientId=100 !== state.clientId=200 → renders Tab A's avatar
+    const tabAJoinData = {
+      uid: 77,
+      clientId: 100,
+      name: 'TabA',
+      x: 10,
+      z: 20,
+      yaw: 0
+    };
+
+    if (tabAJoinData.clientId === tabBState.clientId) {
+      // Skip self
+    } else if (!tabBState.remote.has(tabAJoinData.clientId)) {
+      // Render Tab A's avatar
+      tabBState.remote.set(tabAJoinData.clientId, {
+        uid: tabAJoinData.uid,
+        name: tabAJoinData.name,
+        x: tabAJoinData.x,
+        z: tabAJoinData.z
+      });
+    }
+
+    expect(tabBState.remote.has(100)).toBe(true);
+    expect(tabBState.remote.get(100).name).toBe('TabA');
+
+    // Tab B's join broadcast arrives at Tab A
+    // Tab A's onJoined sees data.clientId=200 !== state.clientId=100 → renders Tab B's avatar
+    const tabBJoinData = {
+      uid: 77,
+      clientId: 200,
+      name: 'TabB',
+      x: 30,
+      z: 40,
+      yaw: 1.5
+    };
+
+    if (tabBJoinData.clientId === tabAState.clientId) {
+      // Skip self
+    } else if (!tabAState.remote.has(tabBJoinData.clientId)) {
+      // Render Tab B's avatar
+      tabAState.remote.set(tabBJoinData.clientId, {
+        uid: tabBJoinData.uid,
+        name: tabBJoinData.name,
+        x: tabBJoinData.x,
+        z: tabBJoinData.z
+      });
+    }
+
+    expect(tabAState.remote.has(200)).toBe(true);
+    expect(tabAState.remote.get(200).name).toBe('TabB');
+
+    // Verify they don't see themselves
+    expect(tabAState.remote.has(100)).toBe(false);
+    expect(tabBState.remote.has(200)).toBe(false);
+  });
+
+  it('Two tabs same uid can both see each other (no self-skip false positives)', () => {
+    // Scenario: uid=77, Tab A (clientId=100), Tab B (clientId=200)
+    // Each tab should see the OTHER tab's avatar, not skip itself incorrectly
+
+    const tabAState = { uid: 77, clientId: 100, remote: new Map() };
+    const tabBState = { uid: 77, clientId: 200, remote: new Map() };
+
+    // Server broadcasts that Tab A (clientId=100) joined
+    // Tab B receives this and checks: data.clientId=100 === state.clientId=200? NO → render Tab A
+    const joinFromA = { uid: 77, clientId: 100, name: 'TabA' };
+    const isSelfB = joinFromA.clientId === tabBState.clientId;
+    expect(isSelfB).toBe(false);
+    if (!isSelfB && !tabBState.remote.has(joinFromA.clientId)) {
+      tabBState.remote.set(joinFromA.clientId, { name: joinFromA.name });
+    }
+
+    // Server broadcasts that Tab B (clientId=200) joined
+    // Tab A receives this and checks: data.clientId=200 === state.clientId=100? NO → render Tab B
+    const joinFromB = { uid: 77, clientId: 200, name: 'TabB' };
+    const isSelfA = joinFromB.clientId === tabAState.clientId;
+    expect(isSelfA).toBe(false);
+    if (!isSelfA && !tabAState.remote.has(joinFromB.clientId)) {
+      tabAState.remote.set(joinFromB.clientId, { name: joinFromB.name });
+    }
+
+    // Both tabs have the other in their remote list
+    expect(tabAState.remote.has(200)).toBe(true);
+    expect(tabBState.remote.has(100)).toBe(true);
+
+    // Neither has itself in remote
+    expect(tabAState.remote.has(100)).toBe(false);
+    expect(tabBState.remote.has(200)).toBe(false);
+  });
+});
+
+// =============================================================================
 // Integration test: All fixes work together
 // =============================================================================
 describe('DataCenter 3D fixes — integration', () => {

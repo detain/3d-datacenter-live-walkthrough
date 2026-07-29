@@ -64,11 +64,21 @@ import * as THREE from "/lib/three/build/three.module.js";
 
 	/* -------------------------- state ---------------------------- */
 
-	/** @type {{uid:number|null, name:string|null, remote:Map}} */
+	/**
+	 * Local presence state for this client (this browser tab).
+	 * @typedef {Object} PresenceState
+	 * @property {number|null} uid            - User ID (same across tabs)
+	 * @property {string|null} name          - Display name
+	 * @property {number|string|null} clientId - Unique per-connection ID (differs per tab); used for multi-tab support
+	 * @property {Map<string, RemoteEntry>} remote - Map of remote clients keyed by clientId (not uid)
+	 */
+
+	/** @type {PresenceState} */
 	var state = {
-		uid:   null,
-		name:  null,
-		remote: new Map()
+		uid:      null,
+		name:     null,
+		clientId: null,
+		remote:   new Map()
 	};
 
 	/** Pending join parameters awaiting scene readiness {x, z, yaw} */
@@ -249,7 +259,7 @@ import * as THREE from "/lib/three/build/three.module.js";
 
 	/**
 	 * Handle dc.presence.joined from the server broadcast.
-	 * @param {{uid:number, name:string, x:number, z:number, yaw:number}} data
+	 * @param {{uid:number, clientId:number, name:string, x:number, z:number, yaw:number}} data
 	 */
 	function onJoined(data) {
 		// Guard: we don't know our own uid yet — queue it
@@ -259,10 +269,11 @@ import * as THREE from "/lib/three/build/three.module.js";
 		}
 
 		// Guard: this is us — we've already rendered ourselves
-		if (String(data.uid) === String(state.uid)) return;
+		// Use clientId (not uid) to distinguish this tab from other tabs with the same session
+		if (data.clientId === state.clientId) return;
 
 		// Guard: already have this user
-		if (state.remote.has(data.uid)) return;
+		if (state.remote.has(data.clientId)) return;
 
 		// Guard: scene must be ready
 		if (!sceneReady()) return;
@@ -286,17 +297,17 @@ import * as THREE from "/lib/three/build/three.module.js";
 		entry.group  = buildAvatar(data.uid, entry.name, entry.x, entry.z, entry.yaw);
 		entry.avatar = entry.group;
 
-		state.remote.set(data.uid, entry);
+		state.remote.set(data.clientId, entry);
 		updateIndicator();
 	}
 
 	/**
 	 * Handle dc.presence.updated from the server broadcast.
-	 * @param {{uid:number, x:number, z:number, yaw:number}} data
+	 * @param {{uid:number, clientId:number, x:number, z:number, yaw:number}} data
 	 */
 	function onUpdated(data) {
-		// Guard: ignore updates for unknown remote users
-		var entry = state.remote.get(data.uid);
+		// Guard: ignore updates for unknown remote users (use clientId for multi-tab support)
+		var entry = state.remote.get(data.clientId);
 		if (!entry) return;
 
 		// Update target position for lerping
@@ -309,10 +320,10 @@ import * as THREE from "/lib/three/build/three.module.js";
 
 	/**
 	 * Handle dc.presence.left from the server broadcast.
-	 * @param {{uid:number}} data
+	 * @param {{uid:number, clientId:number}} data
 	 */
 	function onLeft(data) {
-		var entry = state.remote.get(data.uid);
+		var entry = state.remote.get(data.clientId);
 		if (!entry) return;
 
 		// Dispose cached name sprite texture+sprite and clear from cache (Fix 1)
@@ -341,7 +352,7 @@ import * as THREE from "/lib/three/build/three.module.js";
 			window.DC.scene.remove(entry.group);
 			entry.group = null;
 		}
-		state.remote.delete(data.uid);
+		state.remote.delete(data.clientId);
 		updateIndicator();
 	}
 
@@ -509,11 +520,12 @@ import * as THREE from "/lib/three/build/three.module.js";
 
 	/**
 	 * Handle dc:auth-success — initialise local state and attempt to join scene.
-	 * @param {{uid:number, name:string}} data
+	 * @param {{uid:number, clientId:number, name:string}} data
 	 */
 	function onAuthSuccess(data) {
-		state.uid  = data.uid;
-		state.name = data.name || '';
+		state.uid      = data.uid;
+		state.name     = data.name || '';
+		state.clientId  = data.clientId || data.uid;
 
 		// Watch for scene readiness; onAuthSuccess is also our signal to join
 		watchScene();
@@ -580,15 +592,15 @@ import * as THREE from "/lib/three/build/three.module.js";
 		} else if (op === 'dc.presence.updated') {
 			onUpdated(data);
 		} else if (op === 'dc.presence.batch_updated') {
-			// data is { uid1: {x,z,yaw,name,ts,...}, uid2: {...}, ... }
+			// data is { clientId1: {uid,name,x,z,yaw,ts,...}, clientId2: {...}, ... }
 			// emitted by Events.php when 2+ clients move within a 50ms window
 			if (data && typeof data === 'object') {
 				var now = performance.now();
-				for (var uid in data) {
-					if (!Object.prototype.hasOwnProperty.call(data, uid)) continue;
-					if (uid === String(state.uid)) continue;  // skip self
-					var entry = data[uid];
-					var remoteEntry = state.remote.get(uid);
+				for (var clientId in data) {
+					if (!Object.prototype.hasOwnProperty.call(data, clientId)) continue;
+					if (clientId === state.clientId) continue;  // skip self
+					var entry = data[clientId];
+					var remoteEntry = state.remote.get(clientId);
 					if (remoteEntry) {
 						// Preserve server timestamp if available
 						if (entry.ts !== undefined) remoteEntry.ts = entry.ts;
@@ -634,7 +646,7 @@ import * as THREE from "/lib/three/build/three.module.js";
 						}
 						if (entry.name) remoteEntry.name = entry.name;
 					}
-					// else: unknown uid, ignore (could be a stale broadcast)
+					// else: unknown clientId, ignore (could be a stale broadcast for tab we haven't seen join yet)
 				}
 			}
 		} else if (op === 'dc.presence.left') {

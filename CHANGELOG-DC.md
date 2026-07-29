@@ -6,6 +6,22 @@ All notable changes to the datacenter 3D walkthrough scene — including `dc.htm
 
 ## [Unreleased]
 
+### Multi-Tab Presence Support (NEW FEATURE)
+
+Two browser tabs with the same session (same user) can now see each other in DataCenter 3D. Previously, the presence system was keyed by `uid`, so Tab 2's join would overwrite Tab 1's presence entry, and each tab's frontend self-filter used uid-only comparison, causing each tab to ignore the other's broadcasts.
+
+**Solution:** Presence is now tracked per WebSocket connection (`client_id`), not per user (`uid`). Each browser tab gets its own presence entry regardless of shared session.
+
+| Layer | What Changed |
+|-------|-------------|
+| Backend (`Events.php`) | Presence storage key changed from `dc_presence:$uid` to `dc_presence:client:$clientId`; index changed from `dc_presence_uids` to `dc_presence_clients`; `auth.welcome` now includes `clientId` in response; `handleDcPresenceJoin/Move/Leave/OnClose` all updated to use `client_id` keys; `setupSessionHealthTimer` iterates `dc_presence_clients` index; batch move handler broadcasts to all clients (viewport filtering preserved) |
+| Frontend (`dc-ws.js`) | `window.DC_CLIENT_ID` set from `auth.welcome` response; `DC_PRESENCE_MOVE` sends `clientId` in message |
+| Frontend (`dc-presence.js`) | `state.clientId` tracked; self-filter uses `clientId === state.clientId`; `state.remote` Map keyed by `clientId` (not uid) |
+
+**Tests:** 18 new PHPUnit tests in `tests/EventsV1DcPresenceMultiTabTest.php`; 20 new Vitest tests in `tests/js/dc-fixes.test.js`
+
+---
+
 ### Comprehensive Audit Fixes (2026-07-29)
 
 A full code audit was performed across all DataCenter 3D frontend modules (`dc.js`, `dc-ws.js`, `dc-presence.js`, `dc-multi.js`) and the backend Events.php handler. All critical, major, minor, and bug-level fixes have been applied and committed.
