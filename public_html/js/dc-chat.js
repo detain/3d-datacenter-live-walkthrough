@@ -73,6 +73,11 @@
 	/** @type {string} NOC chat channel name. */
 	const CHANNEL_NOC = 'chat:noc';
 
+	/** Module-level idle state exposed for use by _renderMessage */
+	const _idleState = {
+		resetFn: /** @type {((messagesEl: HTMLElement) => void)|null} */ (null)
+	};
+
 	/* -------------------------- DOM helpers -------------------------- */
 
 	/**
@@ -120,7 +125,7 @@
 				font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
 				font-size: 13px;
 				color: #e8e8f0;
-				background: rgba(20, 20, 28, 0.85);
+				background: rgba(20, 20, 28, 0.15);
 				backdrop-filter: blur(8px);
 				-webkit-backdrop-filter: blur(8px);
 				border-top-right-radius: 10px;
@@ -128,7 +133,16 @@
 				border-right: 1px solid rgba(255, 255, 255, 0.08);
 				z-index: 9998;
 				overflow: hidden;
-				transition: height 0.25s ease;
+				transition: background 0.3s ease, height 0.25s ease;
+			}
+
+			.dc-chat-frame:hover {
+				background: rgba(20, 20, 28, 0.85);
+			}
+
+			.dc-chat-messages-faded .dc-chat-msg-body {
+				opacity: 0.3;
+				transition: opacity 2s ease;
 			}
 
 			.dc-chat-header {
@@ -384,6 +398,9 @@
 	 * @param {string} msgClass  — CSS class suffix from _msgClass()
 	 */
 	function _renderMessage(messagesEl, msg, msgClass) {
+		// Reset idle timer on new message
+		if (_idleState.resetFn) _idleState.resetFn(messagesEl);
+
 		const el = document.createElement('div');
 		el.className = 'dc-chat-msg' + (msgClass ? ' dc-chat-msg-' + msgClass : '');
 
@@ -424,8 +441,8 @@
 		/** @type {string} */
 		const clientCount = 'connected';
 
-		const presenceName = (window.DC_PRESENCE && window.DC_PRESENCE.name)
-			? window.DC_PRESENCE.name
+		const presenceName = (window.DC_PRESENCE && (window.DC_PRESENCE.name || window.DC_PRESENCE.uid))
+			? (window.DC_PRESENCE.name || `User:${window.DC_PRESENCE.uid}`)
 			: 'Unknown';
 
 		const statusBody = [
@@ -540,6 +557,30 @@
 		/** @type {boolean} */
 		let initialized = false;
 
+		/** @type {boolean} */
+		let _isHovered = false;
+
+		/** @type {ReturnType<typeof setTimeout>|null} */
+		let _idleTimer = null;
+
+		const _IDLE_FADE_MS = 60000;
+
+		/**
+		 * Reset the idle timer. When timer fires, messages fade.
+		 * @param {HTMLElement} messagesEl
+		 */
+		function _resetIdleTimer(messagesEl) {
+			if (_idleTimer) clearTimeout(_idleTimer);
+			messagesEl.classList.remove('dc-chat-messages-faded');
+			if (!_isHovered) {
+				_idleTimer = setTimeout(() => {
+					messagesEl.classList.add('dc-chat-messages-faded');
+				}, _IDLE_FADE_MS);
+			}
+		}
+
+		_idleState.resetFn = _resetIdleTimer;
+
 		return {
 			/**
 			 * Initialize the chat frame UI and WebSocket listeners.
@@ -555,6 +596,19 @@
 				messagesEl = msgEl;
 
 				wsCleanup = _wireWebSocket(this);
+
+				// Wire up hover listeners for idle timer
+				frame.addEventListener('mouseenter', () => {
+					_isHovered = true;
+					if (_idleTimer) { clearTimeout(_idleTimer); _idleTimer = null; }
+					messagesEl.classList.remove('dc-chat-messages-faded');
+				});
+				frame.addEventListener('mouseleave', () => {
+					_isHovered = false;
+					_resetIdleTimer(messagesEl);
+				});
+				// Start the idle timer initially
+				_resetIdleTimer(messagesEl);
 
 				console.log('[dc-chat] Initialized');
 			},
@@ -632,6 +686,7 @@
 					wsCleanup();
 					wsCleanup = null;
 				}
+				if (_idleTimer) { clearTimeout(_idleTimer); _idleTimer = null; }
 				initialized = false;
 			}
 		};
