@@ -55,6 +55,15 @@ When a real user joins DataCenter 3D, a simulated bot avatar is spawned that wan
 
 **Tests:** 18 new bot tests added
 
+#### Bug Fixes
+
+| ID | File | Issue | Fix |
+|----|------|-------|-----|
+| Bot join broadcast | `Events.php` | Bot spawned but not visible on frontend because `spawnBotForLocation` wasn't broadcasting the join event | Added `dc.presence.joined` broadcast to `dc_presence` channel after writing bot presence to GlobalData, ensuring frontend's `onJoined` handler receives the event and creates avatar entries |
+| Test coverage | `EventsBotPresenceTest.php` | No test verifying broadcast behavior | Added `testSpawnBotBroadcastsJoinedEvent()` test |
+
+**Tests:** 19 new bot tests added
+
 ---
 
 ### Comprehensive Audit Fixes (2026-07-29)
