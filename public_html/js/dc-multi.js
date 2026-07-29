@@ -87,6 +87,14 @@ const _camTarget = new THREE.Vector3();
 function log(...a) { console.log("[dc-multi]", ...a); }
 
 // ---------------------------------------------------------------- bootstrap
+/**
+ * Wait for the DC (datacenter) scene to be fully initialized before calling callback.
+ * Polls every 80ms for up to `timeoutMs` milliseconds. If timeout is reached without
+ * all DC properties being available, logs an error and does not call the callback.
+ *
+ * @param {function()} cb - Called when DC.scene, DC.camera, DC.renderer, DC.controls, and DC.options are all truthy
+ * @param {number} [timeoutMs=15000] - Maximum milliseconds to wait before giving up
+ */
 function whenReady(cb, timeoutMs = 15000) {
   const start = performance.now();
   const tick = () => {
@@ -830,6 +838,10 @@ function hud(text) {
   el.textContent = text;
 }
 
+/**
+ * Display a 4-second overlay showing keyboard controls for the DataCenter 3D walkthrough.
+ * This is a debug aid; access it via `window.DCM.showHelp()`.
+ */
 function showHelp() {
   const help = document.createElement('div');
   help.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.9);color:#fff;padding:24px;border-radius:8px;z-index:9999;font-family:sans-serif;font-size:14px;line-height:1.8;';
@@ -843,6 +855,15 @@ function showHelp() {
   setTimeout(() => help.remove(), 4000);
 }
 
+/**
+ * Expose debug utilities on `window.DCM` for development and troubleshooting.
+ * Only available when `window.DC_DEBUG` is truthy, or on the admin dc.html page.
+ *
+ * @example
+ * window.DCM.showHelp()           // Show controls overlay (4s)
+ * window.DCM.getPosition()       // { x, z } player position
+ * window.DCM.getLatency()        // WebSocket latency in ms
+ */
 function exposeDebug() {
   window.DCM = {
     getPosition: () => ({ x: S.player.position.x, z: S.player.position.z }),
@@ -854,8 +875,9 @@ function exposeDebug() {
     setFacingOffset: (rad) => { S.player.rotation.y = S.facing + rad; },
     getLatency: () => window.DC_LATENCY || 0,
     getConnected: () => window.DC_AUTHED || false,
-    // IDEA-3: expose current viewport from WS layer
+    /** Current camera viewport data from the WS layer */
     getViewport: () => window.DC_WS?._viewport || null,
+    /** Show keyboard controls overlay for 4 seconds */
     showHelp,
     viewDist: 50,
   };
