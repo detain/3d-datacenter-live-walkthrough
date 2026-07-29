@@ -44,6 +44,23 @@ let _contextLost = false;
 let _sessionBackup = null;
 // Animation loop callback storage (Fix: module-level declaration for setAnimationLoop)
 let _animationLoopCb = null;
+
+// MINOR-4: cancel-then-send pattern to avoid duplicate _updateViewport calls during location switch
+let _viewportPending = null;
+// MINOR-7: requestIdleCallback polyfill - reuse a single MessageChannel instead of creating one per call
+let _ricChannel = null;
+function scheduleViewportUpdate(data) {
+    if (_viewportPending) {
+        clearTimeout(_viewportPending);
+        _viewportPending = null;
+    }
+    _viewportPending = setTimeout(() => {
+        if (window.DC_WS && window.DC_WS._updateViewport) {
+            window.DC_WS._updateViewport(data);
+        }
+        _viewportPending = null;
+    }, 100);  // 100ms debounce
+}
 // three.js WebGLAnimation re-arms requestAnimationFrame AFTER invoking the loop callback:
 //     onAnimationFrame() { animationLoop(time, frame); requestId = requestAnimationFrame(onAnimationFrame); }
 // so ONE exception escaping the callback permanently stops rendering — the scene freezes on the last
@@ -57,6 +74,7 @@ function _guardLoop(cb) {
     return function (time, frame) {
         try {
             cb(time, frame);
+            _loopErrorCount = 0;  // Reset on successful frame (MINOR-9)
         } catch (err) {
             _loopErrorCount++;
             if (_loopErrorCount <= _LOOP_ERROR_LOG_LIMIT) {
@@ -73,9 +91,18 @@ function _guardLoop(cb) {
 const _ric = requestIdleCallback
     ? (cb, opts) => requestIdleCallback(cb, opts)
     : (cb) => {
-        const mc = new MessageChannel();
-        mc.port1.onmessage = () => cb({ didTimeout: false });
-        mc.port2.postMessage(null);
+        if (!_ricChannel) {
+            _ricChannel = new MessageChannel();
+            _ricChannel.port1.onmessage = (e) => {
+                if (_ricChannel._cb) {
+                    const cb = _ricChannel._cb;
+                    _ricChannel._cb = null;
+                    cb({ didTimeout: false });
+                }
+            };
+        }
+        _ricChannel._cb = cb;
+        _ricChannel.port2.postMessage(null);
     };
 
 // --- FPS monitoring for automatic quality scaling ---
@@ -135,7 +162,7 @@ const RACK_GRID_CELL = 10;  // 10-unit cells for racks (smaller than building-sc
 
 // Cache: locationId → { geometry, tubeCount } for cable geometry (Fix #10)
 const _cableGeometryCache = new Map();
-const _cableCacheOrder = [];
+const _cableCacheOrder = new Set();  // O(1) add/has/delete; insertion order maintained for LRU
 const MAX_CABLE_CACHE = 8;  // MAJOR-9: increased from 3 to 8
 
 // Cache: poster spec string → CanvasTexture (Fix #11)
@@ -156,25 +183,25 @@ const _ceilingTextureCache = new Map();
 // LRU eviction for texture caches (Fix #19)
 const MAX_TEXTURE_CACHE = 128;
 const _cacheOrder = {
-    label: [], poster: [], sign: [], floor: [], ceiling: []
+    label: new Set(), poster: new Set(), sign: new Set(), floor: new Set(), ceiling: new Set()
 };
 
-function cacheWithEvict(cacheMap, key, value, orderArray) {
+function cacheWithEvict(cacheMap, key, value, orderSet) {
     if (cacheMap.has(key)) {
-        // move to end (most recently used)
-        const idx = orderArray.indexOf(key);
-        if (idx !== -1) orderArray.splice(idx, 1);
-        orderArray.push(key);
+        // move to end (most recently used): delete and re-add is O(1) with Set
+        orderSet.delete(key);  // O(1) delete
+        orderSet.add(key);     // O(1) add
         cacheMap.set(key, value);
         return;
     }
     if (cacheMap.size >= MAX_TEXTURE_CACHE) {
-        const oldest = orderArray.shift();
+        const oldest = orderSet.values().next().value;  // O(1) get first (LRU)
+        orderSet.delete(oldest);  // O(1) delete
         const oldVal = cacheMap.get(oldest);
         if (oldVal && oldVal.dispose) oldVal.dispose();
         cacheMap.delete(oldest);
     }
-    orderArray.push(key);
+    orderSet.add(key);  // O(1) add
     cacheMap.set(key, value);
 }
 
@@ -634,6 +661,11 @@ function clearScene() {
     if (typeof window.DC_PRESENCE_LEAVE === 'function') {
         window.DC_PRESENCE_LEAVE();
     }
+    // Remove stats.dom from DOM if present (stats.dom is appended once in init() but clearScene()
+    // tears down the scene — without removal the panel would stay in the body indefinitely)
+    if (stats && stats.dom && stats.dom.parentNode) {
+        stats.dom.parentNode.removeChild(stats.dom);
+    }
     // Reset idle skip state (Bug #2: clearScene must not leave stale skip mode from a previous scene)
     _tickSkippedFrames = 0;
     _skipExpensiveUpdates = false;
@@ -662,7 +694,7 @@ function clearScene() {
     _ceilingTextureCache.clear();
     _labelTextureCache.forEach(tex => tex.dispose());
     _labelTextureCache.clear();
-    Object.keys(_cacheOrder).forEach(k => _cacheOrder[k] = []);
+    Object.keys(_cacheOrder).forEach(k => _cacheOrder[k] = new Set());
     roomBounds = null; roomSpawn = null;
     // Multi-building LOD: dispose any neighbour FULL models (their group is added straight to the scene,
     // separate from objects.community). Geometry/material are shared cached templates -> only free each
@@ -1256,6 +1288,7 @@ function displaySwitches(locId, dx, dz, sink) {
     locId = (locId === undefined) ? options.location : locId;
     dx = dx || 0; dz = dz || 0;
     const intraOnly = !!sink;   // neighbours: only draw cables whose endpoints are inside THIS building
+    const cacheKey = sink ? locId + ':n' : locId;  // cache main and neighbour cable geometry separately
     const racks = (locations[locId] || {}).racks; if (!racks) return;
 
     // IDEA-4: Cable geometry LOD — reduce tubular segments when camera is far (overview mode)
@@ -1263,9 +1296,9 @@ function displaySwitches(locId, dx, dz, sink) {
     const farFromCables = camY > 25;
     const maxTubular = farFromCables ? 40 : 220;
 
-    // Fix #10: Cache cable geometry per location for the main building (not neighbours, not LOD-reduced)
-    if (!sink && !farFromCables && _cableGeometryCache.has(locId)) {
-        const cached = _cableGeometryCache.get(locId);
+    // Fix #10: Cache cable geometry per location (main and neighbours separately, not LOD-reduced)
+    if (!farFromCables && _cableGeometryCache.has(cacheKey)) {
+        const cached = _cableGeometryCache.get(cacheKey);
         // Reuse cached merged geometry (clone so dispose doesn't affect cache)
         const geo = cached.geometry.clone();
         if (objects.network) {
@@ -1400,21 +1433,21 @@ function displaySwitches(locId, dx, dz, sink) {
     // IDEA-8: Progressive cable loading - when many cables, defer merge to avoid main-thread blocking
     if (tubes.length > 150 && !sink) {
         const _tubes = tubes;
-        const _locId = locId;
+        const _locId = cacheKey;
         _ric(() => {
             const geometry = BufferGeometryUtils.mergeGeometries(_tubes, false);
             _tubes.forEach((g) => g.dispose());
-            // Fix #8: LRU eviction for cable geometry cache
+            // Fix #8: LRU eviction for cable geometry cache (MINOR-1: use Set for O(1) ops)
             if (_cableGeometryCache.has(_locId)) {
-                const idx = _cableCacheOrder.indexOf(_locId);
-                if (idx !== -1) _cableCacheOrder.splice(idx, 1);
+                _cableCacheOrder.delete(_locId);  // O(1) delete
             } else if (_cableGeometryCache.size >= MAX_CABLE_CACHE) {
-                const oldest = _cableCacheOrder.shift();
+                const oldest = _cableCacheOrder.values().next().value;  // O(1) get first (LRU)
+                _cableCacheOrder.delete(oldest);  // O(1) delete
                 const oldVal = _cableGeometryCache.get(oldest);
                 if (oldVal) oldVal.geometry.dispose();
                 _cableGeometryCache.delete(oldest);
             }
-            _cableCacheOrder.push(_locId);
+            _cableCacheOrder.add(_locId);  // O(1) add
             _cableGeometryCache.set(_locId, { geometry: geometry.clone(), tubeCount: _tubes.length });
             if (objects.network) {
                 scene.remove(objects.network);
@@ -1434,21 +1467,19 @@ function displaySwitches(locId, dx, dz, sink) {
     // Small-to-medium cable count: merge synchronously (fast enough)
     const geometry = BufferGeometryUtils.mergeGeometries(tubes, false);
     tubes.forEach((g) => g.dispose());
-    // Fix #10: Cache the merged cable geometry for the main building (not neighbours)
-    // Fix #8: LRU eviction for cable geometry cache
-    if (!sink) {
-        if (_cableGeometryCache.has(locId)) {
-            const idx = _cableCacheOrder.indexOf(locId);
-            if (idx !== -1) _cableCacheOrder.splice(idx, 1);
-        } else if (_cableGeometryCache.size >= MAX_CABLE_CACHE) {
-            const oldest = _cableCacheOrder.shift();
-            const oldVal = _cableGeometryCache.get(oldest);
-            if (oldVal) oldVal.geometry.dispose();
-            _cableGeometryCache.delete(oldest);
-        }
-        _cableCacheOrder.push(locId);
-        _cableGeometryCache.set(locId, { geometry: geometry.clone(), tubeCount: tubes.length });
+    // Fix #10: Cache the merged cable geometry (main and neighbours separately)
+    // Fix #8: LRU eviction for cable geometry cache (MINOR-1: use Set for O(1) ops)
+    if (_cableGeometryCache.has(cacheKey)) {
+        _cableCacheOrder.delete(cacheKey);  // O(1) delete
+    } else if (_cableGeometryCache.size >= MAX_CABLE_CACHE) {
+        const oldest = _cableCacheOrder.values().next().value;  // O(1) get first (LRU)
+        _cableCacheOrder.delete(oldest);  // O(1) delete
+        const oldVal = _cableGeometryCache.get(oldest);
+        if (oldVal) oldVal.geometry.dispose();
+        _cableGeometryCache.delete(oldest);
     }
+    _cableCacheOrder.add(cacheKey);  // O(1) add
+    _cableGeometryCache.set(cacheKey, { geometry: geometry.clone(), tubeCount: tubes.length });
     // matte plastic base + a clearcoat layer for a slight gloss / rounded depth on the cables
     const material = new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: 0.6, metalness: 0.0, clearcoat: 0.6, clearcoatRoughness: 0.25 });
     const cables = new THREE.Mesh(geometry, material);
@@ -2585,18 +2616,16 @@ function spawnInside() {
     // so poking S.player here silently does nothing — this event is the only working channel.
     document.dispatchEvent(new CustomEvent('dc:respawn', { detail: { x: sx, z: sz } }));
     // IDEA-3: notify server of viewport after spawn/camera move
-    if (window.DC_WS && window.DC_WS._updateViewport) {
-        const dir = new THREE.Vector3();
-        camera.getWorldDirection(dir);
-        window.DC_WS._updateViewport({
-            x: camera.position.x,
-            y: camera.position.y,
-            z: camera.position.z,
-            dirX: dir.x,
-            dirY: dir.y,
-            dirZ: dir.z
-        });
-    }
+    const dir = new THREE.Vector3();
+    camera.getWorldDirection(dir);
+    scheduleViewportUpdate({
+        x: camera.position.x,
+        y: camera.position.y,
+        z: camera.position.z,
+        dirX: dir.x,
+        dirY: dir.y,
+        dirZ: dir.z
+    });
 }
 
 // Scan the open margin band around the racks for the first spot a player of radius r fits.
@@ -2843,18 +2872,16 @@ function flyTransition(toLoc) {
         flyTo.look.set(s.lookX, eyeHeight(), s.lookZ);
         flyTo.t = 0; flyTo.speed = 0.012; flyTo.active = true; flyTo.onDone = null; // phase 2: descend in
         // IDEA-3: notify server of viewport after fly-to lands
-        if (window.DC_WS && window.DC_WS._updateViewport) {
-            const dir = new THREE.Vector3();
-            camera.getWorldDirection(dir);
-            window.DC_WS._updateViewport({
-                x: camera.position.x,
-                y: camera.position.y,
-                z: camera.position.z,
-                dirX: dir.x,
-                dirY: dir.y,
-                dirZ: dir.z
-            });
-        }
+        const dir = new THREE.Vector3();
+        camera.getWorldDirection(dir);
+        scheduleViewportUpdate({
+            x: camera.position.x,
+            y: camera.position.y,
+            z: camera.position.z,
+            dirX: dir.x,
+            dirY: dir.y,
+            dirZ: dir.z
+        });
     };
 }
 
