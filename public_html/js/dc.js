@@ -18,6 +18,7 @@ import Stats from "three/addons/libs/stats.module.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import * as BufferGeometryUtils from "three/addons/utils/BufferGeometryUtils.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+import { Lensflare, LensflareElement } from 'three/addons/objects/Lensflare.js';
 let camera, scene, renderer, controls, controlObject, stats, gui, locations = {}, maxAnisotropy; // Declare global variables
 const VIEW_OPTS = { Overview: 'overview', 'Top-down': 'top', Aisle: 'aisle', Labels: 'labels', Cables: 'cables' };
 const _viewProxy = { view: 'overview' };   // bound to the GUI 'View' dropdown (replaces the #dcViews button bar)
@@ -256,7 +257,10 @@ const options = {
     showWalls: true,    // room walls (built from the rack-layout bounds)
     showCeiling: true,  // ceiling + fluorescent fixtures + HVAC ducts
     faultyLights: 1,    // PERCENT of fixtures that flicker, in EVERY building (0..100; default 1%)
-    disco: false,       // when on, every light fixture cycles a random colour every 3-5s
+    disco: false,       // master disco switch
+    discoSmoke: true,   // smoke particle effect when disco is on
+    discoFlare: true,   // lens flare on each light when disco is on
+    discoFog: true,     // volumetric fog color shift when disco is on
 	moveForward: false,
 	moveBackward: false,
 	moveLeft: false,
@@ -542,7 +546,10 @@ function displayGui() {
     const fc = displayFolder.add(options, 'faultyLights', 0, 100, 1);
     fc.onChange(() => valLabel(fc, 'faulty lights', options.faultyLights + '%')).onFinishChange(() => displayDatacenter());
     valLabel(fc, 'faulty lights', options.faultyLights + '%');
-    displayFolder.add(options, 'disco').name('disco').onChange((v) => { if (!v) resetDisco(); });   // unchecked default; cycles each fixture's colour
+    displayFolder.add(options, 'disco').name('disco').onChange((v) => { if (!v) resetDisco(); });
+    displayFolder.add(options, 'discoFlare').name('flare');
+    displayFolder.add(options, 'discoSmoke').name('smoke');
+    displayFolder.add(options, 'discoFog').name('fog');
     displayFolder.add(options, 'useFirstPerson').onChange( () => { setupControls(); });
     const moveFolder = gui.addFolder( 'Movement' );
     // live camera position. value lives in the LEFT label (the right number box is hidden via css);
@@ -2328,6 +2335,28 @@ function buildNeighborInterior(group, b) {
 	if (housings.length) { const m = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(housings), new THREE.MeshStandardMaterial({ color: 0x2c2f35, roughness: 0.6, metalness: 0.3 })); housings.forEach((g) => g.dispose()); group.add(m); }
 	let nbBulbDisco = null;
 	if (bulbs.length) { const m = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(bulbs), new THREE.MeshBasicMaterial({ color: 0xffffff })); bulbs.forEach((g) => g.dispose()); group.add(m); nbBulbDisco = makeBulbDisco(m, bulbs.length); }
+	// Disco PointLights — one per fixture slot
+	const discoLights = [];
+	for (const s of slots) {
+		const light = new THREE.PointLight(0xffffff, DISCO_LIGHT_NORMAL, DISCO_LIGHT_DIST, DISCO_LIGHT_DECAY);
+		light.position.set(s.x, bulbY, s.z);
+		group.add(light);
+		// Add lensflare to the light
+		const lensflare = new Lensflare();
+		lensflare.addElement(new LensflareElement(_flareTex1, 80, 0, new THREE.Color(1, 1, 1)));
+		lensflare.addElement(new LensflareElement(_flareTex2, 40, 0.15, new THREE.Color(1, 1, 1)));
+		lensflare.addElement(new LensflareElement(_flareTexHex, 30, 0.3, new THREE.Color(1, 1, 1)));
+		light.add(lensflare);
+		// Each light has its own phase for breathing effect
+		discoLights.push({ 
+			light, 
+			nextPulse: 0, 
+			pulseDir: 1, 
+			intensity: DISCO_LIGHT_NORMAL,
+			phase: Math.random() * Math.PI * 2,  // random starting phase for desync
+			color: new THREE.Color(1, 1, 1)       // start white
+		});
+	}
 	// HVAC ducts (elbow runs in the gaps between rows) + a couple of pipes
 	const rowGap = D / fixRows, laneZ = (k) => minZ + rowGap * k, ducts = [];
 	const dbox = (w, h, d, x, y, z) => { const g = new THREE.BoxGeometry(w, h, d); g.translate(x, y, z); ducts.push(g); };
@@ -2368,7 +2397,7 @@ function buildNeighborInterior(group, b) {
 	floorTex.repeat.set(Math.max(1, Math.round(W / (4 * tu))), Math.max(1, Math.round(D / (4 * tu))));
 	const floor = new THREE.Mesh(new THREE.PlaneGeometry(W, D), new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.9 }));
 	floor.rotation.x = -Math.PI / 2; floor.position.set(cx, 0, cz); group.add(floor);
-	return { faulty, bulbDisco: nbBulbDisco };   // faulty -> b.full.faulty (maybeFlicker); bulbDisco -> b.full.bulbDisco (updateDisco)
+	return { faulty, bulbDisco: nbBulbDisco, discoLights };   // faulty -> b.full.faulty (maybeFlicker); bulbDisco -> b.full.bulbDisco (updateDisco); discoLights -> b.full.discoLights
 }
 // Swap a neighbour BLOCKS -> FULL (async-load its models, hide the blocks, add the full interior). The
 // loading flag both de-dupes concurrent triggers and acts as a cancel token (exitFull clears it mid-load).
@@ -2378,7 +2407,7 @@ function enterFull(b) {
 		if (!b.loading) return;                         // cancelled by exitFull while loading
 		b.full = buildBuildingFull(b.id, b.dx, b.dz);
 		const ri = buildNeighborInterior(b.full.group, b);             // interior; returns its flicker + disco handles
-		b.full.faulty = ri.faulty || []; b.full.bulbDisco = ri.bulbDisco;
+		b.full.faulty = ri.faulty || []; b.full.bulbDisco = ri.bulbDisco; b.full.discoLights = ri.discoLights || [];
 		scene.add(b.full.group);
 		if (b.blocks) b.blocks.visible = false;
 		b.loading = false;
@@ -2515,6 +2544,20 @@ function buildRoom() {
 	housings.forEach((g) => g.dispose()); ceiling.add(housingMesh);
 	let roomBulbDisco = null;
 	if (bulbs.length) { const bulbMesh = new THREE.Mesh(BufferGeometryUtils.mergeGeometries(bulbs), new THREE.MeshBasicMaterial({ color: 0xffffff })); bulbs.forEach((g) => g.dispose()); ceiling.add(bulbMesh); roomBulbDisco = makeBulbDisco(bulbMesh, bulbs.length); }
+	// Disco PointLights for main room — one per fixture slot
+	const roomDiscoLights = [];
+	for (const s of slots) {
+		const light = new THREE.PointLight(0xffffff, DISCO_LIGHT_NORMAL, DISCO_LIGHT_DIST, DISCO_LIGHT_DECAY);
+		light.position.set(s.x, bulbY, s.z);
+		ceiling.add(light);
+		// Add lensflare to the light
+		const lensflare = new Lensflare();
+		lensflare.addElement(new LensflareElement(_flareTex1, 80, 0, new THREE.Color(1, 1, 1)));
+		lensflare.addElement(new LensflareElement(_flareTex2, 40, 0.15, new THREE.Color(1, 1, 1)));
+		lensflare.addElement(new LensflareElement(_flareTexHex, 30, 0.3, new THREE.Color(1, 1, 1)));
+		light.add(lensflare);
+		roomDiscoLights.push({ light, nextPulse: 0, pulseDir: 1, intensity: DISCO_LIGHT_NORMAL, phase: Math.random() * Math.PI * 2, color: new THREE.Color(1, 1, 1) });
+	}
 
 	// HVAC ducts + pipes: kept OFF the fixture rows -- they run in the GAPS between rows, never the full
 	// length straight under a row, and each turns a corner (an elbow) so it reads as real ductwork.
@@ -2594,7 +2637,7 @@ function buildRoom() {
 	walls.visible = options.showWalls;
 	ceiling.visible = options.showCeiling;
 	scene.add(group);
-	objects.room = { group, walls, ceiling, faulty: faultyMeshes, blinds, bulbDisco: roomBulbDisco };
+	objects.room = { group, walls, ceiling, faulty: faultyMeshes, blinds, bulbDisco: roomBulbDisco, discoLights: roomDiscoLights };
 	// wall colliders + a safe spawn spot (open margin near the maxZ wall, looking into the room)
 	roomBounds = { minX, maxX, minZ, maxZ };
 	roomSpawn = { x: cx, z: maxZ - ROOM_MARGIN * 0.5, lookX: cx, lookZ: cz };
@@ -2961,6 +3004,112 @@ function maybeCycleIdleView() {
 // the merged diffuser mesh (1 draw call kept). Off -> all white. Handles on objects.room.bulbDisco +
 // b.full.bulbDisco (set where the bulb mesh is built). ---
 const _discoColor = new THREE.Color();
+
+// Disco PointLight constants
+const DISCO_LIGHT_NORMAL = 1.4;    // intensity when disco OFF (white light)
+const DISCO_LIGHT_MIN = 0.3;       // breathing dim floor
+const DISCO_LIGHT_MAX = 4.0;       // breathing bright ceiling
+const DISCO_LIGHT_DIST = 22;       // falloff distance (scene units)
+const DISCO_LIGHT_DECAY = 2;       // physically correct 1/d² decay
+
+// Procedural lens flare textures (no external files needed)
+function _makeFlareTexture(size, innerAlpha = 0.9, outerAlpha = 0.0, color = [255, 255, 255]) {
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    const c = size / 2, r = size / 2;
+    const grad = ctx.createRadialGradient(c, c, 0, c, c, r);
+    grad.addColorStop(0, `rgba(${color[0]},${color[1]},${color[2]},${innerAlpha})`);
+    grad.addColorStop(0.3, `rgba(${color[0]},${color[1]},${color[2]},${innerAlpha * 0.6})`);
+    grad.addColorStop(0.7, `rgba(${color[0]},${color[1]},${color[2]},${innerAlpha * 0.2})`);
+    grad.addColorStop(1, `rgba(${color[0]},${color[1]},${color[2]},${outerAlpha})`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, size, size);
+    return new THREE.CanvasTexture(canvas);
+}
+
+function _makeHexFlareTexture(size) {
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    const c = size / 2;
+    ctx.save();
+    ctx.translate(c, c);
+    ctx.rotate(Math.PI / 6);
+    const r = size * 0.42;
+    ctx.beginPath();
+    for (let i = 0; i < 6; i++) {
+        const angle = (i / 6) * Math.PI * 2;
+        const x = Math.cos(angle) * r, y = Math.sin(angle) * r;
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    const grad = ctx.createRadialGradient(c, c, 0, c, c, r);
+    grad.addColorStop(0, 'rgba(200,220,255,0.9)');
+    grad.addColorStop(0.5, 'rgba(180,200,255,0.4)');
+    grad.addColorStop(1, 'rgba(150,180,255,0)');
+    ctx.fillStyle = grad;
+    ctx.fill();
+    ctx.restore();
+    return new THREE.CanvasTexture(canvas);
+}
+
+const _flareTex1 = _makeFlareTexture(128, 0.95, 0);       // main star flare
+const _flareTex2 = _makeFlareTexture(64, 0.5, 0);        // secondary ring
+const _flareTexHex = _makeHexFlareTexture(64);            // hexagonal iris flare
+
+// Disco smoke particle system
+let _discoSmoke = null;   // THREE.Points particle system for disco smoke
+
+function _initDiscoSmoke() {
+    if (_discoSmoke) return;
+    const COUNT = 400;
+    const geo = new THREE.BufferGeometry();
+    const positions = new Float32Array(COUNT * 3);
+    const randoms = new Float32Array(COUNT * 3);  // velocity seeds
+    for (let i = 0; i < COUNT; i++) {
+        // spread particles across the room volume
+        positions[i * 3] = (Math.random() - 0.5) * 200;
+        positions[i * 3 + 1] = 5 + Math.random() * 30;  // above floor, below ceiling
+        positions[i * 3 + 2] = (Math.random() - 0.5) * 200;
+        randoms[i * 3] = (Math.random() - 0.5) * 0.04;   // vx
+        randoms[i * 3 + 1] = 0.01 + Math.random() * 0.02; // vy (slow rise)
+        randoms[i * 3 + 2] = (Math.random() - 0.5) * 0.04; // vz
+    }
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute('aRandom', new THREE.BufferAttribute(randoms, 3));
+    const mat = new THREE.PointsMaterial({
+        color: 0x888899,
+        size: 5,
+        sizeAttenuation: true,
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+    });
+    _discoSmoke = new THREE.Points(geo, mat);
+    _discoSmoke.visible = false;
+    scene.add(_discoSmoke);
+}
+
+function _updateDiscoSmoke(dt) {  // dt = delta time in seconds
+    if (!_discoSmoke || !_discoSmoke.visible) return;
+    const pos = _discoSmoke.geometry.attributes.position;
+    const rand = _discoSmoke.geometry.attributes.aRandom;
+    const COUNT = pos.count;
+    for (let i = 0; i < COUNT; i++) {
+        let x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+        x += rand.getX(i) * dt * 60;
+        y += rand.getY(i) * dt * 60;
+        z += rand.getZ(i) * dt * 60;
+        // Wrap particles that drift out of the room
+        if (y > 35) { y = 3; x = (Math.random() - 0.5) * 200; z = (Math.random() - 0.5) * 200; }
+        if (x < -110 || x > 110) { x = (Math.random() - 0.5) * 200; }
+        if (z < -110 || z > 110) { z = (Math.random() - 0.5) * 200; }
+        pos.setXYZ(i, x, y, z);
+    }
+    pos.needsUpdate = true;
+}
 function makeBulbDisco(mesh, count) {
     if (!mesh || !count) return null;
     const g = mesh.geometry, n = g.attributes.position.count;
@@ -2970,29 +3119,127 @@ function makeBulbDisco(mesh, count) {
 }
 function _discoHandles() {
     const h = [];
-    if (objects.room && objects.room.bulbDisco) h.push(objects.room.bulbDisco);
-    for (const b of lodBuildings) if (b.full && b.full.bulbDisco) h.push(b.full.bulbDisco);
+    if (objects.room && objects.room.bulbDisco) h.push({ 
+        discoMesh: objects.room.bulbDisco.mesh, 
+        count: objects.room.bulbDisco.count, 
+        vertsPer: objects.room.bulbDisco.vertsPer,
+        next: objects.room.bulbDisco.next,
+        discoLights: objects.room.discoLights || []   // ADD
+    });
+    for (const b of lodBuildings) if (b.full && b.full.bulbDisco) h.push({
+        discoMesh: b.full.bulbDisco.mesh,
+        count: b.full.bulbDisco.count,
+        vertsPer: b.full.bulbDisco.vertsPer,
+        next: b.full.bulbDisco.next,
+        discoLights: b.full.discoLights || []   // ADD
+    });
     return h;
 }
-function updateDisco() {
+function updateDisco(dt) {
     if (!options.disco) return;
     const now = performance.now();
+    const t = now * 0.001;  // seconds
+
     for (const h of _discoHandles()) {
-        const col = h.mesh.geometry.attributes.color; let changed = false;
-        for (let i = 0; i < h.count; i++) {
-            if (now >= h.next[i]) {
-                h.next[i] = now + 3000 + Math.random() * 2000;          // re-colour this fixture in 3-5s
-                _discoColor.setHSL(Math.random(), 0.9, 0.6);
-                const base = i * h.vertsPer * 3;
-                for (let v = 0; v < h.vertsPer; v++) { col.array[base + v * 3] = _discoColor.r; col.array[base + v * 3 + 1] = _discoColor.g; col.array[base + v * 3 + 2] = _discoColor.b; }
-                changed = true;
+        // 1. Vertex color changes (existing behavior)
+        if (h.discoMesh) {
+            const col = h.discoMesh.geometry.attributes.color;
+            let changed = false;
+            for (let i = 0; i < h.count; i++) {
+                if (now >= h.next[i]) {
+                    h.next[i] = now + 3000 + Math.random() * 2000;
+                    _discoColor.setHSL(Math.random(), 0.9, 0.6);
+                    const base = i * h.vertsPer * 3;
+                    for (let v = 0; v < h.vertsPer; v++) {
+                        col.array[base + v * 3] = _discoColor.r;
+                        col.array[base + v * 3 + 1] = _discoColor.g;
+                        col.array[base + v * 3 + 2] = _discoColor.b;
+                    }
+                    changed = true;
+                }
+            }
+            if (changed) col.needsUpdate = true;
+        }
+
+        // 2. PointLight breathing + color
+        if (h.discoLights) {
+            for (const dl of h.discoLights) {
+                // Each light breathes on its own sine wave with random phase
+                const breath = Math.sin(t * 1.5 + dl.phase);  // ~2.1s cycle
+                const intensity = DISCO_LIGHT_MIN + (DISCO_LIGHT_MAX - DISCO_LIGHT_MIN) * (breath * 0.5 + 0.5);
+                dl.light.intensity = intensity;
+
+                // Color changes less frequently than vertex colors (less expensive)
+                if (now >= dl.nextPulse) {
+                    dl.nextPulse = now + 800 + Math.random() * 1200;  // new color every 0.8-2s
+                    const hue = Math.random();
+                    dl.color.setHSL(hue, 0.9, 0.6);
+                    dl.light.color.copy(dl.color);
+                    // Also update lensflare element colors (only when discoFlare is on)
+                    if (options.discoFlare && dl.light.children[0] instanceof Lensflare) {
+                        const lf = dl.light.children[0];
+                        for (const elem of lf.elements) {
+                            elem.color.copy(dl.color);
+                        }
+                    }
+                }
             }
         }
-        if (changed) col.needsUpdate = true;
+    }
+
+    // 3. Fog for atmospheric volumetric feel (only when discoFog is on)
+    if (options.discoFog && scene.fog) {
+        scene.fog.color.copy(_discoColor);
+        scene.fog.density = 0.006;  // denser fog during disco for volumetric feel
+    }
+
+    // 4. Smoke visibility (only when discoSmoke is on)
+    if (options.discoSmoke && _discoSmoke) {
+        if (!_discoSmoke.visible) _discoSmoke.visible = true;
+        // Fade in: reach max opacity over ~1 second
+        _discoSmoke.material.opacity = Math.min(0.12, _discoSmoke.material.opacity + dt * 0.12);
+    } else if (_discoSmoke && _discoSmoke.visible) {
+        // Fade out when smoke sub-option is off
+        _discoSmoke.material.opacity = Math.max(0, _discoSmoke.material.opacity - dt * 0.15);
+        if (_discoSmoke.material.opacity <= 0) {
+            _discoSmoke.visible = false;
+            _discoSmoke.material.opacity = 0;
+        }
     }
 }
 function resetDisco() {   // back to plain white (disco toggled off)
-    for (const h of _discoHandles()) { const col = h.mesh.geometry.attributes.color; col.array.fill(1); col.needsUpdate = true; for (let i = 0; i < h.count; i++) h.next[i] = 0; }
+    // Hide smoke
+    if (_discoSmoke) { _discoSmoke.visible = false; _discoSmoke.material.opacity = 0; }
+    
+    for (const h of _discoHandles()) {
+        // reset vertex colors
+        if (h.discoMesh) {
+            const col = h.discoMesh.geometry.attributes.color;
+            col.array.fill(1);
+            col.needsUpdate = true;
+            for (let i = 0; i < h.count; i++) h.next[i] = 0;
+        }
+
+        // reset all lights to white normal intensity
+        if (h.discoLights) {
+            for (const dl of h.discoLights) {
+                dl.light.color.set(0xffffff);
+                dl.light.intensity = DISCO_LIGHT_NORMAL;
+                dl.nextPulse = 0;
+                dl.color.set(1, 1, 1);
+                if (dl.light.children[0] instanceof Lensflare) {
+                    const lf = dl.light.children[0];
+                    for (const elem of lf.elements) elem.color.set(1, 1, 1);
+                }
+            }
+        }
+    }
+    
+    // Reset fog
+    if (scene.fog) {
+        scene.fog.color.set(0x88aacc);
+        scene.fog.density = 0.003;
+    }
 }
 // Each "faulty" fixture (objects.room.faulty) flickers on its own clock: mostly lit, but every few
 // seconds it stutters off/on for a moment like a dying fluorescent tube.
@@ -3053,7 +3300,7 @@ function init() {
     // Create the scene
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0xaed4f5);                 // sky blue (the community is outdoors)
-    scene.fog = new THREE.Fog(0xc8e2f6, 600, 2600);              // sky-tinted haze, pushed far out
+    scene.fog = new THREE.FogExp2(0x88aacc, 0.003);              // exponential fog, will be overridden during disco mode
     // Add ambient light. Lighter ground term so down-facing surfaces (drop-ceiling tiles, duct/pipe
     // undersides) aren't dim when viewed from below.
     const light = new THREE.HemisphereLight(0xeeeeff, 0x9a9aa2, 2.6);
@@ -3076,6 +3323,9 @@ function init() {
     renderer.setSize(window.innerWidth, window.innerHeight);
     document.body.appendChild(renderer.domElement);
     maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
+
+    // Initialize disco smoke particle system
+    _initDiscoSmoke();
 
     // IDEA-2: WebGL context loss handling
     _animationLoopCb = animate;  // stored callback; honoured on restore
@@ -3246,6 +3496,9 @@ function animate() {
     maybeCycleIdleView();
     maybeFlicker();
 
+    // Update disco smoke particles
+    if (options.disco && options.discoSmoke) _updateDiscoSmoke(clock.getDelta());
+
     // FPS monitoring for automatic quality scaling (MINOR-6: skip during idle mode)
     if (!_skipExpensiveUpdates) {
         _updateFPS(now);
@@ -3403,7 +3656,7 @@ window.DC = {
             _autoQualityScale(now);
         }
         maybeFlicker();
-        updateDisco();
+        updateDisco(clock.getDelta());
         maybeCycleIdleView();
         updateFlyTo();
         if ((_hlFrame++ % 4) === 0) updateHighlight();
