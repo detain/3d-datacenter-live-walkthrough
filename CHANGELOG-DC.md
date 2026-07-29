@@ -22,6 +22,41 @@ Two browser tabs with the same session (same user) can now see each other in Dat
 
 ---
 
+### Bot Presence System (NEW FEATURE)
+
+When a real user joins DataCenter 3D, a simulated bot avatar is spawned that wanders around the datacenter. When the last real user leaves, the bot is cleaned up.
+
+#### Backend Changes (`Events.php`)
+
+| Function | Description |
+|----------|-------------|
+| `spawnBotForLocation($location)` | Spawns bot when first user joins a location |
+| `moveBot($location)` | 500ms timer moves bot toward random target at 1.2 units/sec |
+| `cleanupBotForLocation($location)` | Removes bot when last user leaves |
+
+**Bot client_id format:** `bot_$location`
+
+**Feature Flags:**
+
+| Function | Description |
+|----------|-------------|
+| `FeatureFlags::dcBotPresenceEnabled()` | Returns true by default; controls enable/disable |
+| `setDcBotPresence(false)` | Disable at runtime |
+| Enabled/disabled via GlobalData key `dc_bot_presence` | Runtime toggle |
+
+**Implementation Details:**
+
+- Uses `hasRealUsersAtLocation()` to skip broadcasting when no audience
+- Proper CAS (compare-and-swap) loops for atomic position updates
+- Bot movement: single `sqrt()` per move (not double)
+- 2 GlobalData writes per move (not 3)
+- Early exit when no real users watching
+- Single `lcg_value()` call with anti-correlated coordinates for random target selection
+
+**Tests:** 18 new bot tests added
+
+---
+
 ### Comprehensive Audit Fixes (2026-07-29)
 
 A full code audit was performed across all DataCenter 3D frontend modules (`dc.js`, `dc-ws.js`, `dc-presence.js`, `dc-multi.js`) and the backend Events.php handler. All critical, major, minor, and bug-level fixes have been applied and committed.
