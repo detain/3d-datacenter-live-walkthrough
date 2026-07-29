@@ -76,7 +76,7 @@
 		#dcPresenceLabel { color: #aabbd0; }
 		#dcPresenceCount { font-weight: bold; color: #fff; margin-left: 2px; }
 	</style>
-	<!-- DC: Three.js scene via importmap, see dc.php -->
+	<!-- DC: Three.js scene via importmap (standalone static fallback) -->
 	<link rel="stylesheet" href="/css/dc.css?v=p45">
 	<link rel="modulepreload" href="/lib/three/build/three.module.js">
 	<link rel="modulepreload" href="/lib/three/examples/jsm/controls/PointerLockControls.js">
@@ -123,6 +123,14 @@
 		<button data-view="cables">Cables</button>
 	</div>
 	<div id="dcLocations"></div>
+	<script>
+		// MINOR-2: keyboard nav for location buttons (Enter/Space triggers click)
+		document.getElementById('dcLocations').addEventListener('keydown', (e) => {
+			if (e.key === 'Enter' || e.key === ' ') {
+				e.target.click();
+			}
+		});
+	</script>
 	<div id="dcPresence">
 		<span id="dcPresenceDot"></span>
 		<span id="dcPresenceLabel">Users: <span id="dcPresenceCount">0</span></span>

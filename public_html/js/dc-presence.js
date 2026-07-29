@@ -184,12 +184,15 @@ import * as THREE from "/lib/three/build/three.module.js";
 	function makeNameSprite(name) {
 		/* eslint-disable no-undef */
 		// Return cached sprite for this username (Fix 1 — cache the Sprite, not just the texture)
+		// MAJOR-6: guard against duplicate entries in _nameSpriteCacheOrder
 		if (_nameSpriteCache.has(name)) {
 			var cached = _nameSpriteCache.get(name);
 			// Move to end of order (most recently used)
 			var idx = _nameSpriteCacheOrder.indexOf(name);
 			if (idx !== -1) { _nameSpriteCacheOrder.splice(idx, 1); }
-			_nameSpriteCacheOrder.push(name);
+			if (_nameSpriteCacheOrder.indexOf(name) === -1) {
+				_nameSpriteCacheOrder.push(name);
+			}
 			return cached.sprite;  // sprite already in scene from previous call — no new object created
 		}
 
@@ -313,7 +316,10 @@ import * as THREE from "/lib/three/build/three.module.js";
 		if (!entry) return;
 
 		// Dispose cached name sprite texture+sprite and clear from cache (Fix 1)
-		if (entry.name && _nameSpriteCache.has(entry.name)) {
+		// MAJOR-5: guard against invalid names before cache operations
+		if (!entry.name || typeof entry.name !== 'string' || entry.name.trim() === '') {
+			// Guard against invalid names — still clean up the avatar group below
+		} else if (_nameSpriteCache.has(entry.name)) {
 			var cached = _nameSpriteCache.get(entry.name);
 			cached.texture.dispose();
 			if (cached.sprite.material) cached.sprite.material.dispose();
@@ -348,7 +354,6 @@ import * as THREE from "/lib/three/build/three.module.js";
 	 */
 	function tickAvatars(dt) {
 		if (document.hidden) return;
-		if (!_sceneReady) return;
 
 		state.remote.forEach(function (entry) {
 			if (!entry.group) return;

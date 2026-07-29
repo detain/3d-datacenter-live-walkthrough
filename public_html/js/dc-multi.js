@@ -14,7 +14,7 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { DRACOLoader } from "three/addons/loaders/DRACOLoader.js";
 
-const MANIFEST_URL = "/images/3d/mixamo/manifest.json";
+const MANIFEST_URL = window.DC_MANIFEST_URL || "/images/3d/mixamo/manifest.json";
 
 // Camera collision cache — avoids re-running the expensive collision loop when player hasn't moved (Fix 6)
 // Includes camera direction to skip re-computation during mouse-look rotation (Fix 9)
@@ -87,10 +87,13 @@ const _camTarget = new THREE.Vector3();
 function log(...a) { console.log("[dc-multi]", ...a); }
 
 // ---------------------------------------------------------------- bootstrap
-function whenReady(cb) {
+function whenReady(cb, timeoutMs = 15000) {
+  const start = performance.now();
   const tick = () => {
     if (window.DC && DC.scene && DC.camera && DC.renderer && DC.controls && DC.options) cb();
-    else setTimeout(tick, 80);
+    else if (performance.now() - start > timeoutMs) {
+      console.error(`[dc-multi] whenReady timeout - DC not initialized after ${timeoutMs}ms`);
+    } else setTimeout(tick, 80);
   };
   tick();
 }
@@ -110,8 +113,11 @@ whenReady(async () => {
 
   try {
     const res = await fetch(MANIFEST_URL, { cache: "default" });
-    if (res.ok) S.manifest = await res.json();
-  } catch (e) { /* manifest may not exist yet */ }
+    if (!res.ok) throw new Error(`HTTP ${res.status} for ${MANIFEST_URL}`);
+    S.manifest = await res.json();
+  } catch (e) {
+    console.warn('[dc-multi] manifest unavailable (may be normal on first load):', e.message);
+  }
 
   if (!S.manifest || !S.manifest.characters || !S.manifest.characters.length) {
     log("no manifest/characters yet at", MANIFEST_URL, "- run the downloader's `batch` command.");
@@ -129,43 +135,75 @@ whenReady(async () => {
   applyMode();                                    // sets visibility for the starting mode
   // Re-sync the player anchor whenever pointer-lock engages (dc may have re-spawned the camera).
   S.controls.addEventListener("lock", syncPlayerFromCamera);
-  S.controls.addEventListener("unlock", function () {
+
+  // CRIT-2: Store handler references so they can be removed on cleanup
+  const _onUnlock = () => {
     if (typeof window.DC_PRESENCE_LEAVE === 'function') window.DC_PRESENCE_LEAVE();
-  });
-  // dc.js re-spawns the camera on its own (lock from a demo view, location switch). Follow it so the
-  // character never gets left behind in the previous room.
-  document.addEventListener('dc:respawn', function (e) {
+  };
+  /**
+   * dc:respawn event handler.
+   * Expected detail shape: { x: number, z: number }
+   * Both coordinates are required — handler returns early if either is missing.
+   */
+  const _onRespawn = (e) => {
     const d = (e && e.detail) || {};
     if (typeof d.x !== 'number' || typeof d.z !== 'number') return;
     S.player.position.set(d.x, 0, d.z);
     S.vy = 0; S.spawned = true;
-  });
-  // Take over the loop: drive the player, then let dc render (flyTo + highlight + labels + render).
-  if (S.DC.setAnimationLoop) S.DC.setAnimationLoop(frame);
-  exposeDebug();
-  log("overlay active. mode =", S.mode);
-
-  // Dispose cached logo texture and glass material on page close/navigate (Fix 2)
-  window.addEventListener('beforeunload', function () {
-    if (_cachedLogoTexture) { _cachedLogoTexture.dispose(); _cachedLogoTexture = null; }
-    if (_cachedGlassMaterial) { _cachedGlassMaterial.dispose(); _cachedGlassMaterial = null; }
-  });
-  // Disable presence on disconnect/auth-failure; re-enabled on auth-success (MAJOR-6)
-  document.addEventListener('dc:disconnected', () => { window.DC_PRESENCE_ENABLED = false; });
-  document.addEventListener('dc:auth-failure', () => { window.DC_PRESENCE_ENABLED = false; });
-  document.addEventListener('dc:auth-success', () => { window.DC_PRESENCE_ENABLED = true; });
-
-  // IDEA-2: Context loss handling (IDEA-2)
-  document.addEventListener('dc:context-lost', () => {
-    log('GPU context lost');
-  });
-  document.addEventListener('dc:context-restored', () => {
+    // BUG-4: Repopulate character picker in case manifest was reloaded
+    if (S.manifest && S.manifest.characters && S.manifest.characters.length) {
+        populateCharacterPicker();
+    }
+  };
+  const _onDisconnected = () => { window.DC_PRESENCE_ENABLED = false; };
+  const _onAuthFailure = () => { window.DC_PRESENCE_ENABLED = false; };
+  const _onAuthSuccess = () => { window.DC_PRESENCE_ENABLED = true; };
+  const _onContextLost = () => { log('GPU context lost'); };
+  const _onContextRestored = () => {
     log('GPU context restored — player state may need refresh');
     // If player was visible, trigger respawn to sync position (MAJOR-9)
     if (S.player && S.spawned) {
       trySpawn(S.player.position.x, S.player.position.z, S.facing);
     }
-  });
+  };
+
+  S.controls.addEventListener("unlock", _onUnlock);
+  // dc.js re-spawns the camera on its own (lock from a demo view, location switch). Follow it so the
+  // character never gets left behind in the previous room.
+  document.addEventListener('dc:respawn', _onRespawn);
+  // Take over the loop: drive the player, then let dc render (flyTo + highlight + labels + render).
+  if (S.DC.setAnimationLoop) S.DC.setAnimationLoop(frame);
+  exposeDebug();
+  log("overlay active. mode =", S.mode);
+
+  // CRIT-2: Remove all event listeners on page close/navigate to prevent memory leaks (bfcache)
+  const cleanup = () => {
+    S.controls.removeEventListener("lock", syncPlayerFromCamera);
+    S.controls.removeEventListener("unlock", _onUnlock);
+    document.removeEventListener('dc:respawn', _onRespawn);
+    document.removeEventListener('dc:disconnected', _onDisconnected);
+    document.removeEventListener('dc:auth-failure', _onAuthFailure);
+    document.removeEventListener('dc:auth-success', _onAuthSuccess);
+    document.removeEventListener('dc:context-lost', _onContextLost);
+    document.removeEventListener('dc:context-restored', _onContextRestored);
+    // CRIT-2: cleanup setupInput() listeners
+    document.removeEventListener("keydown", _onKeyDown);
+    document.removeEventListener("keyup", _onKeyUp);
+    document.removeEventListener("wheel", onWheel, { passive: false });
+    if (S._dcPersonBtn) S._dcPersonBtn.removeEventListener("click", _onBtnClick);
+    if (S._dcCharSel) S._dcCharSel.removeEventListener("change", _onCharChange);
+    if (_cachedLogoTexture) { _cachedLogoTexture.dispose(); _cachedLogoTexture = null; }
+    if (_cachedGlassMaterial) { _cachedGlassMaterial.dispose(); _cachedGlassMaterial = null; }
+  };
+  window.addEventListener('beforeunload', cleanup);
+  // Disable presence on disconnect/auth-failure; re-enabled on auth-success (MAJOR-6)
+  document.addEventListener('dc:disconnected', _onDisconnected);
+  document.addEventListener('dc:auth-failure', _onAuthFailure);
+  document.addEventListener('dc:auth-success', _onAuthSuccess);
+
+  // IDEA-2: Context loss handling (IDEA-2)
+  document.addEventListener('dc:context-lost', _onContextLost);
+  document.addEventListener('dc:context-restored', _onContextRestored);
 });
 
 // ---------------------------------------------------------------- character
@@ -198,6 +236,7 @@ async function loadCharacter(ch) {
 
   log("loading character", ch.name, ch.model);
   const cb = (S.manifest && S.manifest.generated_at) ? ('?m=' + encodeURIComponent(S.manifest.generated_at)) : '';
+  hud("Loading character...");
   try {
     var gltf = await S.loader.loadAsync(ch.model + cb);
   } catch (e) {
@@ -206,6 +245,7 @@ async function loadCharacter(ch) {
     hud("Character model failed to load — movement enabled without character");
     return;
   }
+  hud("");
   const root = gltf.scene;
   root.traverse(o => { if (o.isMesh) { o.castShadow = true; o.frustumCulled = false; } });
 
@@ -334,8 +374,11 @@ function frame() {
 
   // Throttled presence update — dc-presence.js enforces the 250ms throttle internally
   // Bug #3: only send moves if DC_PRESENCE_ENABLED is not false (join must have succeeded first)
+  // MAJOR-10: only send if model is loaded
   if (typeof window.DC_PRESENCE_MOVE === 'function' && window.DC_PRESENCE_ENABLED !== false) {
-    window.DC_PRESENCE_MOVE(S.player.position.x, S.player.position.z, S.facing);
+    if (S.model && !S.modelLoadFailed) {
+      window.DC_PRESENCE_MOVE(S.player.position.x, S.player.position.z, S.facing);
+    }
   }
 
   chooseAnimation(moving, speed);
@@ -400,6 +443,7 @@ function placeCamera() {
       const inside = insideRoom(S.player.position.x, S.player.position.z, 0);
       for (let d = 2; d <= S.camDist; d += 1.5) {
         const cx = _head.x - _dir.x * d, cz = _head.z - _dir.z * d;
+        // MAJOR-11: Camera uses 60% radius for clearance — player uses full radius for movement collision
         if (collide(cx, cz, rad * 0.6)
           || currentDoorShutBlocks(cx, cz, rad * 0.6)
           || (inside && !insideRoom(cx, cz, rad * 0.6))) { dist = Math.max(2.5, d - 1.5); break; }
@@ -599,6 +643,13 @@ function syncPlayerFromCamera() {
   const cam = S.camera.position;
   const ours = S.camPlacedValid && cam.distanceToSquared(S.camPlaced) < 1;
   if (ours) { S.player.position.y = 0; S.vy = 0; S.spawned = true; return; }
+  // First-person mode: PointerLockControls owns camera, don't teleport player
+  if (S.mode === "first") return;
+  // Cancel any existing fly animation
+  if (window.DC && window.DC.flyTo) {
+    window.DC.flyTo.active = false;
+    window.DC.flyTo.onDone = null;
+  }
   if (playableSpot(cam.x, cam.z)) {
     S.player.position.set(cam.x, 0, cam.z);
     S.vy = 0; S.spawned = true;
@@ -698,39 +749,46 @@ function flashGesture(text) {                          // brief centred toast na
 }
 
 // ---------------------------------------------------------------- input + UI
+// Named handlers for cleanup (CRIT-2)
+const _onKeyDown = (e) => {
+  if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+  switch (e.code) {
+    case "ShiftLeft": case "ShiftRight": S.options.runFast = true; break;
+    case "Space": if (S.grounded) { S.vy = JUMP_V; S.grounded = false; } break;
+    case "KeyV": case "KeyC": toggleMode(); break;
+    case "Digit1": gesture("dance1"); break;
+    case "Digit2": gesture("dance2"); break;
+    case "Digit3": gesture("clap"); break;
+    case "Digit4": gesture("dying"); break;
+    case "Digit5": gesture("wave"); break;
+    case "Digit6": gesture("dance3"); break;
+    case "Digit7": gesture("dance4"); break;
+    case "Digit8": gesture("salute"); break;
+    case "Digit9": gesture("cheer"); break;
+    case "KeyG": cycleGesture(1); break;                    // cycle forward through ALL gestures
+    case "KeyH": cycleGesture(-1); break;                   // cycle backward
+    case "Backquote": case "Digit0": endGesture(); break;   // return to normal / stop the gesture
+    case "KeyR": trySpawn(); break;                       // reset player to spawn
+  }
+};
+const _onKeyUp = (e) => {
+  if (e.code === "ShiftLeft" || e.code === "ShiftRight") S.options.runFast = false;
+};
+const _onBtnClick = (e) => { e.stopPropagation(); toggleMode(); };
+const _onCharChange = () => {
+  const sel = S._dcCharSel;
+  const ch = S.manifest.characters.find(c => c.id === sel.value);
+  if (ch) { S.spawned = false; loadCharacter(ch); }
+};
+
 function setupInput() {
-  document.addEventListener("keydown", (e) => {
-    if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
-    switch (e.code) {
-      case "ShiftLeft": case "ShiftRight": S.options.runFast = true; break;
-      case "Space": if (S.grounded) { S.vy = JUMP_V; S.grounded = false; } break;
-      case "KeyV": case "KeyC": toggleMode(); break;
-      case "Digit1": gesture("dance1"); break;
-      case "Digit2": gesture("dance2"); break;
-      case "Digit3": gesture("clap"); break;
-      case "Digit4": gesture("dying"); break;
-      case "Digit5": gesture("wave"); break;
-      case "Digit6": gesture("dance3"); break;
-      case "Digit7": gesture("dance4"); break;
-      case "Digit8": gesture("salute"); break;
-      case "Digit9": gesture("cheer"); break;
-      case "KeyG": cycleGesture(1); break;                    // cycle forward through ALL gestures
-      case "KeyH": cycleGesture(-1); break;                   // cycle backward
-      case "Backquote": case "Digit0": endGesture(); break;   // return to normal / stop the gesture
-      case "KeyR": trySpawn(); break;                       // reset player to spawn
-    }
-  });
-  document.addEventListener("keyup", (e) => {
-    if (e.code === "ShiftLeft" || e.code === "ShiftRight") S.options.runFast = false;
-  });
+  document.addEventListener("keydown", _onKeyDown);
+  document.addEventListener("keyup", _onKeyUp);
   document.addEventListener("wheel", onWheel, { passive: false });
   const btn = document.getElementById("dcPerson");
-  if (btn) btn.addEventListener("click", (e) => { e.stopPropagation(); toggleMode(); });
+  if (btn) { S._dcPersonBtn = btn; btn.addEventListener("click", _onBtnClick); }
   const sel = document.getElementById("dcChar");
-  if (sel) sel.addEventListener("change", () => {
-    const ch = S.manifest.characters.find(c => c.id === sel.value);
-    if (ch) { S.spawned = false; loadCharacter(ch); }
-  });
+  if (sel) { S._dcCharSel = sel; sel.addEventListener("change", _onCharChange); }
 }
 
 function populateCharacterPicker() {
@@ -772,9 +830,23 @@ function hud(text) {
   el.textContent = text;
 }
 
+function showHelp() {
+  const help = document.createElement('div');
+  help.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.9);color:#fff;padding:24px;border-radius:8px;z-index:9999;font-family:sans-serif;font-size:14px;line-height:1.8;';
+  help.innerHTML = '<strong>DataCenter 3D Controls</strong><br>' +
+      'W/A/S/D - Move &nbsp; Mouse - Look<br>' +
+      'Space - Jump &nbsp; Shift - Run<br>' +
+      '1-9 - Switch locations<br>' +
+      'F - Toggle fly &nbsp; G - Toggle GUI<br>' +
+      'Click - Lock pointer';
+  document.body.appendChild(help);
+  setTimeout(() => help.remove(), 4000);
+}
+
 function exposeDebug() {
   window.DCM = {
-    state: S,
+    getPosition: () => ({ x: S.player.position.x, z: S.player.position.z }),
+    getState: () => ({ mode: S.mode, spawned: S.spawned, charId: S.loadedCharId }),
     setMode, toggleMode, gesture, endGesture, cycleGesture,
     play: (l) => play(l, 0.2),
     reload: () => location.reload(),
@@ -784,6 +856,7 @@ function exposeDebug() {
     getConnected: () => window.DC_AUTHED || false,
     // IDEA-3: expose current viewport from WS layer
     getViewport: () => window.DC_WS?._viewport || null,
+    showHelp,
     viewDist: 50,
   };
 }

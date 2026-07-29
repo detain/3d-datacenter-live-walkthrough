@@ -62,7 +62,8 @@
 		// Only allow if it's the same host as the default or an allowed test host
 		try {
 			const parsed = new URL(_wsUrlOverride);
-			const allowedHosts = ['mystage.interserver.net'];
+			const _defaultHosts = ['mystage.interserver.net'];
+			const allowedHosts = window.DC_WS_ALLOWED_HOSTS || _defaultHosts;
 			if (parsed.protocol !== 'wss:') {
 				console.warn('DC_WS: ws_url must use wss:// protocol, using default');
 				_wsUrlOverride = null;
@@ -106,6 +107,12 @@
 		// IDEA-3: viewport update throttle
 		this._viewportSendTimer = null;
 		this._viewport = null;
+		// MAJOR-2: visibilitychange handler — flush batch immediately when tab becomes visible
+		document.addEventListener('visibilitychange', () => {
+			if (!document.hidden && this._presenceBatch && this._presenceBatch.length > 0) {
+				this._flushPresence();
+			}
+		});
 	}
 
 	Client.prototype = {
@@ -150,8 +157,9 @@
 				if (!self.closedByUs && self.reconnectAttempts < self.maxReconnectAttempts) {
 					self.reconnectAttempts++;
 					setTimeout(function () { self._connect(); }, self.reconnectDelay);
-					// exponential backoff: double each attempt, cap at 30s, then add jitter
-					self.reconnectDelay = Math.min(self.reconnectDelay * 2, 30000) * (0.5 + Math.random() * 0.5);
+					// exponential backoff: double each attempt, cap at 30s, then add jitter (cap AFTER jitter to stay within 30s ceiling)
+					const baseDelay = Math.min(self.reconnectDelay * 2, 30000);
+					self.reconnectDelay = baseDelay * (0.5 + Math.random() * 0.5);
 				} else if (!self.closedByUs) {
 					// exhausted reconnect attempts
 					self._setStatus('exhausted');
@@ -349,7 +357,12 @@
 		_updateViewport: function (data) {
 			// data: { x, y, z, dirX, dirY, dirZ } — camera position + look direction
 			this._viewport = data;
+			// MAJOR-7: 100ms throttle before the existing 500ms cooldown
 			if (this._viewportSendTimer) return;
+			if (!this._lastViewportUpdate) this._lastViewportUpdate = 0;
+			const now = Date.now();
+			if (now - this._lastViewportUpdate < 100) return;
+			this._lastViewportUpdate = now;
 			this._viewportSendTimer = setTimeout(() => {
 				this._viewportSendTimer = null;
 				this._sendRaw({

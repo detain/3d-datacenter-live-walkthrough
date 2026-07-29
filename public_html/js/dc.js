@@ -72,7 +72,11 @@ function _guardLoop(cb) {
 // --- requestIdleCallback polyfill (MAJOR-8: fix broken fallback) ---
 const _ric = requestIdleCallback
     ? (cb, opts) => requestIdleCallback(cb, opts)
-    : (cb) => setTimeout(cb, 2000);  // Safari lacks rIC; 2s delay is a reasonable idle guess
+    : (cb) => {
+        const mc = new MessageChannel();
+        mc.port1.onmessage = () => cb({ didTimeout: false });
+        mc.port2.postMessage(null);
+    };
 
 // --- FPS monitoring for automatic quality scaling ---
 const FPS_WINDOW = 60;          // frames to average over (must be before ring buffer)
@@ -132,7 +136,7 @@ const RACK_GRID_CELL = 10;  // 10-unit cells for racks (smaller than building-sc
 // Cache: locationId → { geometry, tubeCount } for cable geometry (Fix #10)
 const _cableGeometryCache = new Map();
 const _cableCacheOrder = [];
-const MAX_CABLE_CACHE = 3;
+const MAX_CABLE_CACHE = 8;  // MAJOR-9: increased from 3 to 8
 
 // Cache: poster spec string → CanvasTexture (Fix #11)
 const _posterTextureCache = new Map();
@@ -343,6 +347,8 @@ function _updateFPS(now) {
         _fpsHistory[_fpsHead] = delta;
         _fpsHead = (_fpsHead + 1) % FPS_WINDOW;
         if (_fpsCount < FPS_WINDOW) _fpsCount++;
+        // Note: _fpsCount stops incrementing once FPS_WINDOW (60) is reached
+        // The check above is redundant after buffer fills but kept for clarity
     }
     _lastFrameTime = now;
 }
@@ -487,6 +493,14 @@ function updateGuiPos() {
 function displayGui() {
     // Fix #17: Dispose old gui before creating a new one to prevent ghost DOM elements
     if (gui) {
+        // MAJOR-15: Manually clean up controller callbacks before destroy().
+        // lil-gui's destroy() removes the DOM element but may not remove all internal
+        // event listeners. Attempt to off() any onChange callbacks on controllers.
+        if (gui.controllers && gui.controllers.length) {
+            for (const c of gui.controllers) {
+                if (typeof c.off === 'function') c.off();
+            }
+        }
         gui.domElement.remove();
         gui.destroy();
         gui = null;
@@ -616,6 +630,10 @@ function loadDatacenter() {
 }
 
 function clearScene() {
+    // BUG-2: Ensure presence state is cleaned up before scene disposal
+    if (typeof window.DC_PRESENCE_LEAVE === 'function') {
+        window.DC_PRESENCE_LEAVE();
+    }
     // Reset idle skip state (Bug #2: clearScene must not leave stale skip mode from a previous scene)
     _tickSkippedFrames = 0;
     _skipExpensiveUpdates = false;
@@ -805,7 +823,10 @@ function loadGlbWithFallback(basePath, relName, onLoad) {
         const isLast = i === GLB_VARIANTS.length - 1;
         i += 1;
         loaderGltf.load(url, onLoad, undefined, isLast
-            ? (err) => console.error('Failed to load model (all variants): ' + url, err)
+            ? (err) => {
+                console.error('[dc] All GLB variants failed for', basePath, relName, err);
+                hud("Warning: Some 3D models failed to load — scene may be incomplete");
+            }
             : tryNext);
     };
     tryNext();
@@ -2171,7 +2192,11 @@ function collideWorld(x, z, r) {
 		// missing its collider list. collideWorld is called from the render loop, and an exception there
 		// kills the loop outright, so never assume the array is there.
 		const cols = (b.full ? b.full.colliders : b.blockColliders) || [];
-		for (let i = 0; i < cols.length; i++) if (hit(cols[i])) return true;
+		for (let i = 0; i < cols.length; i++) {
+			const c = cols[i];
+			if (!c) continue;
+			if (hit(c)) return true;
+		}
 	}
 	return false;
 }
@@ -2626,7 +2651,7 @@ function setupControls() {
     if (controls && typeof controls.dispose === "function") {
         controls.dispose();
     }
-    if (options.useFirstPerson == true) {
+    if (options.useFirstPerson === true) {
         controls = new FirstPersonControls(camera, renderer.domElement);
         if (instructions) instructions.style.display = "none";
         if (blocker) blocker.style.display = "none";
@@ -3182,7 +3207,7 @@ function animate() {
         _skipExpensiveUpdates = true;
     }
 
-    if (options.useFirstPerson == true) {
+    if (options.useFirstPerson === true) {
         controls.update( clock.getDelta() );
     } else {
         // Update controls if locked
@@ -3345,9 +3370,11 @@ window.DC = {
             if (stats) stats.update();
             return renderer.info.render.calls;
         }
-        // MINOR-6: FPS monitoring — only runs when not in idle skip mode
-        _updateFPS(now);
-        _autoQualityScale(now);
+        // MINOR-10: FPS monitoring — only runs when not in idle skip mode
+        if (!_skipExpensiveUpdates) {
+            _updateFPS(now);
+            _autoQualityScale(now);
+        }
         maybeFlicker();
         updateDisco();
         maybeCycleIdleView();
