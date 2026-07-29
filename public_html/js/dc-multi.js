@@ -879,6 +879,10 @@ function exposeDebug() {
     getViewport: () => window.DC_WS?._viewport || null,
     /** Show keyboard controls overlay for 4 seconds */
     showHelp,
+    /** Get WebSocket connection state */
+    getWsState: () => window.DC_WS?.getState() ?? null,
+    /** Check if presence/multiplayer is enabled */
+    getPresenceEnabled: () => window.DC_PRESENCE_ENABLED !== false,
     viewDist: 50,
   };
 }

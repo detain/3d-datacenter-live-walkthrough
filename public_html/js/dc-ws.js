@@ -107,6 +107,10 @@
 		// IDEA-3: viewport update throttle
 		this._viewportSendTimer = null;
 		this._viewport = null;
+		// Graceful degradation: whether connection has succeeded at least once
+		this._connectedOnce = false;
+		// Track last pong received timestamp for getState()
+		this._lastPongTs = null;
 		// MAJOR-2: visibilitychange handler — flush batch immediately when tab becomes visible
 		document.addEventListener('visibilitychange', () => {
 			if (!document.hidden && this._presenceBatch && this._presenceBatch.length > 0) {
@@ -120,15 +124,21 @@
 		_connect: function () {
 			var self = this;
 			this._setStatus('connecting');
+			console.log(`[dc-ws] Connecting to ${this.wsUrl} (attempt ${this.reconnectAttempts + 1})`);
 			try {
 				this.ws = new WebSocket(this.wsUrl);
 			} catch (e) {
+				console.log('[dc-ws] Connection failed - multiplayer disabled');
+				window.DC_PRESENCE_ENABLED = false;
 				this._setStatus('error');
 				return;
 			}
 			this.ws.onopen = function () {
 				self.reconnectAttempts = 0;
 				self.reconnectDelay = 3000;
+				self._connectedOnce = true;
+				self._setStatus('connected');
+				console.log(`[dc-ws] Connected. Session: ${window.DC_SESSION_ID || 'unknown'}`);
 				self._dispatchEvent(document, 'dc:connected');
 				self._hello();
 				// Keepalive: client sends ping to server
@@ -146,12 +156,13 @@
 				}, WS_KEEPALIVE_MS);
 			};
 			this.ws.onmessage = function (e) { self._onFrame(e.data); };
-			this.ws.onclose = function () {
+			this.ws.onclose = function (e) {
 				self.authed = false;
 				if (self._keepaliveTimer) {
 					clearInterval(self._keepaliveTimer);
 					self._keepaliveTimer = null;
 				}
+				console.log(`[dc-ws] Connection closed. Code: ${e.code}, Reason: ${e.reason || 'none'}`);
 				self._setStatus('disconnected');
 				self._dispatchEvent(document, 'dc:disconnected');
 				if (!self.closedByUs && self.reconnectAttempts < self.maxReconnectAttempts) {
@@ -161,11 +172,17 @@
 					const baseDelay = Math.min(self.reconnectDelay * 2, 30000);
 					self.reconnectDelay = baseDelay * (0.5 + Math.random() * 0.5);
 				} else if (!self.closedByUs) {
-					// exhausted reconnect attempts
+					// exhausted reconnect attempts - enable graceful degradation
+					if (!self._connectedOnce) {
+						console.log('[dc-ws] Connection failed - multiplayer disabled');
+						window.DC_PRESENCE_ENABLED = false;
+					}
 					self._setStatus('exhausted');
 				}
 			};
-			this.ws.onerror = function () { /* onclose follows */ };
+			this.ws.onerror = function (e) {
+				console.log('[dc-ws] Connection error:', e);
+			};
 		},
 
 		/** Send auth.hello on every (re)connect. */
@@ -185,7 +202,11 @@
 		 * @param {Object} envelope */
 		_sendRaw: function (envelope) {
 			if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-				this.ws.send(JSON.stringify(envelope));
+				const json = JSON.stringify(envelope);
+				// Debug logging for sent messages
+				const dataStr = json.length > 100 ? json.slice(0, 100) + '...' : json;
+				console.log(`[dc-ws] >>> ${envelope.op} ${dataStr}`);
+				this.ws.send(json);
 			}
 		},
 
@@ -214,6 +235,7 @@
                         cancelAnimationFrame(this._batchRaf);
                         this._batchRaf = null;
                     }
+                    console.log(`[dc-ws] Batch throttled, ${this._presenceBatch.length} pending`);
                     this._flushPresence();
                     return;
                 }
@@ -239,6 +261,7 @@
 		// IDEA-1: flush batched presence moves
 		_flushPresence: function () {
 			if (this._presenceBatch && this._presenceBatch.length) {
+				console.log(`[dc-ws] Flushing ${this._presenceBatch.length} presence updates`);
 				for (const { op, data } of this._presenceBatch) {
 					this._sendRaw({
 						v: 1,
@@ -266,6 +289,21 @@
 			var op = envelope.op;
 			var data = envelope.data || {};
 
+			// Debug logging for received messages
+			const dataStr = JSON.stringify(data).length > 100 ? JSON.stringify(data).slice(0, 100) + '...' : JSON.stringify(data);
+			console.log(`[dc-ws] <<< ${op} ${dataStr}`);
+
+			// Debug logging for presence updates from others
+			if (op === 'dc.presence.move' && data.name) {
+				console.log(`[dc-ws] Remote avatar ${data.name} moved to (${data.x}, ${data.z})`);
+			}
+			if (op === 'dc.presence.join' && data.name) {
+				console.log(`[dc-ws] ${data.name} joined (client ${data.clientId || 'unknown'})`);
+			}
+			if (op === 'dc.presence.leave' && data.name) {
+				console.log(`[dc-ws] ${data.name} left`);
+			}
+
 			// auth.welcome — authentication succeeded
 			if (op === 'auth.welcome') {
 				this.authed = true;
@@ -277,6 +315,7 @@
 					session: data.session,
 					hub_time: data.hub_time
 				};
+				window.DC_PRESENCE_ENABLED = true;
 				this._dispatchEvent(document, 'dc:auth-success', data);
 				return;
 			}
@@ -292,6 +331,7 @@
 			// pong — server responded to our keepalive ping
 			if (op === 'pong') {
 				// IDEA-7: track latency
+				this._lastPongTs = Date.now();
 				if (this._lastPingTs) {
 					const latency = Date.now() - this._lastPingTs;
 					window.DC_LATENCY = latency;
@@ -336,7 +376,7 @@
 
 		_setStatus: function (status) {
 			if (typeof window.DC_DEBUG !== 'undefined' && window.DC_DEBUG) {
-				console.debug('[dc-ws]', status);
+				console.log('[dc-ws]', status);
 			}
 		},
 
@@ -346,6 +386,22 @@
 			if (history.length === 0) return null;
 			const sum = history.reduce((a, b) => a + b, 0);
 			return Math.round(sum / history.length);
+		},
+
+		// Debug: get comprehensive connection state
+		getState: function () {
+			return {
+				connected: this.connected(),
+				authenticated: this.authed,
+				clientId: window.DC_UID || null,
+				sessionId: window.DC_SESSION_ID || null,
+				latency: window.DC_LATENCY || null,
+				lastPing: this._lastPingTs || null,
+				lastPong: this._lastPongTs || null,
+				// Note: This is the NEXT attempt number (pre-increment), not completed attempts
+				reconnectAttempts: this.reconnectAttempts,
+				presenceEnabled: window.DC_PRESENCE_ENABLED !== false
+			};
 		},
 
 		// IDEA-2: check if WebSocket is currently connected
@@ -416,8 +472,42 @@
 	 * @param {string} op   Op name, e.g. 'dc.presence.join'.
 	 * @param {Object} [data] */
 	window.DC_PRESENCE_SEND = function (op, data) {
-		if (window.DC_WS) {
+		if (window.DC_WS && window.DC_WS.connected()) {
 			window.DC_WS.send(op, data);
+		}
+	};
+
+	// Presence functions that gracefully degrade when WebSocket is not available
+	// DC_PRESENCE_JOIN - join the presence session
+	window.DC_PRESENCE_JOIN = function(x, z, facing) {
+		if (window.DC_PRESENCE_ENABLED === false) {
+			console.log('[dc-presence] WS not connected, join skipped');
+			return;
+		}
+		if (window.DC_WS && window.DC_WS.connected()) {
+			window.DC_WS.send('dc.presence.join', { x: x, z: z, facing: facing });
+		}
+	};
+
+	// DC_PRESENCE_MOVE - update presence position
+	window.DC_PRESENCE_MOVE = function(x, z, facing) {
+		if (window.DC_PRESENCE_ENABLED === false) {
+			console.log('[dc-presence] WS not connected, move skipped');
+			return;
+		}
+		if (window.DC_WS && window.DC_WS.connected()) {
+			window.DC_WS.send('dc.presence.move', { x: x, z: z, facing: facing });
+		}
+	};
+
+	// DC_PRESENCE_LEAVE - leave the presence session
+	window.DC_PRESENCE_LEAVE = function() {
+		if (window.DC_PRESENCE_ENABLED === false) {
+			console.log('[dc-presence] WS not connected, leave skipped');
+			return;
+		}
+		if (window.DC_WS && window.DC_WS.connected()) {
+			window.DC_WS.send('dc.presence.leave', {});
 		}
 	};
 
