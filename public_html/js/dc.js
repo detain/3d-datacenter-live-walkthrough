@@ -3201,6 +3201,10 @@ function updateDisco(dt) {
     if (options.discoFog && scene.fog) {
         scene.fog.color.copy(_discoColor);
         scene.fog.density = 0.006;  // denser fog during disco for volumetric feel
+    } else if (scene.fog) {
+        // Instantly reset to normal fog when option is off
+        scene.fog.color.set(0x88aacc);
+        scene.fog.density = 0.003;
     }
 
     // 4. Smoke visibility (only when discoSmoke is on)
@@ -3208,13 +3212,10 @@ function updateDisco(dt) {
         if (!_discoSmoke.visible) _discoSmoke.visible = true;
         // Fade in: reach max opacity over ~1 second
         _discoSmoke.material.opacity = Math.min(0.12, _discoSmoke.material.opacity + dt * 0.12);
-    } else if (_discoSmoke && _discoSmoke.visible) {
-        // Fade out when smoke sub-option is off
-        _discoSmoke.material.opacity = Math.max(0, _discoSmoke.material.opacity - dt * 0.15);
-        if (_discoSmoke.material.opacity <= 0) {
-            _discoSmoke.visible = false;
-            _discoSmoke.material.opacity = 0;
-        }
+    } else if (_discoSmoke) {
+        // Instantly hide when option is off (no slow fade needed for sub-option toggle)
+        _discoSmoke.visible = false;
+        _discoSmoke.material.opacity = 0;
     }
 }
 function resetDisco() {   // back to plain white (disco toggled off)
