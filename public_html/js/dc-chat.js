@@ -14,7 +14,7 @@
  *   - Auto-joins channel "chat:noc" on authentication
  *   - Sends messages via channel.publish op
  *   - Handles channel.message and chat.message incoming events
- *   - Local /status command returns synthetic status response
+ *   - /status command sent to server via channel.publish
  *   - System/info/warn/error messages styled distinctly
  *
 	 * ---------------------------------------------------------------------------
@@ -75,7 +75,7 @@
 
 	/** Module-level idle state exposed for use by _renderMessage */
 	const _idleState = {
-		resetFn: /** @type {((messagesEl: HTMLElement) => void)|null} */ (null)
+		resetFn: /** @type {((frame: HTMLElement) => void)|null} */ (null)
 	};
 
 	/* -------------------------- DOM helpers -------------------------- */
@@ -125,7 +125,7 @@
 				font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
 				font-size: 13px;
 				color: #e8e8f0;
-				background: rgba(20, 20, 28, 0.15);
+				background: rgba(20, 20, 28, 0.85);
 				backdrop-filter: blur(8px);
 				-webkit-backdrop-filter: blur(8px);
 				border-top-right-radius: 10px;
@@ -136,13 +136,15 @@
 				transition: background 0.3s ease, height 0.25s ease;
 			}
 
-			.dc-chat-frame:hover {
-				background: rgba(20, 20, 28, 0.85);
+			.dc-chat-frame.dc-chat-idle {
+				background: rgba(20, 20, 28, 0.15);
+				pointer-events: none;
 			}
 
-			.dc-chat-messages-faded .dc-chat-msg-body {
-				opacity: 0.3;
-				transition: opacity 2s ease;
+			.dc-chat-frame.dc-chat-idle:hover,
+			.dc-chat-frame.dc-chat-idle:focus-within {
+				background: rgba(20, 20, 28, 0.85);
+				pointer-events: auto;
 			}
 
 			.dc-chat-header {
@@ -366,7 +368,7 @@
 			}
 		});
 
-		return { frame, styleEl, messagesEl, inputEl };
+		return { frame, styleEl, messagesEl, inputEl, inputArea };
 	}
 
 	/* -------------------------- Message rendering -------------------------- */
@@ -397,9 +399,9 @@
 	 * @param {{ from_name?: string, body: string, ts?: number, level?: string, from?: string }} msg
 	 * @param {string} msgClass  — CSS class suffix from _msgClass()
 	 */
-	function _renderMessage(messagesEl, msg, msgClass) {
+	function _renderMessage(messagesEl, msg, msgClass, frame) {
 		// Reset idle timer on new message
-		if (_idleState.resetFn) _idleState.resetFn(messagesEl);
+		if (_idleState.resetFn) _idleState.resetFn(frame);
 
 		const el = document.createElement('div');
 		el.className = 'dc-chat-msg' + (msgClass ? ' dc-chat-msg-' + msgClass : '');
@@ -425,41 +427,6 @@
 			const old = _messageBuffer.shift();
 			old.remove();
 		}
-	}
-
-	/* -------------------------- Status command -------------------------- */
-
-	/**
-	 * Build and render a local synthetic status response message.
-	 *
-	 * @param {HTMLElement} messagesEl
-	 */
-	function _handleStatusCommand(messagesEl) {
-		const now = new Date();
-		const timestamp = now.toISOString().replace('T', ' ').slice(0, 19);
-
-		/** @type {string} */
-		const clientCount = 'connected';
-
-		const presenceName = (window.DC_PRESENCE && (window.DC_PRESENCE.name || window.DC_PRESENCE.uid))
-			? (window.DC_PRESENCE.name || `User:${window.DC_PRESENCE.uid}`)
-			: 'Unknown';
-
-		const statusBody = [
-			`─── Status Check ───`,
-			`Time    : ${timestamp}`,
-			`User    : ${presenceName}`,
-			`Clients : ${clientCount}`,
-			`Status  : ✓ All systems operational`,
-			`─────────────────────`,
-		].join('\n');
-
-		_renderMessage(messagesEl, {
-			from_name: 'system',
-			body: statusBody,
-			level: 'info',
-			ts: Math.floor(Date.now() / 1000)
-		}, 'level-info');
 	}
 
 	/* -------------------------- WebSocket integration -------------------------- */
@@ -566,15 +533,15 @@
 		const _IDLE_FADE_MS = 60000;
 
 		/**
-		 * Reset the idle timer. When timer fires, messages fade.
-		 * @param {HTMLElement} messagesEl
+		 * Reset the idle timer. When timer fires, frame becomes faded.
+		 * @param {HTMLElement} frame
 		 */
-		function _resetIdleTimer(messagesEl) {
+		function _resetIdleTimer(frame) {
 			if (_idleTimer) clearTimeout(_idleTimer);
-			messagesEl.classList.remove('dc-chat-messages-faded');
+			frame.classList.remove('dc-chat-idle');
 			if (!_isHovered) {
 				_idleTimer = setTimeout(() => {
-					messagesEl.classList.add('dc-chat-messages-faded');
+					frame.classList.add('dc-chat-idle');
 				}, _IDLE_FADE_MS);
 			}
 		}
@@ -590,10 +557,11 @@
 				if (initialized) return;
 				initialized = true;
 
-				const { frame: f, styleEl: s, messagesEl: msgEl } = _buildChatFrame();
+				const { frame: f, styleEl: s, messagesEl: msgEl, inputArea: ia } = _buildChatFrame();
 				frame = f;
 				styleEl = s;
 				messagesEl = msgEl;
+				const inputArea = ia;
 
 				wsCleanup = _wireWebSocket(this);
 
@@ -601,21 +569,35 @@
 				frame.addEventListener('mouseenter', () => {
 					_isHovered = true;
 					if (_idleTimer) { clearTimeout(_idleTimer); _idleTimer = null; }
-					messagesEl.classList.remove('dc-chat-messages-faded');
+					frame.classList.remove('dc-chat-idle');
+					inputArea.classList.add('visible');
 				});
 				frame.addEventListener('mouseleave', () => {
 					_isHovered = false;
-					_resetIdleTimer(messagesEl);
+					inputArea.classList.remove('visible');
+					_resetIdleTimer(frame);
 				});
+
+				// Wire up focus listener for input (treat focus like hover)
+				inputEl.addEventListener('focusin', () => {
+					_isHovered = true;
+					if (_idleTimer) { clearTimeout(_idleTimer); _idleTimer = null; }
+					frame.classList.remove('dc-chat-idle');
+				});
+
+				inputEl.addEventListener('focusout', () => {
+					_isHovered = false;
+					_resetIdleTimer(frame);
+				});
+
 				// Start the idle timer initially
-				_resetIdleTimer(messagesEl);
+				_resetIdleTimer(frame);
 
 				console.log('[dc-chat] Initialized');
 			},
 
 			/**
-			 * Send a text message to the chat:noc channel.
-			 * Intercepts /status locally; all other messages are sent via
+			 * Send a text message to the chat:noc channel via
 			 * channel.publish over the DC_WS connection.
 			 *
 			 * @param {string} text
@@ -627,12 +609,6 @@
 				}
 
 				const trimmed = (text || '').trim();
-
-				// /status command — handled locally
-				if (trimmed === '/status') {
-					if (messagesEl) _handleStatusCommand(messagesEl);
-					return;
-				}
 
 				if (!trimmed) return;
 
@@ -656,7 +632,7 @@
 			addMessage(msg) {
 				if (!initialized || !messagesEl || !msg) return;
 				const msgClass = _msgClass(msg);
-				_renderMessage(messagesEl, msg, msgClass);
+				_renderMessage(messagesEl, msg, msgClass, frame);
 			},
 
 			/**

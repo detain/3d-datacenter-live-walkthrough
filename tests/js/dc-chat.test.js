@@ -246,10 +246,10 @@ describe('dc-chat.js — DC_CHAT public API', () => {
 });
 
 // ----------------------------------------------------------------
-// Tests: /status command handling
+// Tests: /status command handling (now sent to server)
 // ----------------------------------------------------------------
-describe('dc-chat.js — /status command', () => {
-  it('/status is handled locally and does NOT send via DC_WS', () => {
+describe('dc-chat.js — /status command (server-side)', () => {
+  it('/status is sent via DC_WS.send with channel.publish op', () => {
     const mockWs = {
       send: vi.fn(),
       readyState: 1 // OPEN
@@ -259,36 +259,20 @@ describe('dc-chat.js — /status command', () => {
 
     win.DC_CHAT.sendMessage('/status');
 
-    // /status should NOT call DC_WS.send
-    expect(mockWs.send).not.toHaveBeenCalled();
+    // /status should call DC_WS.send with channel.publish
+    expect(mockWs.send).toHaveBeenCalledTimes(1);
+    const sentData = JSON.parse(mockWs.send.mock.calls[0][0]);
+    expect(sentData.op).toBe('channel.publish');
+    expect(sentData.data.channel).toBe('chat:noc');
+    expect(sentData.data.body).toBe('/status');
+    expect(sentData.data.level).toBe('chat');
   });
 
-  it('/status adds a synthetic info-level message to the chat', () => {
-    const mockWs = {
-      send: vi.fn(),
-      readyState: 1
-    };
-    const { win, simulateDomReady, mockFrames } = loadDcChat({ DC_WS: mockWs });
+  it('renders Status Bot channel.message response correctly', () => {
+    const mockWs = { send: vi.fn(), readyState: 1 };
+    const { win, simulateDomReady, fireDocumentEvent } = loadDcChat({ DC_WS: mockWs });
     simulateDomReady();
 
-    win.DC_CHAT.sendMessage('/status');
-
-    // The frame should have been created
-    expect(mockFrames.length).toBeGreaterThan(0);
-  });
-
-  it('/status body contains "Status:", "Clients:", "Channels:"', () => {
-    const mockWs = {
-      send: vi.fn(),
-      readyState: 1
-    };
-    const { win, simulateDomReady, mockFrames } = loadDcChat({
-      DC_WS: mockWs,
-      DC_PRESENCE: { name: 'TestUser' }
-    });
-    simulateDomReady();
-
-    // Capture the message that would be rendered
     let capturedMsg = null;
     const origAddMessage = win.DC_CHAT.addMessage;
     win.DC_CHAT.addMessage = function(msg) {
@@ -296,62 +280,23 @@ describe('dc-chat.js — /status command', () => {
       origAddMessage(msg);
     };
 
-    win.DC_CHAT.sendMessage('/status');
+    // Simulate server response: Status Bot sending status info
+    fireDocumentEvent('dc:v1-event', {
+      op: 'channel.message',
+      data: {
+        channel: 'chat:noc',
+        from: 'status-bot',
+        from_name: 'Status Bot',
+        body: 'Status: OK | Clients: 5 | Channels: 3',
+        level: 'chat',
+        ts: 1719700000
+      }
+    });
 
     expect(capturedMsg).not.toBeNull();
-    expect(capturedMsg.body).toContain('Status:');
-    expect(capturedMsg.body).toContain('Clients:');
-    expect(capturedMsg.body).toContain('Channels:');
-    expect(capturedMsg.level).toBe('info');
-    expect(capturedMsg.from_name).toBe('system');
-  });
-
-  it('/status with DC_PRESENCE.name shows the user name', () => {
-    const mockWs = {
-      send: vi.fn(),
-      readyState: 1
-    };
-    const { win, simulateDomReady } = loadDcChat({
-      DC_WS: mockWs,
-      DC_PRESENCE: { name: 'MyTestUser' }
-    });
-    simulateDomReady();
-
-    let capturedMsg = null;
-    const origAddMessage = win.DC_CHAT.addMessage;
-    win.DC_CHAT.addMessage = function(msg) {
-      capturedMsg = msg;
-      origAddMessage(msg);
-    };
-
-    win.DC_CHAT.sendMessage('/status');
-
-    // Check body matches structured status format with user info
-    expect(capturedMsg.body).toMatch(/User:\s*MyTestUser/);
-  });
-
-  it('/status without DC_PRESENCE shows "Unknown" for user', () => {
-    const mockWs = {
-      send: vi.fn(),
-      readyState: 1
-    };
-    const { win, simulateDomReady } = loadDcChat({
-      DC_WS: mockWs,
-      DC_PRESENCE: null
-    });
-    simulateDomReady();
-
-    let capturedMsg = null;
-    const origAddMessage = win.DC_CHAT.addMessage;
-    win.DC_CHAT.addMessage = function(msg) {
-      capturedMsg = msg;
-      origAddMessage(msg);
-    };
-
-    win.DC_CHAT.sendMessage('/status');
-
-    // Check body matches structured status format with Unknown user
-    expect(capturedMsg.body).toMatch(/User:\s*Unknown/);
+    expect(capturedMsg.from_name).toBe('Status Bot');
+    expect(capturedMsg.body).toBe('Status: OK | Clients: 5 | Channels: 3');
+    expect(capturedMsg.level).toBe('chat');
   });
 });
 
@@ -609,14 +554,14 @@ describe('dc-chat.js — _msgClass helper (via addMessage)', () => {
     const { win, simulateDomReady } = loadDcChat({ DC_WS: mockWs });
     simulateDomReady();
 
-    // Trigger _handleStatusCommand which creates a system info message
+    // System messages are added directly via addMessage
     let capturedMsg = null;
     const origAddMessage = win.DC_CHAT.addMessage;
     win.DC_CHAT.addMessage = function(msg) {
       capturedMsg = msg;
     };
 
-    win.DC_CHAT.sendMessage('/status');
+    win.DC_CHAT.addMessage({ from_name: 'system', body: 'System message', level: 'info' });
 
     expect(capturedMsg.level).toBe('info');
     expect(capturedMsg.from_name).toBe('system');
