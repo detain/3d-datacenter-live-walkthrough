@@ -78,6 +78,17 @@
 		resetFn: /** @type {((frame: HTMLElement) => void)|null} */ (null)
 	};
 
+	/**
+	 * WebSocket connection toggle state.
+	 * When false, the chat frame is hidden and DC_WS connection is not used.
+	 * Persisted to localStorage under 'dc_ws_enabled'.
+	 * @type {boolean}
+	 */
+	let wsEnabled = true;
+
+	/** localStorage key for persisting the wsEnabled preference */
+	const WS_ENABLED_KEY = 'dc_ws_enabled';
+
 	/* -------------------------- DOM helpers -------------------------- */
 
 	/**
@@ -351,7 +362,7 @@
 			inputArea.classList.remove('visible');
 		});
 
-		// ---- Send on Enter keypress ------------------------------------------
+		// ---- Send on Enter keypress, blur on Esc/Tab ------------------------------------------
 		inputEl.addEventListener('keydown', (e) => {
 			if (e.key === 'Enter') {
 				e.preventDefault();
@@ -360,6 +371,12 @@
 					window.DC_CHAT.sendMessage(text);
 					inputEl.value = '';
 				}
+			} else if (e.key === 'Escape' || e.key === 'Tab') {
+				// Esc or Tab: blur input and return focus to canvas
+				e.preventDefault();
+				inputEl.blur();
+				const canvas = document.querySelector('canvas');
+				if (canvas) canvas.focus();
 			}
 		});
 
@@ -505,6 +522,7 @@
 	 * @property {(msg: ChatMessage) => void} addMessage
 	 * @property {() => void} clearMessages
 	 * @property {() => void} destroy
+	 * @property {() => boolean} focusInput
 	 */
 
 	/**
@@ -524,6 +542,12 @@
 
 		/** @type {(() => void)|null} */
 		let wsCleanup = null;
+
+		/** @type {HTMLElement|null} */
+		let inputEl = null;
+
+		/** @type {HTMLElement|null} */
+		let inputArea = null;
 
 		/** @type {boolean} */
 		let initialized = false;
@@ -565,8 +589,8 @@
 				frame = f;
 				styleEl = s;
 				messagesEl = msgEl;
-				const inputEl = iEl;
-				const inputArea = ia;
+				inputEl = iEl;
+				inputArea = ia;
 
 				wsCleanup = _wireWebSocket(this);
 
@@ -594,6 +618,33 @@
 					_isHovered = false;
 					_resetIdleTimer(frame);
 				});
+
+				// Wire up WebSocket toggle button
+				const toggleBtn = document.getElementById('dcWsToggle');
+				if (toggleBtn) {
+					toggleBtn.addEventListener('click', () => {
+						wsEnabled = !wsEnabled;
+						localStorage.setItem(WS_ENABLED_KEY, String(wsEnabled));
+						if (!wsEnabled) {
+							// Turn OFF: destroy chat frame and close WebSocket
+							this.destroy();
+							if (window.DC_WS && typeof window.DC_WS.close === 'function') {
+								window.DC_WS.close();
+							}
+							toggleBtn.textContent = 'Chat: OFF';
+							toggleBtn.classList.add('off');
+						} else {
+							// Turn ON: reinitialize
+							this.init();
+							if (window.DC_WS) {
+								window.DC_WS.closedByUs = false;
+								window.DC_WS._connect();
+							}
+							toggleBtn.textContent = 'Chat: ON';
+							toggleBtn.classList.remove('off');
+						}
+					});
+				}
 
 				// Start the idle timer initially
 				_resetIdleTimer(frame);
@@ -668,7 +719,21 @@
 					wsCleanup = null;
 				}
 				if (_idleTimer) { clearTimeout(_idleTimer); _idleTimer = null; }
+				inputEl = null;
+				inputArea = null;
 				initialized = false;
+			},
+
+			/**
+			 * Focus the chat input element.
+			 * @returns {boolean} true if input was focused, false if not available
+			 */
+			focusInput() {
+				if (inputEl) {
+					inputEl.focus();
+					return true;
+				}
+				return false;
 			}
 		};
 	}
@@ -679,9 +744,26 @@
 	 * Boot the module once the DOM is ready.
 	 */
 	function _boot() {
+		// Restore wsEnabled preference from localStorage (default true)
+		const stored = localStorage.getItem(WS_ENABLED_KEY);
+		if (stored !== null) {
+			wsEnabled = stored === 'true';
+		}
+
 		_instance = createAPI();
 		window.DC_CHAT = _instance;
-		_instance.init();
+
+		// Initialize only if WebSocket is enabled
+		if (wsEnabled) {
+			_instance.init();
+		} else {
+			// Mark toggle button as OFF state if ws is disabled
+			const toggleBtn = document.getElementById('dcWsToggle');
+			if (toggleBtn) {
+				toggleBtn.textContent = 'Chat: OFF';
+				toggleBtn.classList.add('off');
+			}
+		}
 	}
 
 	if (document.readyState === 'loading') {

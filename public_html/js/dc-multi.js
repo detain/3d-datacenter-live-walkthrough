@@ -206,6 +206,7 @@ whenReady(async () => {
     if (S._dcCharSel) S._dcCharSel.removeEventListener("change", _onCharChange);
     if (_cachedLogoTexture) { _cachedLogoTexture.dispose(); _cachedLogoTexture = null; }
     if (_cachedGlassMaterial) { _cachedGlassMaterial.dispose(); _cachedGlassMaterial = null; }
+    if (_hudEl && _hudEl.parentNode) { _hudEl.parentNode.removeChild(_hudEl); _hudEl = null; }
   };
   window.addEventListener('beforeunload', cleanup);
   // Disable presence on disconnect/auth-failure; re-enabled on auth-success (MAJOR-6)
@@ -445,7 +446,10 @@ function placeCamera() {
   const _posKey = S.player.position.x.toFixed(1) + ',' + S.player.position.z.toFixed(1);
   const _camDirKey = Math.round(_dir.x * 20) + ',' + Math.round(_dir.y * 20) + ',' + Math.round(_dir.z * 20);
   let dist;
-  const playerMoved = !_lastPlayerPos.equals(S.player.position);
+  const playerMoved = (
+    _lastPlayerPos.x.toFixed(1) !== S.player.position.x.toFixed(1) ||
+    _lastPlayerPos.z.toFixed(1) !== S.player.position.z.toFixed(1)
+  );
   if (!playerMoved && _posKey === _lastCollisionCamPos && _camDirKey === _lastCollisionCamDir && S.camDist === _lastSafeDist) {
     dist = _lastSafeDist;
   } else {
@@ -750,18 +754,27 @@ function cycleGesture(dir) {
   flashGesture(GESTURE_NAMES[label] || label);
 }
 
-let _gFlashTimer = 0;
+let _gFlashEl = null, _gFlashTimer = null;
 function flashGesture(text) {                          // brief centred toast naming the gesture you cycled to
-  let el = document.getElementById("dcGesture");
-  if (!el) {
-    el = document.createElement("div"); el.id = "dcGesture";
-    el.style.cssText = "position:fixed;top:46px;left:50%;transform:translateX(-50%);z-index:33;padding:5px 14px;" +
+  if (!_gFlashEl) {
+    _gFlashEl = document.createElement("div");
+    _gFlashEl.id = "dcGesture";
+    _gFlashEl.style.cssText = "position:fixed;top:46px;left:50%;transform:translateX(-50%);z-index:33;padding:5px 14px;" +
       "background:rgba(20,20,28,0.85);color:#ffd23a;border-radius:5px;font:bold 14px Arial,sans-serif;pointer-events:none;transition:opacity .3s;";
-    document.body.appendChild(el);
+    document.body.appendChild(_gFlashEl);
   }
-  el.textContent = text; el.style.opacity = "1";
   clearTimeout(_gFlashTimer);
-  _gFlashTimer = setTimeout(() => { el.style.opacity = "0"; }, 1200);
+  _gFlashEl.textContent = text;
+  _gFlashEl.style.opacity = "1";
+  _gFlashTimer = setTimeout(() => {
+    _gFlashEl.style.opacity = "0";
+    _gFlashTimer = setTimeout(() => {
+      if (_gFlashEl && _gFlashEl.parentNode) {
+        _gFlashEl.parentNode.removeChild(_gFlashEl);
+        _gFlashEl = null;
+      }
+    }, 300);                                           // wait for CSS transition to complete
+  }, 1200);
 }
 
 // ---------------------------------------------------------------- input + UI
@@ -840,10 +853,19 @@ function populateCharacterPicker() {
   build();
 }
 
+let _hudEl = null;
+
 function hud(text) {
-  let el = document.getElementById("dcPlayerHud");
-  if (!el) { el = document.createElement("div"); el.id = "dcPlayerHud"; document.body.appendChild(el); }
-  el.textContent = text;
+  if (!text || text === "") {
+    if (_hudEl && _hudEl.parentNode) { _hudEl.parentNode.removeChild(_hudEl); _hudEl = null; }
+    return;
+  }
+  if (!_hudEl) {
+    _hudEl = document.createElement("div");
+    _hudEl.id = "dcPlayerHud";
+    document.body.appendChild(_hudEl);
+  }
+  _hudEl.textContent = text;
 }
 
 /**

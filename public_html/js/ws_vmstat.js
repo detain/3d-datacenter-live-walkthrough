@@ -139,7 +139,7 @@
         var self = this;
         var ws;
         try {
-            ws = new global.WebSocket(this.url);
+            ws = new global.WebSocket(this.url, 'v1');
         } catch (e) {
             console.log('ws_vmstat: WebSocket error: ' + e.message);
             return;

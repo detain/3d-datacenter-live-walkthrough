@@ -258,7 +258,7 @@
         this.setStatus('connecting', 'Connecting to ' + this.url + ' ...');
         var ws;
         try {
-            ws = new global.WebSocket(this.url);
+            ws = new global.WebSocket(this.url, 'v1');
         } catch (e) {
             this.setStatus('error', 'WebSocket error: ' + e.message);
             this.scheduleReconnect();

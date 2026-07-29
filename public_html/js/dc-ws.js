@@ -126,7 +126,7 @@
 			this._setStatus('connecting');
 			console.log(`[dc-ws] Connecting to ${this.wsUrl} (attempt ${this.reconnectAttempts + 1})`);
 			try {
-				this.ws = new WebSocket(this.wsUrl);
+				this.ws = new WebSocket(this.wsUrl, 'v1');
 			} catch (e) {
 				console.log('[dc-ws] Connection failed - multiplayer disabled');
 				window.DC_PRESENCE_ENABLED = false;
@@ -205,7 +205,11 @@
 				const json = JSON.stringify(envelope);
 				// Debug logging for sent messages
 				const dataStr = json.length > 100 ? json.slice(0, 100) + '...' : json;
-				console.log(`[dc-ws] >>> ${envelope.op} ${dataStr}`);
+				if (envelope.op === 'auth.hello') {
+					console.log(`[dc-ws] >>> auth.hello role=${envelope.data.role} session=${envelope.data.session}`);
+				} else {
+					console.log(`[dc-ws] >>> ${envelope.op} ${dataStr}`);
+				}
 				this.ws.send(json);
 			}
 		},
@@ -297,9 +301,9 @@
 				return;
 			}
 
-			// Debug logging for received messages
-			const dataStr = JSON.stringify(data).length > 100 ? JSON.stringify(data).slice(0, 100) + '...' : JSON.stringify(data);
-			console.log(`[dc-ws] <<< ${op} ${dataStr}`);
+			// Debug logging for received messages (guard against undefined op)
+			const dataStr = data !== undefined ? (JSON.stringify(data).length > 100 ? JSON.stringify(data).slice(0, 100) + '...' : JSON.stringify(data)) : 'undefined';
+			console.info('[dc-ws] <<', {op, data: dataStr});
 
 			// Debug logging for presence updates from others
 			if (op === 'dc.presence.move' && data.name) {

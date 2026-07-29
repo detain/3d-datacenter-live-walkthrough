@@ -135,10 +135,28 @@
 		<span id="dcPresenceDot"></span>
 		<span id="dcPresenceLabel">Users: <span id="dcPresenceCount">0</span></span>
 	</div>
+	<button id="dcWsToggle" type="button" title="Toggle chat connection" aria-label="Toggle chat">Chat: ON</button>
 	<script type="module" src="/js/dc-ws.js?v=p1"></script>
 	<script type="module" src="/js/dc.js?v=p48"></script>
 	<script type="module" src="/js/dc-presence.js?v=p1"></script>
 	<script type="module" src="/js/dc-multi.js?v=p26"></script>
 	<script type="module" src="/js/dc-chat.js?v=p1"></script>
+	<script>
+		// Feature 3: 'c' key focuses chat input when not in a text field
+		// Note: If dc.js has a 'c' binding that conflicts, this preventDefault()
+		// will stop it from reaching dc.js IF dc.js uses addEventListener.
+		// If dc.js uses onkeydown, the event will still reach both handlers.
+		document.addEventListener('keydown', function(e) {
+			// Only fire if not already in an input/textarea/contentEditable
+			if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable) return;
+
+			if (e.key === 'c' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+				e.preventDefault();
+				if (window.DC_CHAT && window.DC_CHAT.focusInput) {
+					window.DC_CHAT.focusInput();
+				}
+			}
+		});
+	</script>
 </body>
 </html>
