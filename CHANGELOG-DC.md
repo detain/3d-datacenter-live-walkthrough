@@ -197,6 +197,45 @@ window.DCM.getPresenceEnabled()  // Returns boolean indicating if presence syste
 
 ### July 2026
 
+##### Commit xxxxxxxx (2026-07-29)
+**feat(dc-chat): transparent chat frame overlay with NOC channel integration**
+
+**What was done:** Added a new `dc-chat.js` module providing a floating chat widget in the bottom-left corner of the datacenter 3D scene. The module connects to the NOC chat channel (`chat:noc`) via the existing DC_WS WebSocket connection.
+
+**Features:**
+- Semi-transparent dark chat frame (320x420px) in bottom-left viewport corner
+- Rolling 20-message buffer with auto-scroll to newest
+- Input area revealed on hover, hidden on mouse-leave
+- WebSocket integration via existing `DC_WS` global (listens for `dc:auth-success`)
+- Auto-joins channel `chat:noc` on successful authentication
+- Sends messages via `channel.publish` op
+- Handles `channel.message` and `chat.message` incoming events
+- Local `/status` command returns synthetic status response (client count, timestamp, channel count)
+- System/info/warn/error messages styled distinctly
+
+**New `/status` Command Handler (`Events.php`):**
+- New private method `handleStatusCommand($client_id, $re, $channel, $level)` in `Events.php`
+- Returns system status info to the requesting client only (not broadcast to the channel)
+- Gathers: connected WebSocket client count, current timestamp, and number of active channels from the `channel_meta` registry
+- Intercepts `/status` messages before they are persisted or broadcast
+
+**Files Changed:**
+| File | Change |
+|------|--------|
+| `public_html/js/dc-chat.js` | New module — transparent chat frame, bottom-left overlay |
+| `public_html/js/dc-chat.js` | `init()` — boot module on DOMContentLoaded |
+| `public_html/js/dc-chat.js` | `sendMessage(text)` — publish to chat:noc, intercept `/status` locally |
+| `public_html/js/dc-chat.js` | `addMessage(msg)` — insert synthetic message into local buffer |
+| `public_html/js/dc-chat.js` | `clearMessages()` — wipe visible log and in-memory buffer |
+| `public_html/js/dc-chat.js` | `destroy()` — tear down module and release resources |
+| `dc.html` | Added `<script src="/js/dc-chat.js">` for single-player entry point |
+| `dc.php` | Added `<script src="/js/dc-chat.js">` for multi-user entry point |
+| `/home/sites/datacentered/Applications/Chat/Events.php` | New `handleStatusCommand()` method for `/status` command handling |
+
+**Why it matters:** Provides real-time NOC chat capability directly within the datacenter 3D walkthrough, allowing operations staff to communicate without leaving the visualization. The `/status` command gives quick system health visibility. The transparent overlay design maintains the immersive 3D experience while keeping chat accessible.
+
+---
+
 ##### Commit 0a5e571f50 (2026-07-28)
 **fix(dc): restore the missing renderer.render() that froze the walkthrough**
 
