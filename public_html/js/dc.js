@@ -258,9 +258,9 @@ const options = {
     showCeiling: true,  // ceiling + fluorescent fixtures + HVAC ducts
     faultyLights: 1,    // PERCENT of fixtures that flicker, in EVERY building (0..100; default 1%)
     disco: false,       // master disco switch
-    discoSmoke: true,   // smoke particle effect when disco is on
-    discoFlare: true,   // lens flare on each light when disco is on
-    discoFog: true,     // volumetric fog color shift when disco is on
+    discoSmoke: false,   // smoke particle effect when disco is on
+    discoFlare: false,   // lens flare on each light when disco is on
+    discoFog: false,     // volumetric fog color shift when disco is on
 	moveForward: false,
 	moveBackward: false,
 	moveLeft: false,
