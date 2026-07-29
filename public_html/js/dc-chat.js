@@ -133,17 +133,21 @@
 				border-right: 1px solid rgba(255, 255, 255, 0.08);
 				z-index: 9998;
 				overflow: hidden;
-				transition: background 0.3s ease, height 0.25s ease;
+				opacity: 0.03;
+				transition: opacity 0.3s ease, height 0.25s ease;
+			}
+
+			.dc-chat-frame:hover,
+			.dc-chat-frame:focus-within {
+				opacity: 1;
 			}
 
 			.dc-chat-frame.dc-chat-idle {
-				background: rgba(20, 20, 28, 0.15);
 				pointer-events: none;
 			}
 
 			.dc-chat-frame.dc-chat-idle:hover,
 			.dc-chat-frame.dc-chat-idle:focus-within {
-				background: rgba(20, 20, 28, 0.85);
 				pointer-events: auto;
 			}
 
@@ -557,10 +561,11 @@
 				if (initialized) return;
 				initialized = true;
 
-				const { frame: f, styleEl: s, messagesEl: msgEl, inputArea: ia } = _buildChatFrame();
+				const { frame: f, styleEl: s, messagesEl: msgEl, inputEl: iEl, inputArea: ia } = _buildChatFrame();
 				frame = f;
 				styleEl = s;
 				messagesEl = msgEl;
+				const inputEl = iEl;
 				const inputArea = ia;
 
 				wsCleanup = _wireWebSocket(this);
