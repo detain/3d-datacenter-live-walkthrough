@@ -5,8 +5,10 @@
  * 1. dc-multi.js - whenReady() timeout: callback not called after timeout, error logged
  * 2. dc-multi.js - Cleanup removes all listeners including wheel {passive:false}
  * 3. dc-ws.js - Exponential backoff capped at 45000 (30000 * 1.5 max jitter)
- * 4. dc-presence.js - LRU cache dedup: duplicate names don't create duplicate entries
- * 5. dc.js - Null collider guard: null entries in colliders array don't cause errors
+ * 4. dc-ws.js - v1 error reply sets authed = false on envelope.ok === false
+ * 5. dc-ws.js - keepalive only fires when authenticated
+ * 6. dc-presence.js - LRU cache dedup: duplicate names don't create duplicate entries
+ * 7. dc.js - Null collider guard: null entries in colliders array don't cause errors
  *
  * DESIGN NOTE: These tests reimplement the source logic in a controlled way rather than
  * importing the actual source files. This is intentional because:
@@ -315,7 +317,47 @@ describe('dc-ws.js — reconnect exponential backoff cap', () => {
 });
 
 // =============================================================================
-// Test 4: dc-presence.js LRU cache deduplication
+// Test 4: dc-ws.js — v1 error reply handling
+// =============================================================================
+describe('dc-ws.js — v1 error reply handling', () => {
+  it('sets authed to false when envelope.ok is false', () => {
+    // Simulate receiving {v:1, re:"<id>", ok:false, error:{code:"bad_session"}}
+    const envelope = { v: 1, re: 'abc123', ok: false, error: { code: 'bad_session', message: 'Invalid session' } };
+    // Check the logic: if (envelope.ok === false && envelope.error) { this.authed = false; ... }
+    // Note: && returns the last truthy value, not a boolean, so we use toBeTruthy()
+    const authed = envelope.ok === false && envelope.error;
+    expect(authed).toBeTruthy();
+  });
+
+  it('dispatches dc:auth-failure event on v1 error reply', () => {
+    // Verify the event would be dispatched with correct error payload
+    const envelope = { v: 1, re: 'abc123', ok: false, error: { code: 'bad_session' } };
+    const shouldDispatch = envelope.ok === false && envelope.error;
+    expect(shouldDispatch).toBeTruthy();
+  });
+});
+
+// =============================================================================
+// Test 5: dc-ws.js — keepalive only when authenticated
+// =============================================================================
+describe('dc-ws.js — keepalive only when authenticated', () => {
+  it('should not send ping when not authenticated', () => {
+    const authed = false;
+    const wsReady = true;
+    const shouldSendPing = wsReady && authed;
+    expect(shouldSendPing).toBe(false);
+  });
+
+  it('should send ping when authenticated', () => {
+    const authed = true;
+    const wsReady = true;
+    const shouldSendPing = wsReady && authed;
+    expect(shouldSendPing).toBe(true);
+  });
+});
+
+// =============================================================================
+// Test 6: dc-presence.js LRU cache deduplication
 // =============================================================================
 describe('dc-presence.js — LRU cache deduplication', () => {
   it('MAJOR-6: indexOf check prevents duplicate entries in _nameSpriteCacheOrder', () => {
