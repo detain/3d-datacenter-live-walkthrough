@@ -144,7 +144,7 @@
 				// Keepalive: client sends ping to server
 				if (self._keepaliveTimer) clearInterval(self._keepaliveTimer);
 				self._keepaliveTimer = setInterval(function () {
-					if (self.ws && self.ws.readyState === WebSocket.OPEN) {
+					if (self.ws && self.ws.readyState === WebSocket.OPEN && self.authed) {
 						// MINOR-5: If we sent a ping > 2x keepalive interval ago without response, reconnect
 						if (self._lastPingTs && Date.now() - self._lastPingTs > WS_KEEPALIVE_MS * 2) {
 							self.ws.close();
@@ -288,6 +288,14 @@
 			}
 			var op = envelope.op;
 			var data = envelope.data || {};
+
+			// Handle v1 error reply (server sends this when auth fails via sendV1Error)
+			if (envelope.ok === false && envelope.error) {
+				this.authed = false;
+				window.DC_AUTHED = false;
+				this._dispatchEvent(document, 'dc:auth-failure', { error: envelope.error || {} });
+				return;
+			}
 
 			// Debug logging for received messages
 			const dataStr = JSON.stringify(data).length > 100 ? JSON.stringify(data).slice(0, 100) + '...' : JSON.stringify(data);
