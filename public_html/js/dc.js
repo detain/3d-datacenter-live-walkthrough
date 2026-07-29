@@ -3179,6 +3179,23 @@ function updateDisco(dt) {
                 const intensity = DISCO_LIGHT_MIN + (DISCO_LIGHT_MAX - DISCO_LIGHT_MIN) * (breath * 0.5 + 0.5);
                 dl.light.intensity = intensity;
 
+                // Sync Lensflare attachment to discoFlare option
+                if (options.discoFlare) {
+                    // Ensure Lensflare is attached when option is on
+                    if (!(dl.light.children[0] instanceof Lensflare)) {
+                        const lensflare = new Lensflare();
+                        lensflare.addElement(new LensflareElement(_flareTex1, 80, 0, dl.color.clone()));
+                        lensflare.addElement(new LensflareElement(_flareTex2, 40, 0.15, dl.color.clone()));
+                        lensflare.addElement(new LensflareElement(_flareTexHex, 30, 0.3, dl.color.clone()));
+                        dl.light.add(lensflare);
+                    }
+                } else {
+                    // Remove Lensflare when option is off
+                    if (dl.light.children[0] instanceof Lensflare) {
+                        dl.light.remove(dl.light.children[0]);
+                    }
+                }
+
                 // Color changes less frequently than vertex colors (less expensive)
                 if (now >= dl.nextPulse) {
                     dl.nextPulse = now + 800 + Math.random() * 1200;  // new color every 0.8-2s
