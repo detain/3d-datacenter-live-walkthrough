@@ -75,6 +75,60 @@ window.DCM.setMode('third')      // Switch to third-person
 window.DCM.toggleMode()          // Toggle between modes
 window.DCM.gesture('Wave')       // Play named gesture animation
 window.DCM.reload()              // Hard-reload the page
+window.DCM.getWsState()           // { connected, authenticated, clientId, sessionId, latency, lastPing, lastPong, reconnectAttempts, presenceEnabled }
+window.DCM.getPresenceEnabled()  // Boolean presence system status
+```
+
+### Debugging & Graceful Degradation
+
+#### Console Debug Logs (when `DC_DEBUG` enabled)
+
+The WebSocket module (`dc-ws.js`) and presence module (`dc-presence.js`) emit structured debug logs prefixed with `[dc-ws]` and `[dc-presence]` for troubleshooting connection issues and presence state:
+
+| Log Message | Module | Description |
+|-------------|--------|-------------|
+| `[dc-ws] Connecting to {url} (attempt {n})` | dc-ws.js | WebSocket connection attempt started |
+| `[dc-ws] Connected. Session: {sessionId}` | dc-ws.js | Successful connection established |
+| `[dc-ws] Connection closed. Code: {code}, Reason: {reason}` | dc-ws.js | Connection terminated |
+| `[dc-ws] >>> {op} {data}` | dc-ws.js | Outgoing message (truncated for display) |
+| `[dc-ws] <<< {op} {data}` | dc-ws.js | Incoming message (truncated for display) |
+| `[dc-ws] Remote avatar {name} moved to ({x}, {z})` | dc-ws.js | Remote player position update |
+| `[dc-ws] {name} joined (client {clientId})` | dc-ws.js | Player joined the session |
+| `[dc-ws] {name} left` | dc-ws.js | Player left the session |
+| `[dc-ws] Flushing {count} presence updates` | dc-ws.js | Presence batch flushed |
+| `[dc-ws] Batch throttled, {count} pending (500ms timeout)` | dc-ws.js | Throttle active, updates queued |
+| `[dc-presence] WS not connected, {op} skipped` | dc-presence.js | Graceful degradation active |
+
+#### Graceful Degradation
+
+When the WebSocket connection fails to establish, the presence system degrades gracefully to allow single-player operation to continue without interruption:
+
+- `DC_PRESENCE_ENABLED` is set to `false` upon connection failure
+- All presence operations (`dc:presence.move`, `dc:presence.join`, `dc:presence.leave`) become no-ops
+- The datacenter 3D scene remains fully functional in single-player mode
+- Users can retry connection by reloading the page or via the Debug API
+
+Presence functions check `DC_PRESENCE_ENABLED` before performing any operations, ensuring that no errors are thrown when WebSocket is unavailable.
+
+#### Extended Debug API
+
+The `window.DCM` debug interface has been extended with WebSocket state introspection:
+
+```javascript
+window.DCM.getWsState()    // Returns detailed WebSocket state object:
+                           // {
+                           //   connected: boolean,        // WebSocket connection status
+                           //   authenticated: boolean,   // Session authenticated
+                           //   clientId: string|null,    // Assigned client ID
+                           //   sessionId: string|null,  // Current session ID
+                           //   latency: number,          // Last measured latency in ms
+                           //   lastPing: number|null,    // Timestamp of last ping sent
+                           //   lastPong: number|null,    // Timestamp of last pong received
+                           //   reconnectAttempts: number, // Current reconnection attempt count
+                           //   presenceEnabled: boolean  // Presence system enabled
+                           // }
+
+window.DCM.getPresenceEnabled()  // Returns boolean indicating if presence system is active
 ```
 
 ---
