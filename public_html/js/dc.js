@@ -3084,6 +3084,13 @@ function init() {
     // IDEA-2: WebGL context loss handling
     _animationLoopCb = animate;  // stored callback; honoured on restore
 
+    // The hub is optional — DC_WS may be absent (script blocked / offline) or a stub, so never
+    // assume connected() is there. Used from the context-lost/restore handlers, where a throw
+    // would cost us the session backup or the scene rebuild.
+    function _wsConnected() {
+        return !!(window.DC_WS && typeof window.DC_WS.connected === 'function' && window.DC_WS.connected());
+    }
+
     function _backupSession() {
         _sessionBackup = {
             authenticated: window.DC_AUTHED === true,
@@ -3093,13 +3100,31 @@ function init() {
             loc: options.location || 0,
             pos: camera ? { x: camera.position.x, y: camera.position.y, z: camera.position.z } : null,
             yaw: camera ? camera.rotation.y : 0,
-            wsConnected: window.DC_WS && window.DC_WS.connected(),
+            wsConnected: _wsConnected(),
             ts: Date.now()
         };
     }
 
+    // Coerce a backed-up coordinate to a finite number. The hub's dc.presence.join handler
+    // treats non-numeric x/z/yaw as 0.0, and camera.position/_sessionBackup.pos can be null
+    // (context lost before the camera existed), so normalise here instead of shipping nulls.
+    function _finite(v) {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : 0;
+    }
+
+    /**
+     * Re-announce viewport + presence to the hub after a GPU context restore.
+     *
+     * DC_WS.send() takes TWO positional args — send(opString, dataObject) — and internally
+     * does op.startsWith('dc.presence.'), so handing it a whole v1 envelope threw a TypeError
+     * and killed the whole restore path. Everything here stays optional: the scene must work
+     * with no hub at all, so DC_WS may be null / never-connected / destroyed.
+     */
     function _rejoinPresence(session) {
-        if (window.DC_WS && window.DC_WS._updateViewport) {
+        if (!window.DC_WS) return;
+        const s = session || _sessionBackup || {};
+        if (typeof window.DC_WS._updateViewport === 'function' && camera) {
             const dir = new THREE.Vector3();
             camera.getWorldDirection(dir);
             window.DC_WS._updateViewport({
@@ -3112,28 +3137,72 @@ function init() {
                 viewDist: 50
             });
         }
-        if (window.DC_WS && window.DC_WS.send) {
-            window.DC_WS.send({
-                v: 1,
-                op: 'dc.presence.join',
-                data: {
-                    loc: session.loc || 0,
-                    x: session.pos ? session.pos.x : 0,
-                    z: session.pos ? session.pos.z : 0,
-                    yaw: session.yaw || 0
-                }
+        // prefer the live camera, fall back to the backed-up position
+        const pos = camera ? camera.position : s.pos;
+        const yaw = camera ? camera.rotation.y : s.yaw;
+        const x = _finite(pos ? pos.x : 0);
+        const z = _finite(pos ? pos.z : 0);
+        const rot = _finite(yaw);
+        // dc-presence owns the join: it latches so exactly one dc.presence.join goes out
+        // per session (a second one here would have the hub tracking us twice), it attaches
+        // the room bounds the bot needs, it honours the DC_PRESENCE_ENABLED kill switch, and
+        // it reads the real PLAYER pose back from dc-multi rather than the third-person
+        // CAMERA pose — which sits metres behind the player.
+        if (typeof window.DC_PRESENCE_JOIN === 'function') {
+            window.DC_PRESENCE_JOIN(x, z, rot);
+            return;
+        }
+        // No dc-presence on the page: fall back to a raw frame.
+        if (typeof window.DC_WS.send === 'function') {
+            window.DC_WS.send('dc.presence.join', {
+                loc: _finite(s.loc),          // hub ignores `loc`, kept for forward-compat
+                x: x,
+                z: z,
+                yaw: rot
             });
         }
     }
 
-    function _reconnectAndRejoin(session) {
-        if (!window.DC_WS) return;
-        const originalOnOpen = window.DC_WS._onOpen;
-        window.DC_WS._onOpen = function () {
-            if (originalOnOpen) originalOnOpen.call(window.DC_WS);
-            setTimeout(() => _rejoinPresence(session), 500);
+    /**
+     * Run `cb` the next time dc-ws reports an open socket. dc-ws.js dispatches 'dc:connected'
+     * on document from its ws.onopen handler — that DOM event is the public hook (there is no
+     * _onOpen member to override). Fires at most once and self-detaches after `timeoutMs` so a
+     * connect that never succeeds doesn't leave a listener that re-joins much later.
+     */
+    function _onceConnected(cb, timeoutMs) {
+        let done = false, timer = null;
+        const handler = function () {
+            if (done) return;
+            done = true;
+            if (timer) { clearTimeout(timer); timer = null; }
+            document.removeEventListener('dc:connected', handler);
+            cb();
         };
-        window.DC_WS._connect();
+        document.addEventListener('dc:connected', handler);
+        timer = setTimeout(function () {
+            if (done) return;
+            done = true;
+            document.removeEventListener('dc:connected', handler);
+        }, typeof timeoutMs === 'number' ? timeoutMs : 30000);
+    }
+
+    function _reconnectAndRejoin(session) {
+        const ws = window.DC_WS;
+        if (!ws) return;
+        // dc-chat's "Chat: OFF" calls DC_WS.destroy(), which sets closedByUs — respect that
+        // rather than dragging the socket back up behind the user's back.
+        if (ws.closedByUs) return;
+        _onceConnected(function () { setTimeout(function () { _rejoinPresence(session); }, 500); });
+        // Only kick a fresh connect when dc-ws has nothing armed of its own: its ws.onclose
+        // schedules _connect() while reconnectAttempts < maxReconnectAttempts, and connecting in
+        // parallel would leave two sockets racing over the single this.ws slot.
+        const attempts = ws.reconnectAttempts | 0;
+        const max = typeof ws.maxReconnectAttempts === 'number' ? ws.maxReconnectAttempts : 0;
+        const retryArmed = attempts > 0 && attempts < max;
+        const connecting = !!(ws.ws && ws.ws.readyState === 0);  // WebSocket.CONNECTING
+        if (!retryArmed && !connecting && typeof ws._connect === 'function') {
+            ws._connect();
+        }
     }
 
     function _showContextLostOverlay() {
@@ -3174,7 +3243,7 @@ function init() {
             camera.rotation.y = _sessionBackup.yaw || 0;
         }
         if (_sessionBackup && _sessionBackup.authenticated && window.DC_WS) {
-            if (window.DC_WS.connected()) {
+            if (_wsConnected()) {
                 _rejoinPresence(_sessionBackup);
             } else {
                 _reconnectAndRejoin(_sessionBackup);

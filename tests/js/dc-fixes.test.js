@@ -23,6 +23,11 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+// Most tests here reimplement logic (see DESIGN NOTE above), but a few assert against
+// the real source text to guard contracts that must not silently drift back.
+const fs = require('node:fs');
+const path = require('node:path');
+
 // =============================================================================
 // Helper: Extract whenReady implementation from dc-multi.js source
 // =============================================================================
@@ -632,7 +637,10 @@ describe('dc-ws.js — multi-tab presence (DC_CLIENT_ID)', () => {
   });
 
   it('auth.welcome sets DC_CLIENT_ID from data.clientId', () => {
-    // Simulate auth.welcome handler (lines 316-331 in dc-ws.js)
+    // Simulate the DC_CLIENT_ID fallback (`data.clientId || data.uid`) that dc-ws.js's
+    // _onWelcome() applies. Still correct after the A2 fix, which changed only HOW the
+    // welcome is recognised (correlated by `re` on an ok:true reply, since the hub sends
+    // no `op` on replies) — not what it does with the payload.
     const data = {
       uid: 77,
       clientId: 100,
@@ -685,38 +693,37 @@ describe('dc-ws.js — multi-tab presence (DC_CLIENT_ID)', () => {
     expect(global.window.DC_CLIENT_ID).toBe(77);
   });
 
-  it('DC_PRESENCE_MOVE includes clientId in the sent message', () => {
-    // Simulate DC_PRESENCE_MOVE (line 504-512 in dc-ws.js)
-    global.window.DC_CLIENT_ID = 100;
-    global.window.DC_PRESENCE_ENABLED = true;
+  // REPLACED (was: 'DC_PRESENCE_MOVE includes clientId in the sent message').
+  // The old test built an envelope inline and asserted what it had just built, so it
+  // verified nothing about the code — and it enshrined two things that are now
+  // deliberately wrong: a `facing:` key (the hub reads `yaw:`, so `facing` was silently
+  // dropped and yaw always arrived as 0.0) and a client-supplied `clientId`, which the
+  // hub intval()'d into garbage AND never ownership-checked, letting any client move
+  // another client's avatar. dc-ws.js's DC_PRESENCE_MOVE is gone; dc-presence.js owns
+  // it and sends {x, z, yaw} only. This now guards the correct shape so nobody
+  // "fixes" the code back toward the old assertion and reopens the hole.
+  it('a presence move payload uses yaw and carries no client-supplied clientId', () => {
+    const SRC = fs.readFileSync(
+      path.resolve(__dirname, '../../public_html/js/dc-presence.js'),
+      'utf8'
+    );
 
-    const sentMessages = [];
+    // The single dc.presence.move send site in dc-presence.js.
+    const moveSend = SRC.match(/send\(\s*['"]dc\.presence\.move['"]\s*,\s*\{[^}]*\}/);
+    expect(moveSend).not.toBeNull();
 
-    // Mock WebSocket send
-    const mockWS = {
-      send: function(json) {
-        sentMessages.push(JSON.parse(json));
-      },
-      readyState: WebSocket.OPEN
-    };
+    expect(moveSend[0]).toMatch(/\byaw\b/);
+    expect(moveSend[0]).not.toMatch(/\bfacing\b/);
+    expect(moveSend[0]).not.toMatch(/\bclientId\b/);
 
-    // The actual code: DC_PRESENCE_MOVE sends { x, z, facing, clientId: window.DC_CLIENT_ID }
-    const moveData = { x: 10, z: 20, facing: 1.5 };
-    const envelope = {
-      v: 1,
-      id: 'test-uuid',
-      op: 'dc.presence.move',
-      ts: Math.floor(Date.now() / 1000),
-      data: { ...moveData, clientId: global.window.DC_CLIENT_ID }
-    };
-
-    mockWS.send(JSON.stringify(envelope));
-
-    expect(sentMessages.length).toBe(1);
-    expect(sentMessages[0].data.clientId).toBe(100);
-    expect(sentMessages[0].data.x).toBe(10);
-    expect(sentMessages[0].data.z).toBe(20);
-    expect(sentMessages[0].data.facing).toBe(1.5);
+    // And dc-ws.js must not have resurrected its duplicate senders.
+    const WS_SRC = fs.readFileSync(
+      path.resolve(__dirname, '../../public_html/js/dc-ws.js'),
+      'utf8'
+    );
+    expect(WS_SRC).not.toMatch(/window\.DC_PRESENCE_MOVE\s*=/);
+    expect(WS_SRC).not.toMatch(/window\.DC_PRESENCE_JOIN\s*=/);
+    expect(WS_SRC).not.toMatch(/window\.DC_PRESENCE_LEAVE\s*=/);
   });
 });
 

@@ -89,6 +89,47 @@
 	/** localStorage key for persisting the wsEnabled preference */
 	const WS_ENABLED_KEY = 'dc_ws_enabled';
 
+	/* -------------------------- Safe storage helpers -------------------------- */
+
+	/*
+	 * localStorage is not always reachable. In Safari private mode, sandboxed or
+	 * third-party iframes, and under strict cookie policies, *touching*
+	 * window.localStorage throws (SecurityError) — and in non-browser hosts the
+	 * identifier isn't defined at all. An unguarded read in _boot() therefore takes
+	 * out the whole module and window.DC_CHAT never gets defined. All access goes
+	 * through these helpers, which degrade to the in-memory default (wsEnabled = true).
+	 */
+
+	/**
+	 * Read a key from localStorage, or null when storage is unavailable.
+	 * @param {string} key
+	 * @returns {string|null}
+	 */
+	function _storageGet(key) {
+		try {
+			if (typeof localStorage === 'undefined' || !localStorage) return null;
+			return localStorage.getItem(key);
+		} catch (e) {
+			return null;
+		}
+	}
+
+	/**
+	 * Persist a key to localStorage. Never throws; returns false when it couldn't.
+	 * @param {string} key
+	 * @param {string} value
+	 * @returns {boolean}
+	 */
+	function _storageSet(key, value) {
+		try {
+			if (typeof localStorage === 'undefined' || !localStorage) return false;
+			localStorage.setItem(key, value);
+			return true;
+		} catch (e) {
+			return false;
+		}
+	}
+
 	/* -------------------------- DOM helpers -------------------------- */
 
 	/**
@@ -471,6 +512,73 @@
 	/* -------------------------- WebSocket integration -------------------------- */
 
 	/**
+	 * Tear down the hub connection when chat is switched off.
+	 *
+	 * dc-ws.js exposes destroy(), not close() — destroy() sets closedByUs (disarming the
+	 * reconnect loop), clears the keepalive interval, flushes any batched presence and
+	 * closes the socket. Guarded because the hub is optional: DC_WS is null when dc-ws.js
+	 * never loaded or the connection was never established.
+	 */
+	function _teardownWs() {
+		if (window.DC_WS && typeof window.DC_WS.destroy === 'function') {
+			window.DC_WS.destroy();
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Bring a destroyed DC_WS instance back up when chat is switched on again.
+	 *
+	 * destroy() only flips closedByUs and closes the socket — the instance itself stays
+	 * usable, so clearing closedByUs (plus reconnectAttempts, which destroy() leaves at
+	 * whatever the last failed run reached) and calling _connect() revives it.
+	 *
+	 * The one sharp edge is that ws.close() is asynchronous: if the user toggles OFF then
+	 * ON while the old socket is still CLOSING, clearing closedByUs early makes dc-ws's own
+	 * onclose handler schedule a *second* _connect(), leaving two sockets racing over the
+	 * single this.ws slot. So while a close is in flight we keep closedByUs set and defer
+	 * the revive to that socket's close event.
+	 */
+	function _reviveWs() {
+		const client = window.DC_WS;
+		if (!client) return false;
+		// If dc-ws ever grows a first-class revive/reconnect entry point, prefer it.
+		if (typeof client.revive === 'function') {
+			client.revive();
+			return true;
+		}
+		if (typeof client._connect !== 'function') return false;
+		const reconnect = () => {
+			client.closedByUs = false;
+			client.reconnectAttempts = 0;
+			client._connect();
+		};
+		if (typeof client.connected === 'function' && client.connected()) {
+			// Socket never actually went away — just re-arm the reconnect loop.
+			client.closedByUs = false;
+			return true;
+		}
+		const sock = client.ws;
+		// 2 === WebSocket.CLOSING
+		if (sock && sock.readyState === 2 && typeof sock.addEventListener === 'function') {
+			let done = false;
+			const go = () => {
+				if (done) return;
+				done = true;
+				reconnect();
+			};
+			sock.addEventListener('close', go, { once: true });
+			// Fallback in case the close event never lands (server not answering the
+			// close frame). setTimeout is fine here — worst case we connect a bit early.
+			setTimeout(go, 2000);
+			return true;
+		}
+		reconnect();
+		return true;
+	}
+
+	/**
 	 * Wire up document listeners for dc:auth-success and dc:v1-event.
 	 * Returns a cleanup function.
 	 *
@@ -618,6 +726,15 @@
 
 				wsCleanup = _wireWebSocket(this);
 
+				// The channel.join normally rides on dc:auth-success, but that event may already
+				// have fired — the hub connects independently of the chat toggle, so switching
+				// chat ON later (or booting with it off) would otherwise leave us unsubscribed
+				// forever. joinGroup on the hub is idempotent, so a redundant join is harmless.
+				if (window.DC_AUTHED === true && window.DC_WS && typeof window.DC_WS.send === 'function') {
+					console.log('[dc-chat] Already authenticated, joining ' + CHANNEL_NOC);
+					window.DC_WS.send('channel.join', { channel: CHANNEL_NOC });
+				}
+
 				// Wire up hover listeners for idle timer
 				frame.addEventListener('mouseenter', () => {
 					_isHovered = true;
@@ -645,32 +762,10 @@
 					_resetIdleTimer(frame);
 				});
 
-				// Wire up WebSocket toggle button
-				const toggleBtn = document.getElementById('dcWsToggle');
-				if (toggleBtn) {
-					toggleBtn.addEventListener('click', () => {
-						wsEnabled = !wsEnabled;
-						localStorage.setItem(WS_ENABLED_KEY, String(wsEnabled));
-						if (!wsEnabled) {
-							// Turn OFF: destroy chat frame and close WebSocket
-							this.destroy();
-							if (window.DC_WS && typeof window.DC_WS.close === 'function') {
-								window.DC_WS.close();
-							}
-							toggleBtn.textContent = 'Chat: OFF';
-							toggleBtn.classList.add('off');
-						} else {
-							// Turn ON: reinitialize
-							this.init();
-							if (window.DC_WS) {
-								window.DC_WS.closedByUs = false;
-								window.DC_WS._connect();
-							}
-							toggleBtn.textContent = 'Chat: ON';
-							toggleBtn.classList.remove('off');
-						}
-					});
-				}
+				// NOTE: the #dcWsToggle button lives in the page markup (dc.html / dc.php), not
+				// inside the frame we just built, so it is wired ONCE from _boot() — wiring it
+				// here would stack a second click handler on every OFF→ON cycle, and the extra
+				// handler immediately undoes the toggle it is reacting to.
 
 				// Start the idle timer initially
 				_resetIdleTimer(frame);
@@ -744,6 +839,11 @@
 					wsCleanup = null;
 				}
 				if (_idleTimer) { clearTimeout(_idleTimer); _idleTimer = null; }
+				// _messageBuffer is module-level and outlives this instance, so a
+				// destroy()/init() cycle (the Chat: OFF → ON toggle) otherwise leaves it
+				// holding up to MAX_MESSAGES elements from the frame we just removed —
+				// detached nodes kept alive for the rest of the page's life.
+				_messageBuffer.length = 0;
 				inputEl = null;
 				inputArea = null;
 				initialized = false;
@@ -765,12 +865,58 @@
 
 	/* -------------------------- Bootstrap -------------------------- */
 
+	/** Guard so the #dcWsToggle click handler is only ever bound once. */
+	let _toggleWired = false;
+
+	/**
+	 * Wire the page's #dcWsToggle button (markup lives in dc.html / dc.php) and sync its
+	 * label with the current wsEnabled state. Bound once per page load: the button outlives
+	 * DC_CHAT.destroy(), so re-binding on each init() would stack handlers.
+	 */
+	function _wireToggleButton() {
+		const toggleBtn = document.getElementById('dcWsToggle');
+		if (!toggleBtn) return null;
+		const paint = () => {
+			toggleBtn.textContent = wsEnabled ? 'Chat: ON' : 'Chat: OFF';
+			if (toggleBtn.classList) {
+				if (wsEnabled) {
+					toggleBtn.classList.remove('off');
+				} else {
+					toggleBtn.classList.add('off');
+				}
+			}
+		};
+		paint();
+		if (_toggleWired) return toggleBtn;
+		_toggleWired = true;
+		toggleBtn.addEventListener('click', () => {
+			wsEnabled = !wsEnabled;
+			// best-effort persistence; storage may be blocked (see _storageSet)
+			_storageSet(WS_ENABLED_KEY, String(wsEnabled));
+			if (!wsEnabled) {
+				// Turn OFF: tear down the chat frame and close the hub socket
+				if (_instance) _instance.destroy();
+				_teardownWs();
+			} else {
+				// Turn ON: rebuild the UI and revive the hub connection
+				if (_instance) _instance.init();
+				_reviveWs();
+			}
+			paint();
+		});
+		return toggleBtn;
+	}
+
 	/**
 	 * Boot the module once the DOM is ready.
+	 *
+	 * Must never throw: whatever goes wrong here (blocked storage, a missing DOM node,
+	 * no hub at all) window.DC_CHAT still has to exist, and the 3D scene must keep
+	 * working without chat/multiplayer.
 	 */
 	function _boot() {
-		// Restore wsEnabled preference from localStorage (default true)
-		const stored = localStorage.getItem(WS_ENABLED_KEY);
+		// Restore wsEnabled preference from storage (default true when unavailable)
+		const stored = _storageGet(WS_ENABLED_KEY);
 		if (stored !== null) {
 			wsEnabled = stored === 'true';
 		}
@@ -778,15 +924,20 @@
 		_instance = createAPI();
 		window.DC_CHAT = _instance;
 
-		// Initialize only if WebSocket is enabled
+		// Bind the toggle button (also paints the OFF label when chat is disabled)
+		try {
+			_wireToggleButton();
+		} catch (e) {
+			console.warn('[dc-chat] toggle button unavailable:', e && e.message);
+		}
+
+		// Initialize only if WebSocket is enabled. A failure here must not escape _boot:
+		// window.DC_CHAT is already published, and the 3D scene has to keep running.
 		if (wsEnabled) {
-			_instance.init();
-		} else {
-			// Mark toggle button as OFF state if ws is disabled
-			const toggleBtn = document.getElementById('dcWsToggle');
-			if (toggleBtn) {
-				toggleBtn.textContent = 'Chat: OFF';
-				toggleBtn.classList.add('off');
+			try {
+				_instance.init();
+			} catch (e) {
+				console.warn('[dc-chat] init failed, chat disabled:', e && e.message);
 			}
 		}
 	}

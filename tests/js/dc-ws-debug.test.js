@@ -106,6 +106,13 @@ function loadDcWs(overrides) {
         });
       },
     },
+    // dc-ws.js references WebSocket as a BARE identifier (`new WebSocket(...)`,
+    // `WebSocket.OPEN`), which resolves against these sandbox globals — NOT against
+    // `win`. Putting the mock only on `win` (as this harness used to) made the
+    // constructor throw ReferenceError, which dc-ws catches and turns into its
+    // degraded path: no socket, DC_PRESENCE_ENABLED forced false. Every
+    // connected-socket assertion in this file then passed vacuously. Keep this here.
+    WebSocket: win.WebSocket,
     // URLSearchParams is used as bare identifier in dc-ws.js at module load
     URLSearchParams: win.URLSearchParams,
     // requestAnimationFrame for presence batching (Node.js doesn't have it)
@@ -124,46 +131,70 @@ function loadDcWs(overrides) {
 // ----------------------------------------------------------------
 // Tests: 1. Graceful degradation when DC_PRESENCE_ENABLED = false
 // ----------------------------------------------------------------
+// NOTE: this block used to assert that window.DC_PRESENCE_JOIN / _MOVE / _LEAVE
+// were no-ops when DC_PRESENCE_ENABLED === false, after loading dc-ws.js ALONE.
+// dc-ws.js no longer defines those three — they were duplicate, and buggy,
+// definitions of functions dc-presence.js also declared and (loading later) won
+// with: the dc-ws copies sent `facing:` where the hub reads `yaw:`, and passed a
+// client-supplied `clientId` the hub mis-parsed and never ownership-checked.
+// dc-presence.js is now the sole owner and carries the DC_PRESENCE_ENABLED
+// short-circuit inside its own send(); that behaviour is covered by
+// tests/js/dc-presence.test.js. What dc-ws.js still owns is DC_PRESENCE_SEND,
+// so that is what this block exercises.
 describe('dc-ws.js graceful degradation', () => {
-  test('DC_PRESENCE_JOIN is no-op when DC_PRESENCE_ENABLED = false', () => {
-    const result = loadDcWs({ DC_PRESENCE_ENABLED: false });
+  test('a socket is genuinely constructed (guards against vacuous passes)', () => {
+    const result = loadDcWs();
 
-    // Ensure DC_WS is available but WS is not connected
-    // DC_WS may or may not have ws set depending on connection state
+    // If WebSocket is ever dropped from the sandbox again, dc-ws swallows the
+    // ReferenceError and parks in its degraded path — and every assertion below
+    // about connected behaviour would pass for the wrong reason. Fail loudly here.
+    expect(result.win.DC_WS).toBeTruthy();
+    expect(result.win.DC_WS.ws).toBeTruthy();
+    expect(result.win.DC_WS.ws.url).toBe('wss://mystage.interserver.net:7272');
+    expect(result.win.DC_PRESENCE_ENABLED).not.toBe(false);
+  });
+
+  test('DC_PRESENCE_SEND does not send while the socket is still CONNECTING', () => {
+    const result = loadDcWs();
     const sent = [];
-    if (result.win.DC_WS && result.win.DC_WS.send) {
-      result.win.DC_WS.send = function(op, data) { sent.push({ op, data }); };
-    }
+    result.win.DC_WS.send = function(op, data) { sent.push({ op, data }); };
 
-    // Should not throw
-    expect(() => result.win.DC_PRESENCE_JOIN(100, 200, 1.5)).not.toThrow();
-
-    // Should NOT send any message (early return when DC_PRESENCE_ENABLED === false)
+    // MockWebSocket starts at readyState 0 (CONNECTING), so connected() is false.
+    expect(result.win.DC_WS.connected()).toBe(false);
+    expect(() => result.win.DC_PRESENCE_SEND('dc.presence.move', { x: 1, z: 2, yaw: 0 })).not.toThrow();
     expect(sent.length).toBe(0);
   });
 
-  test('DC_PRESENCE_MOVE is no-op when DC_PRESENCE_ENABLED = false', () => {
-    const result = loadDcWs({ DC_PRESENCE_ENABLED: false });
-
+  test('DC_PRESENCE_SEND forwards to DC_WS.send once the socket is OPEN', () => {
+    const result = loadDcWs();
     const sent = [];
-    if (result.win.DC_WS && result.win.DC_WS.send) {
-      result.win.DC_WS.send = function(op, data) { sent.push({ op, data }); };
-    }
+    result.win.DC_WS.send = function(op, data) { sent.push({ op, data }); };
 
-    expect(() => result.win.DC_PRESENCE_MOVE(150, 250, 0.5)).not.toThrow();
-    expect(sent.length).toBe(0);
+    result.win.DC_WS.ws.readyState = result.win.WebSocket.OPEN;
+    expect(result.win.DC_WS.connected()).toBe(true);
+
+    result.win.DC_PRESENCE_SEND('dc.presence.move', { x: 1, z: 2, yaw: 0.5 });
+    expect(sent.length).toBe(1);
+    expect(sent[0].op).toBe('dc.presence.move');
+    expect(sent[0].data).toEqual({ x: 1, z: 2, yaw: 0.5 });
   });
 
-  test('DC_PRESENCE_LEAVE is no-op when DC_PRESENCE_ENABLED = false', () => {
-    const result = loadDcWs({ DC_PRESENCE_ENABLED: false });
+  test('DC_PRESENCE_SEND is a safe no-op when DC_WS is null', () => {
+    const result = loadDcWs();
+    const send = result.win.DC_PRESENCE_SEND;
+    result.win.DC_WS = null;
 
-    const sent = [];
-    if (result.win.DC_WS && result.win.DC_WS.send) {
-      result.win.DC_WS.send = function(op, data) { sent.push({ op, data }); };
-    }
+    expect(() => send('dc.presence.leave', {})).not.toThrow();
+  });
 
-    expect(() => result.win.DC_PRESENCE_LEAVE()).not.toThrow();
-    expect(sent.length).toBe(0);
+  test('getState() is usable immediately after load', () => {
+    const result = loadDcWs();
+    const state = result.win.DC_WS.getState();
+
+    expect(state.connected).toBe(false);      // still CONNECTING
+    expect(state.authenticated).toBe(false);  // no welcome reply yet
+    expect(state.presenceEnabled).toBe(true);
+    expect(state.sessionId).toBe('test-session-123');
   });
 });
 

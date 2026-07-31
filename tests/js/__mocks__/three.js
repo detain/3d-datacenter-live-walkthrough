@@ -12,6 +12,13 @@ export const Vector3 = class {
   equals(v) { return this.x === v.x && this.y === v.y && this.z === v.z; }
   addScaledVector() { return this; }
   lengthSq() { return this.x * this.x + this.y * this.y + this.z * this.z; }
+  setScalar(s) { this.x = this.y = this.z = s; return this; }
+  normalize() { return this; }
+  lerp() { return this; }
+  distanceToSquared(v) {
+    const dx = this.x - v.x, dy = this.y - v.y, dz = this.z - v.z;
+    return dx * dx + dy * dy + dz * dz;
+  }
 };
 
 export const Euler = class {
@@ -22,14 +29,45 @@ export const Euler = class {
   setFromQuaternion() { return this; }
 };
 
+// Faithful enough for dc-presence's avatar bookkeeping: add()/remove() maintain
+// children + parent, and traverse() walks the subtree (used by its teardown paths).
 export const Group = class {
   constructor() {
     this.position = new Vector3();
     this.rotation = new Euler();
+    this.scale = new Vector3(1, 1, 1);
     this.visible = true;
+    this.children = [];
+    this.parent = null;
   }
-  add() {}
-  remove() {}
+  // Real Three.js Object3D.add() REPARENTS: it detaches the object from its previous
+  // parent first, because an Object3D has exactly one parent. The stub used to only
+  // push and overwrite .parent, which made a shared object look like it was in two
+  // groups at once — and hid the fact that dc-presence's per-NAME Sprite cache hands
+  // the same Sprite instance to every avatar with that name, so they fight over one
+  // nameplate and all but the last lose it. Keep this faithful.
+  add(o) {
+    if (o) {
+      if (o.parent && o.parent !== this && typeof o.parent.remove === 'function') {
+        o.parent.remove(o);
+      }
+      if (this.children.indexOf(o) === -1) this.children.push(o);
+      o.parent = this;
+    }
+    return this;
+  }
+  remove(o) {
+    const i = this.children.indexOf(o);
+    if (i !== -1) { this.children.splice(i, 1); if (o) o.parent = null; }
+    return this;
+  }
+  traverse(cb) {
+    cb(this);
+    for (const c of this.children.slice()) {
+      if (c && typeof c.traverse === 'function') c.traverse(cb);
+      else cb(c);
+    }
+  }
 };
 
 export const MathUtils = {
@@ -115,6 +153,8 @@ export const Mesh = class {
     this.visible = true;
     this.castShadow = false;
     this.frustumCulled = false;
+    this.isMesh = true;
+    this.parent = null;
   }
 };
 
@@ -164,6 +204,8 @@ export const Sprite = class {
     this.position = new Vector3();
     this.scale = new Vector3(1, 1, 1);
     this.visible = true;
+    this.isSprite = true;   // dc-presence's teardown branches on this
+    this.parent = null;
   }
 };
 
@@ -172,12 +214,12 @@ export const SpriteMaterial = class {
     this.map = opts.map || null;
     this.transparent = opts.transparent ?? true;
     this.depthTest = opts.depthTest ?? true;
+    this.disposed = false;
   }
+  dispose() { this.disposed = true; }
 };
 
-export const CanvasTexture = class {
-  constructor(canvas) {
-    this.canvas = canvas;
-  }
-  dispose() {}
-};
+// NOTE: CanvasTexture is declared once, above. A second `export const CanvasTexture`
+// used to live here, which made this whole stub fail to parse
+// ("Identifier 'CanvasTexture' has already been declared") and took every test that
+// imports it down with it. Keep exports unique.

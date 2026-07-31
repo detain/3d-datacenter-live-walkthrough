@@ -414,3 +414,212 @@ test.describe('Group 7: WebGL Availability', () => {
     expect(criticalErrors).toHaveLength(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Group 8: Hub unreachable — OWNER REQUIREMENT #1 in a real browser
+//
+//   "The scene must work fully when the WebSocket server is unreachable, just
+//    without multi-user."
+//
+// Hermetic by construction. Two things are stubbed before any page script runs:
+//   - window.WebSocket, so the real datacentered hub (wss://…:7272) is NEVER
+//     contacted. dc-ws.js reads `WebSocket` as a bare identifier, which resolves
+//     to the window property, so the override takes effect.
+//   - /ajax/datacenter.php, so no DB is touched and the room build is fast.
+//
+// The Vitest specs (tests/js/dc-offline.test.js) are the real gate for this
+// behaviour; this group is the in-browser confirmation. Playwright is
+// continue-on-error in CI, so keep the assertions about the HUD and input
+// handling rather than about GLB assets the single-threaded php -S cannot serve.
+// ---------------------------------------------------------------------------
+test.describe('Group 8: Hub unreachable (scene must still work)', () => {
+  const DATACENTER_STUB = {
+    locations: {
+      0: {
+        name: 'Test',
+        region: 'Test',
+        racks: {
+          1: { x: 0, y: 0, type: 0, servers: {}, switches: {} },
+          2: { x: 1, y: 0, type: 1, servers: {}, switches: {} },
+        },
+      },
+    },
+  };
+
+  /**
+   * @param mode 'throw'  the WebSocket constructor throws (blocked / bad URL)
+   *             'close'  the socket is created and closes immediately
+   */
+  async function bootWithDeadHub(page: any, mode: 'throw' | 'close') {
+    await page.addInitScript((m: string) => {
+      (window as any).__wsAttempts = 0;
+      function DeadSocket(this: any, url: string) {
+        (window as any).__wsAttempts++;
+        (window as any).__wsUrl = url;
+        if (m === 'throw') throw new Error('E2E: hub unreachable');
+        this.url = url;
+        this.readyState = 0;
+        this.send = () => { throw new Error('E2E: socket is not open'); };
+        this.close = () => { this.readyState = 3; };
+        setTimeout(() => {
+          this.readyState = 3;
+          if (this.onclose) this.onclose({ code: 1006, reason: 'E2E: hub unreachable' });
+        }, 0);
+      }
+      (DeadSocket as any).CONNECTING = 0;
+      (DeadSocket as any).OPEN = 1;
+      (DeadSocket as any).CLOSING = 2;
+      (DeadSocket as any).CLOSED = 3;
+      (window as any).WebSocket = DeadSocket;
+    }, mode);
+
+    await page.route('**/ajax/datacenter.php*', (route: any) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(DATACENTER_STUB),
+      })
+    );
+
+    await page.goto('/admin/dc.html', { timeout: 120000 });
+    await page.waitForLoadState('domcontentloaded');
+    // dc-ws.js is a module script; under fixture contention it can arrive well after
+    // domcontentloaded. Wait for it to have run so the assertions below have a base.
+    await page
+      .waitForFunction(() => 'DC_WS' in window, { timeout: 90000 })
+      .catch(() => { /* asserted per-test below */ });
+  }
+
+  // The single-threaded `php -S` fixture serialises the scene's ~100 GLB assets, so
+  // under full-suite contention every page load here is slow. Give each test a
+  // generous budget so contention shows up as slowness, not as a false regression.
+  test.beforeEach(() => {
+    test.setTimeout(150000);
+  });
+
+  test('the WebSocket stub really intercepted the hub connection', async ({ page }) => {
+    // Guard: without this the whole group could pass while quietly talking to the
+    // real hub, or while never attempting a connection at all.
+    await bootWithDeadHub(page, 'throw');
+    await page.waitForFunction(() => (window as any).__wsAttempts > 0, { timeout: 30000 });
+    const attempts = await page.evaluate(() => (window as any).__wsAttempts);
+    const url = await page.evaluate(() => (window as any).__wsUrl);
+    expect(attempts).toBeGreaterThan(0);
+    expect(url).toContain('7272');
+  });
+
+  for (const mode of ['throw', 'close'] as const) {
+    test(`[${mode}] the scene still initialises`, async ({ page }) => {
+      await bootWithDeadHub(page, mode);
+      const ready = await page
+        .waitForFunction(() => (window as any).DC && (window as any).DC.scene, { timeout: 60000 })
+        .then(() => true)
+        .catch(() => false);
+      expect(ready).toBe(true);
+      const hasOptions = await page.evaluate(() => !!(window as any).DC?.options);
+      expect(hasOptions).toBe(true);
+      const renderer = await page.evaluate(() => !!(window as any).DC?.renderer);
+      expect(renderer).toBe(true);
+    });
+
+    test(`[${mode}] multiplayer is disabled and the badge says so`, async ({ page }) => {
+      await bootWithDeadHub(page, mode);
+      const offline = await page
+        .waitForFunction(() => (window as any).DC_PRESENCE_ENABLED === false, { timeout: 60000 })
+        .then(() => true)
+        .catch(() => false);
+      expect(offline).toBe(true);
+
+      await expect(page.locator('#dcPresence')).toHaveCount(1);
+      // The dot must NOT be green/live with no hub.
+      const active = await page.evaluate(() =>
+        document.getElementById('dcPresenceDot')?.classList.contains('active')
+      );
+      expect(active).toBe(false);
+      const label = await page.locator('#dcPresenceLabel').textContent();
+      expect(label).toMatch(/Offline|Connecting|Users/);
+    });
+
+    test(`[${mode}] the page stays interactive`, async ({ page }) => {
+      test.setTimeout(120000);
+      await bootWithDeadHub(page, mode);
+      await page.waitForFunction(() => (window as any).DC?.options, { timeout: 60000 });
+
+      // Search still accepts input — pure markup, always available.
+      await page.locator('#dcSearch').fill('web123');
+      await expect(page.locator('#dcSearch')).toHaveValue('web123');
+
+      // View buttons still respond. dispatchEvent rather than click(): the
+      // pointer-lock #blocker overlay legitimately covers the viewport until the
+      // user clicks into the scene, and this test is about the page's own handlers
+      // still being alive with no hub, not about overlay hit-testing.
+      await page.locator('#dcViews button[data-view="top"]').dispatchEvent('click');
+      await expect(page.locator('#dcViews button[data-view="top"]')).toHaveClass(/active/);
+
+      // The HUD panels still open and close.
+      await page.locator('#dcSearch').fill('');
+      await expect(page.locator('#dcSearch')).toHaveValue('');
+      await expect(page.locator('#dcPresence')).toBeVisible();
+
+      // NOTE: keyboard movement is deliberately NOT asserted here. WASD handling is
+      // attached by attachKeyHandlers() inside displayDatacenter(), which waits on the
+      // scene's ~100 GLB assets that the single-threaded `php -S` fixture cannot serve
+      // in time (.claude/rules/js-tests.md). Group 6 covers keyboard movement, and
+      // tests/js/dc-offline.test.js covers scene liveness with a dead hub.
+    });
+
+    test(`[${mode}] no unhandled JS errors from the dead hub`, async ({ page }) => {
+      const errors: string[] = [];
+      page.on('pageerror', (err) => errors.push(err.message));
+      await bootWithDeadHub(page, mode);
+      await page.waitForTimeout(4000);
+
+      // The stub's own synthetic throw is expected; anything else is not. Asset and
+      // WebGL noise is filtered for the same reason as Group 7.
+      const critical = errors.filter(
+        (e) =>
+          !e.includes('E2E:') &&
+          !e.includes('WebGL') &&
+          !e.includes('GPU') &&
+          !e.includes('context') &&
+          !e.includes('Failed to load resource') &&
+          !e.includes('Failed to fetch')
+      );
+      if (critical.length > 0) console.log('Critical errors found:', critical);
+      expect(critical).toHaveLength(0);
+    });
+
+    test(`[${mode}] presence entry points are safe no-ops`, async ({ page }) => {
+      await bootWithDeadHub(page, mode);
+      await page.waitForFunction(() => typeof (window as any).DC_PRESENCE_JOIN === 'function', { timeout: 60000 });
+      const threw = await page.evaluate(() => {
+        try {
+          (window as any).DC_PRESENCE_JOIN(10, 20, 0.5);
+          for (let i = 0; i < 30; i++) (window as any).DC_PRESENCE_MOVE(i, i, 0);
+          (window as any).DC_PRESENCE_LEAVE();
+          return null;
+        } catch (e: any) {
+          return String(e && e.message);
+        }
+      });
+      expect(threw).toBeNull();
+    });
+  }
+
+  test('[close] the reconnect loop is bounded, not an endless 3s storm', async ({ page }) => {
+    // Deliberately watches real wall-clock backoff, so it needs longer than the
+    // 30s default.
+    test.setTimeout(120000);
+    // Regression guard for the live reconnect storm: dc.html loaded directly has an
+    // empty DC_SESSION_ID, so every cycle used to re-open, reset the counters and
+    // retry at a flat 3s forever. maxReconnectAttempts is 10, so the attempt count
+    // must stay bounded well under a runaway loop.
+    await bootWithDeadHub(page, 'close');
+    await page.waitForFunction(() => (window as any).DC_PRESENCE_ENABLED === false, { timeout: 60000 });
+    const first = await page.evaluate(() => (window as any).__wsAttempts);
+    await page.waitForTimeout(10000);
+    const second = await page.evaluate(() => (window as any).__wsAttempts);
+    expect(second).toBeLessThanOrEqual(12);
+    expect(second).toBeGreaterThanOrEqual(first);
+  });
+});

@@ -145,8 +145,10 @@ whenReady(async () => {
 
   setupInput();
   applyMode();                                    // sets visibility for the starting mode
-  // Re-sync the player anchor whenever pointer-lock engages (dc may have re-spawned the camera).
-  S.controls.addEventListener("lock", syncPlayerFromCamera);
+  // Re-sync the player anchor whenever pointer-lock engages (dc may have re-spawned the camera),
+  // then re-announce presence: the matching "unlock" handler sends dc.presence.leave.
+  const _onLock = () => { syncPlayerFromCamera(); announcePresence(); };
+  S.controls.addEventListener("lock", _onLock);
 
   // CRIT-2: Store handler references so they can be removed on cleanup
   const _onUnlock = () => {
@@ -166,10 +168,23 @@ whenReady(async () => {
     if (S.manifest && S.manifest.characters && S.manifest.characters.length) {
         populateCharacterPicker();
     }
+    // dc.js fires dc:respawn from spawnInside(), which on a LOCATION SWITCH runs after
+    // clearScene() has already called DC_PRESENCE_LEAVE() — so the hub thinks we left and
+    // ignores the moves the frame loop then sends: we silently vanish from every other
+    // client until the next pointer re-lock. Re-announcing here restores us, and because
+    // buildRoom() has just repopulated DC.roomBounds the fresh join carries the new room's
+    // BOT-BOUNDS. dc-presence latches the join, so on the initial load (where we are still
+    // joined) this degrades to a corrective move rather than a second join.
+    announcePresence();
   };
   const _onDisconnected = () => { window.DC_PRESENCE_ENABLED = false; };
   const _onAuthFailure = () => { window.DC_PRESENCE_ENABLED = false; };
-  const _onAuthSuccess = () => { window.DC_PRESENCE_ENABLED = true; };
+  // Auth just succeeded. dc-presence joins on this same event and reads our live pose
+  // back through window.DCM, so re-announcing here is normally a no-op — it only
+  // matters when this overlay spawned the player BEFORE auth completed, in which case
+  // dc-presence turns the second call into a dc.presence.move correction. Exactly one
+  // dc.presence.join is sent either way (dc-presence latches it).
+  const _onAuthSuccess = () => { window.DC_PRESENCE_ENABLED = true; announcePresence(); };
   const _onContextLost = () => { log('GPU context lost'); };
   const _onContextRestored = () => {
     log('GPU context restored — player state may need refresh');
@@ -190,7 +205,7 @@ whenReady(async () => {
 
   // CRIT-2: Remove all event listeners on page close/navigate to prevent memory leaks (bfcache)
   const cleanup = () => {
-    S.controls.removeEventListener("lock", syncPlayerFromCamera);
+    S.controls.removeEventListener("lock", _onLock);
     S.controls.removeEventListener("unlock", _onUnlock);
     document.removeEventListener('dc:respawn', _onRespawn);
     document.removeEventListener('dc:disconnected', _onDisconnected);
@@ -485,6 +500,22 @@ function placeCamera() {
   S.camPlacedValid = true;
 }
 
+// ---------------------------------------------------------------- presence
+// Announce the player's REAL pose to dc-presence. This is the ONLY place this module
+// starts a presence announcement, and dc-presence latches it so exactly one
+// dc.presence.join goes out per authenticated session (later calls with different
+// coordinates become dc.presence.move corrections). Safe to call at any time: it
+// no-ops when presence is disabled, dc-presence is absent, or we have not spawned.
+function announcePresence() {
+  if (typeof window.DC_PRESENCE_JOIN !== 'function') return;
+  if (window.DC_PRESENCE_ENABLED === false) return;
+  if (!S.spawned || !S.player) return;
+  // Let the throttled per-frame update fire again straight away so the hub gets a
+  // fresh position right after a (re-)join.
+  S._lastPresenceX = S._lastPresenceZ = S._lastPresenceF = null;
+  window.DC_PRESENCE_JOIN(S.player.position.x, S.player.position.z, S.facing);
+}
+
 // ---------------------------------------------------------------- helpers
 // The current building's fancy double door. DC.collideWorld leaves its doorway GAP open at all times, so
 // while the door is shut we re-block that gap here (this is what makes the closed door solid; once it
@@ -630,9 +661,7 @@ function trySpawn(x, z, facing) {
   S.camPlacedValid = true;
   S.spawned = true;
   log("spawned player at", spawnX.toFixed(1), spawnZ.toFixed(1));
-  if (typeof window.DC_PRESENCE_JOIN === 'function' && window.DC_PRESENCE_ENABLED !== false) {
-    window.DC_PRESENCE_JOIN(S.player.position.x, S.player.position.z, S.facing);
-  }
+  announcePresence();
 }
 
 // Is (x,z) inside the current building's walls, with `pad` of clearance?
@@ -784,7 +813,10 @@ const _onKeyDown = (e) => {
   switch (e.code) {
     case "ShiftLeft": case "ShiftRight": S.options.runFast = true; break;
     case "Space": if (S.grounded) { S.vy = JUMP_V; S.grounded = false; } break;
-    case "KeyV": case "KeyC": toggleMode(); break;
+    // V only. 'c' is the chat-focus key (bound in dc.html); it used to ALSO toggle
+    // perspective here, so pressing it flipped the camera behind the user's back while
+    // they were typing. Every on-screen hint already documents V.
+    case "KeyV": toggleMode(); break;
     case "Digit1": gesture("dance1"); break;
     case "Digit2": gesture("dance2"); break;
     case "Digit3": gesture("clap"); break;
@@ -897,6 +929,8 @@ function showHelp() {
 function exposeDebug() {
   window.DCM = {
     getPosition: () => ({ x: S.player.position.x, z: S.player.position.z }),
+    /** Character yaw in radians — dc-presence reads this so its join carries our real facing */
+    getFacing: () => S.facing,
     getState: () => ({ mode: S.mode, spawned: S.spawned, charId: S.loadedCharId }),
     setMode, toggleMode, gesture, endGesture, cycleGesture,
     play: (l) => play(l, 0.2),

@@ -10,7 +10,13 @@
  * Run: yarn test:js
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+const fs = require('node:fs');
+const path = require('node:path');
+
+const MULTI_SRC = path.resolve(__dirname, '../../public_html/js/dc-multi.js');
+const MULTI_SOURCE = fs.readFileSync(MULTI_SRC, 'utf8');
 
 // ----------------------------------------------------------------
 // Mock Three.js module (must be mocked before the source under test
@@ -21,6 +27,15 @@ vi.mock('three', async () => {
   const mockThree = await vi.importActual('./__mocks__/three.js');
   return mockThree;
 });
+vi.mock('three/addons/loaders/GLTFLoader.js', () => ({
+  GLTFLoader: class {
+    setDRACOLoader() {}
+    loadAsync() { return Promise.resolve(globalThis.__DCM_FAKE_GLTF__()); }
+  },
+}));
+vi.mock('three/addons/loaders/DRACOLoader.js', () => ({
+  DRACOLoader: class { setDecoderPath() {} },
+}));
 
 // ----------------------------------------------------------------
 // Constants from dc-multi.js (verified by reading the source)
@@ -540,5 +555,233 @@ describe('dc-multi.js — frame with no model', () => {
 
     // Position SHOULD have changed
     expect(position.x).toBeGreaterThan(0);
+  });
+});
+
+// ================================================================
+// Tests: the real module, loaded with fake browser globals.
+//
+// dc-multi.js is a side-effect module: it polls for window.DC, then boots the
+// overlay. Everything it touches (window / document / fetch / controls / renderer)
+// is faked below so the presence coordination with dc-presence.js can be driven
+// end to end. Per .claude/rules/js-tests.md the real `three` is never imported —
+// the vi.mock calls at the top of this file swap in tests/js/__mocks__/three.js.
+// ================================================================
+describe('dc-multi.js — presence announcement (loaded module)', () => {
+  let env;
+
+  /** Anything-goes chainable stub, enough for lil-gui's fluent API. */
+  function chainStub() {
+    const target = function () { return proxy; };
+    const proxy = new Proxy(target, { get: () => proxy, apply: () => proxy });
+    return proxy;
+  }
+
+  function makeEl() {
+    return {
+      textContent: '', style: {}, value: '',
+      addEventListener() {}, removeEventListener() {},
+      appendChild() {}, removeChild() {}, remove() {},
+      innerHTML: '', parentNode: null,
+    };
+  }
+
+  async function boot(opts = {}) {
+    const THREE = await vi.importActual('./__mocks__/three.js');
+    const docListeners = {};
+    const controlListeners = {};
+    const joins = [];
+    const moves = [];
+    const leaves = [];
+
+    const doc = {
+      readyState: 'complete',
+      hidden: false,
+      addEventListener(evt, cb) { (docListeners[evt] = docListeners[evt] || []).push(cb); },
+      removeEventListener() {},
+      getElementById: () => makeEl(),
+      createElement: () => makeEl(),
+      body: { appendChild() {}, removeChild() {} },
+    };
+
+    const scene = new THREE.Group();
+    const camera = {
+      position: new THREE.Vector3(),
+      quaternion: {},
+      fov: 75,
+      lookAt() {},
+      getWorldDirection(v) { v.set(0, 0, -1); return v; },
+      updateProjectionMatrix() {},
+    };
+    const controls = {
+      isLocked: false,
+      addEventListener(evt, cb) { (controlListeners[evt] = controlListeners[evt] || []).push(cb); },
+      removeEventListener() {},
+    };
+
+    // `window === globalThis` mirrors the browser, where `window.DC = x` also creates
+    // the bare `DC` binding that dc-multi's whenReady() reads.
+    globalThis.window = globalThis;
+    globalThis.document = doc;
+    globalThis.devicePixelRatio = 1;
+    globalThis.innerWidth = 1280;
+    globalThis.innerHeight = 720;
+    globalThis.location = { search: '' };
+    globalThis.addEventListener = () => {};
+    globalThis.removeEventListener = () => {};
+    globalThis.fetch = async () => ({
+      ok: true,
+      json: async () => ({ generated_at: null, characters: [{ id: 'c1', name: 'C1', model: '/c1.glb', animations: [] }] }),
+    });
+    globalThis.__DCM_FAKE_GLTF__ = () => ({ scene: new THREE.Group(), animations: [] });
+
+    globalThis.DC_PRESENCE_JOIN = (x, z, yaw) => { joins.push({ x, z, yaw }); };
+    globalThis.DC_PRESENCE_MOVE = (x, z, yaw) => { moves.push({ x, z, yaw }); };
+    globalThis.DC_PRESENCE_LEAVE = () => { leaves.push(true); };
+    if (opts.enabled !== undefined) globalThis.DC_PRESENCE_ENABLED = opts.enabled;
+
+    let frameFn = null;
+    globalThis.DC = Object.assign({
+      scene, camera, controls,
+      renderer: { setPixelRatio() {}, setSize() {}, render() {} },
+      options: {},
+      eyeHeight: () => 15,
+      playerRadius: () => 1,
+      roomSpawn: { x: 100, y: 0, z: 200, lookX: 100, lookZ: 210 },
+      roomBounds: { minX: -50, maxX: 250, minZ: 100, maxZ: 300 },
+      gui: { addFolder: () => chainStub() },
+      setAnimationLoop(fn) { frameFn = fn; },
+      tick() {},
+      flyTo: { active: false, onDone: null },
+    }, opts.dc);
+
+    vi.resetModules();
+    await import('../../public_html/js/dc-multi.js');
+    // whenReady's callback is async (awaits the manifest fetch) — let it settle.
+    for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 0));
+
+    return {
+      joins, moves, leaves, scene, camera, controls, doc,
+      get frame() { return frameFn; },
+      fireDoc(evt, detail) { (docListeners[evt] || []).forEach((cb) => cb({ detail, type: evt })); },
+      fireControls(evt) { (controlListeners[evt] || []).forEach((cb) => cb()); },
+      key(code) { (docListeners.keydown || []).forEach((cb) => cb({ code, target: {} })); },
+    };
+  }
+
+  beforeEach(() => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    for (const k of ['window', 'document', 'DC', 'DCM', 'fetch', 'location', 'devicePixelRatio',
+      'innerWidth', 'innerHeight', 'addEventListener', 'removeEventListener', '__DCM_FAKE_GLTF__',
+      'DC_PRESENCE_JOIN', 'DC_PRESENCE_MOVE', 'DC_PRESENCE_LEAVE', 'DC_PRESENCE_ENABLED']) {
+      delete globalThis[k];
+    }
+    env = null;
+  });
+
+  it('boots and exposes window.DCM', async () => {
+    env = await boot();
+    expect(globalThis.DCM).toBeTruthy();
+    expect(typeof globalThis.DCM.getPosition).toBe('function');
+    expect(typeof env.frame).toBe('function');
+  });
+
+  it('exposes getFacing() so dc-presence can read our real facing (C3)', async () => {
+    env = await boot();
+    expect(typeof globalThis.DCM.getFacing).toBe('function');
+    env.key('KeyR');   // trySpawn -> facing derived from roomSpawn's look target
+    expect(globalThis.DCM.getFacing()).toBeCloseTo(Math.atan2(0, 10), 6);
+  });
+
+  it('getPosition() reports the real spawn position, not the world origin', async () => {
+    env = await boot();
+    env.key('KeyR');
+    expect(globalThis.DCM.getPosition()).toEqual({ x: 100, z: 200 });
+  });
+
+  it('spawning announces presence at the REAL position (never 0,0,0)', async () => {
+    env = await boot();
+    env.joins.length = 0;
+    env.key('KeyR');
+    expect(env.joins.length).toBe(1);
+    expect(env.joins[0].x).toBe(100);
+    expect(env.joins[0].z).toBe(200);
+    expect(typeof env.joins[0].yaw).toBe('number');
+  });
+
+  it('dc:auth-success re-enables presence and re-announces after a pre-auth spawn', async () => {
+    env = await boot();
+    env.key('KeyR');            // spawned before auth
+    env.joins.length = 0;
+
+    env.fireDoc('dc:disconnected');
+    expect(globalThis.DC_PRESENCE_ENABLED).toBe(false);
+
+    env.fireDoc('dc:auth-success', { uid: 1, clientId: 'abc', name: 'n' });
+    expect(globalThis.DC_PRESENCE_ENABLED).toBe(true);
+    // Re-announced with the live pose; dc-presence latches it into ONE join.
+    expect(env.joins.length).toBe(1);
+    expect(env.joins[0]).toMatchObject({ x: 100, z: 200 });
+  });
+
+  it('does not announce before the player has spawned', async () => {
+    env = await boot();
+    env.joins.length = 0;
+    env.fireDoc('dc:auth-success', { uid: 1 });
+    expect(env.joins.length).toBe(0);
+  });
+
+  it('does not announce while presence is disabled', async () => {
+    env = await boot({ enabled: false });
+    env.joins.length = 0;
+    env.key('KeyR');
+    expect(env.joins.length).toBe(0);
+  });
+
+  it('pointer unlock leaves and pointer re-lock re-announces (symmetric)', async () => {
+    env = await boot();
+    env.key('KeyR');
+    env.joins.length = 0;
+
+    env.fireControls('unlock');
+    expect(env.leaves.length).toBe(1);
+
+    env.fireControls('lock');
+    expect(env.joins.length).toBe(1);
+    expect(env.joins[0]).toMatchObject({ x: 100, z: 200 });
+  });
+
+  it('an announcement clears the move dedupe so the next frame resyncs position', async () => {
+    env = await boot();
+    env.key('KeyR');
+    env.frame();                       // primes S._lastPresence*
+    const before = env.moves.length;
+    env.frame();                       // nothing changed -> deduped
+    expect(env.moves.length).toBe(before);
+
+    env.fireControls('lock');          // re-announce clears the dedupe
+    env.frame();
+    expect(env.moves.length).toBe(before + 1);
+  });
+
+  it('there is exactly one DC_PRESENCE_JOIN call site, funnelled through announcePresence()', () => {
+    const callSites = MULTI_SOURCE.match(/window\.DC_PRESENCE_JOIN\(/g) || [];
+    expect(callSites.length).toBe(1);
+    expect(MULTI_SOURCE).toMatch(/function announcePresence\(\)/);
+    // trySpawn, auth-success and pointer re-lock all go through the helper.
+    expect((MULTI_SOURCE.match(/announcePresence\(\)/g) || []).length).toBeGreaterThanOrEqual(4);
+  });
+
+  it('the frame loop still sends throttled moves with yaw (no facing key)', async () => {
+    env = await boot();
+    env.key('KeyR');
+    env.frame();
+    expect(env.moves.length).toBeGreaterThan(0);
+    expect(Object.keys(env.moves[0]).sort()).toEqual(['x', 'yaw', 'z']);
   });
 });
