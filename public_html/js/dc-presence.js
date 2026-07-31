@@ -70,9 +70,37 @@ import * as THREE from "three";
   const MAX_TICK_DT_S = 0.25 // clamp a huge frame gap (backgrounded tab) so the blend stays sane
   const WATCH_SCENE_TIMEOUT_MS = 30000 // give up polling for DC.scene after this (see watchScene)
 
+  /* -------------------------- avatar scale -------------------------- */
+  /**
+   * Remote avatars are built to the SAME scale as the rest of the scene.
+   *
+   * dc.js works in scene units where UNITS_PER_INCH = 15/70 — i.e. one unit is about
+   * 4.67 inches (0.12 m), chosen so a 70-inch person's eye height is ~15 units. These
+   * avatars were previously hard-coded at a 0.28-unit body plus a 0.10-radius head,
+   * ~0.48 units overall: **5.7 cm tall**, roughly 1/31 life size. They were present,
+   * correctly positioned and counted in the presence badge, but far too small to find
+   * on screen — which is exactly what "the user count goes to 2 but I can't see the
+   * bot" looks like. Derive from the scene's unit instead of magic numbers so this
+   * cannot drift out of scale again.
+   */
+  const UNITS_PER_INCH = 15 / 70
+  const AVATAR_HEIGHT_IN = 70   // 5'10", matching dc.js's default options.heightInches
+  const AVATAR_HEAD_DIA_IN = 9  // an adult head is ~9in front-to-back
+  const AVATAR_WAIST_IN = 34    // same waist->radius derivation dc.js playerRadius() uses
+
+  const AVATAR_TOTAL_H = AVATAR_HEIGHT_IN * UNITS_PER_INCH                    // ~15.0
+  const AVATAR_HEAD_R = (AVATAR_HEAD_DIA_IN / 2) * UNITS_PER_INCH             // ~0.96
+  const AVATAR_BODY_H = AVATAR_TOTAL_H - (AVATAR_HEAD_DIA_IN * UNITS_PER_INCH) // ~13.07
+  const AVATAR_BODY_R = (AVATAR_WAIST_IN / (2 * Math.PI)) * UNITS_PER_INCH    // ~1.16
+  // Nameplate: the canvas is 256x48, so the sprite MUST stay at 16:3 or the text
+  // distorts. Sized to read from across the room without dwarfing the avatar.
+  const NAME_SPRITE_W = 6.0
+  const NAME_SPRITE_H = NAME_SPRITE_W * (48 / 256)                            // 1.125
+  const NAME_SPRITE_GAP = 1.2   // clearance between the top of the head and the plate
+
   /* -------------------------- shared geometry/materials -------------------------- */
-  const AVATAR_BODY_GEO = new THREE.CylinderGeometry(0.12, 0.12, 0.28, 8)
-  const AVATAR_HEAD_GEO = new THREE.SphereGeometry(0.10, 12, 8)
+  const AVATAR_BODY_GEO = new THREE.CylinderGeometry(AVATAR_BODY_R, AVATAR_BODY_R, AVATAR_BODY_H, 12)
+  const AVATAR_HEAD_GEO = new THREE.SphereGeometry(AVATAR_HEAD_R, 16, 12)
   const BODY_MAT = new THREE.MeshLambertMaterial({ color: 0x2255cc })
   const HEAD_MAT = new THREE.MeshLambertMaterial({ color: 0xf0f4ff })
 
@@ -356,14 +384,18 @@ import * as THREE from "three";
     // other tab rendered anonymous.
     const isLocal = state.clientId !== null && key === idKey(state.clientId)
 
-    // Cylinder body (blue) — use shared geometry/material (Fix 4)
+    // Cylinder body (blue) — use shared geometry/material (Fix 4).
+    // A CylinderGeometry is centred on its own origin, so lift it by half its height
+    // to stand it on the floor (the group sits at y=0).
     const body = new THREE.Mesh(AVATAR_BODY_GEO, BODY_MAT)
-    body.position.y = 0.14 // sit on ground (y=0)
+    body.position.y = AVATAR_BODY_H / 2
     body.castShadow = true
 
-    // Sphere head (white) — use shared geometry/material (Fix 4)
+    // Sphere head (white) — use shared geometry/material (Fix 4).
+    // Centre one head-radius above the top of the body, so the crown lands exactly at
+    // AVATAR_TOTAL_H and the whole figure is a true 70 inches tall.
     const head = new THREE.Mesh(AVATAR_HEAD_GEO, HEAD_MAT)
-    head.position.y = 0.38 // top of cylinder + small gap
+    head.position.y = AVATAR_BODY_H + AVATAR_HEAD_R
     head.castShadow = true
 
     const group = new THREE.Group()
@@ -373,7 +405,7 @@ import * as THREE from "three";
     // Name sprite (hidden for local user)
     if (!isLocal && name) {
       const sprite = makeNameSprite(name)
-      sprite.position.y = 0.62
+      sprite.position.y = AVATAR_TOTAL_H + NAME_SPRITE_GAP
       group.add(sprite)
     }
 
@@ -487,7 +519,7 @@ import * as THREE from "three";
     }
     _nameSpriteCacheOrder.add(name) // O(1) add
     const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false }))
-    sprite.scale.set(1.6, 0.30, 1)
+    sprite.scale.set(NAME_SPRITE_W, NAME_SPRITE_H, 1)
     _nameSpriteCache.set(name, { texture, sprite })
     _cachedSprites.add(sprite)
     /* eslint-enable no-undef */

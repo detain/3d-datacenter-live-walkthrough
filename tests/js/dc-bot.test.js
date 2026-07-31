@@ -96,14 +96,47 @@ describe('bot avatar — renders exactly like a human peer', () => {
     h.expectClean();
   });
 
-  it('the bot gets a visible nameplate', () => {
+  it('the bot gets a visible nameplate, above its head', () => {
     const h = connected();
     h.presenceJoined({ clientId: BOT, uid: 900, name: 'NOC Bot', x: 1, z: 1, yaw: 0 });
     const plate = h.nameplates()[0];
     expect(plate).toBeTruthy();
     expect(plate.isSprite).toBe(true);
     expect(plate.material.map).toBeTruthy();     // the rendered name texture
-    expect(plate.position.y).toBeCloseTo(0.62, 6);
+
+    // Relative to the avatar, not a hard-coded height: this used to pin 0.62, which
+    // silently froze the whole avatar at ~1/31 life size (see below).
+    const [bot] = h.avatarGroups();
+    const headTop = Math.max(...bot.children.filter((c) => c.isMesh).map((m) => m.position.y));
+    expect(plate.position.y).toBeGreaterThan(headTop);
+
+    // The canvas is 256x48, so the sprite must stay at 16:3 or the text distorts.
+    expect(plate.scale.x / plate.scale.y).toBeCloseTo(256 / 48, 6);
+    h.expectClean();
+  });
+
+  /**
+   * REGRESSION: the bot was invisible in the real scene despite being present,
+   * correctly positioned and counted in the badge — the avatar was hard-coded to a
+   * 0.28-unit body plus a 0.10-radius head, ~0.48 units, and this scene's unit is
+   * UNITS_PER_INCH = 15/70 (~0.12 m). That is 5.7 cm tall: a speck on the floor,
+   * about 1/31 life size. Assert human scale so it cannot silently shrink again.
+   */
+  it('the bot avatar is life-sized, not a speck on the floor', () => {
+    const h = connected();
+    h.presenceJoined({ clientId: BOT, uid: 900, name: 'NOC Bot', x: 1, z: 1, yaw: 0 });
+    const [bot] = h.avatarGroups();
+
+    const UNITS_PER_INCH = 15 / 70;          // dc.js's scene scale
+    const meshes = bot.children.filter((c) => c.isMesh);
+    const crown = Math.max(...meshes.map((m) => m.position.y));
+    const heightInches = crown / UNITS_PER_INCH;
+
+    // Head centre is one radius below the crown, so the figure is a little taller than
+    // `crown`; allow a generous human range rather than pinning an exact constant.
+    expect(heightInches).toBeGreaterThan(48);  // taller than 4ft
+    expect(heightInches).toBeLessThan(84);     // shorter than 7ft
+    expect(bot.position.y).toBe(0);            // stands ON the floor
     h.expectClean();
   });
 
