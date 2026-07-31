@@ -301,6 +301,14 @@
 			.dc-chat-send-btn:active {
 				background: rgba(60, 120, 240, 0.95);
 			}
+
+			.dc-chat-frame.dc-chat-idle .dc-chat-msg {
+				opacity: 0.03;
+			}
+			.dc-chat-frame.dc-chat-idle .dc-chat-msg-recent {
+				opacity: 1;
+				transition: opacity 0.3s ease;
+			}
 		`);
 
 		// ---- Frame container ---------------------------------------------------
@@ -427,6 +435,13 @@
 		const el = document.createElement('div');
 		el.className = 'dc-chat-msg' + (msgClass ? ' dc-chat-msg-' + msgClass : '');
 
+		// Mark as recent (visible when idle)
+		el.classList.add('dc-chat-msg-recent');
+		// Remove 'recent' class after 60 seconds so it fades when idle
+		setTimeout(() => {
+			el.classList.remove('dc-chat-msg-recent');
+		}, 60000);
+
 		if (msg.from_name && msgClass !== 'system' && !['level-info', 'level-warn', 'level-error'].includes(msgClass)) {
 			const fromSpan = document.createElement('span');
 			fromSpan.className = 'dc-chat-msg-from';
@@ -440,7 +455,10 @@
 		el.appendChild(bodySpan);
 
 		messagesEl.appendChild(el);
-		messagesEl.scrollTop = messagesEl.scrollHeight;
+		// Scroll to bottom after render
+		requestAnimationFrame(() => {
+			messagesEl.scrollTop = messagesEl.scrollHeight;
+		});
 
 		// Maintain rolling buffer
 		_messageBuffer.push(el);
@@ -471,10 +489,15 @@
 		/** @param {MessageEvent} e */
 		const onV1Event = (e) => {
 			const { op, data } = e.detail || {};
+			// Debug: log all incoming ops to see what's coming back
+			if (op && (op.startsWith('channel.') || op.startsWith('chat.') || op === 'dc.presence.join')) {
+				console.log('[dc-chat] incoming event:', { op, data });
+			}
 			if (!op || !data) return;
 
 			// channel.message — broadcast from the server to all clients in the channel
 			if (op === 'channel.message') {
+				console.log('[dc-chat] channel.message received:', data);
 				api.addMessage({
 					from_name: data.from_name || data.from || 'server',
 					body: data.body || '',
@@ -486,6 +509,7 @@
 
 			// chat.message — alternative incoming format
 			if (op === 'chat.message') {
+				console.log('[dc-chat] chat.message received:', data);
 				api.addMessage({
 					from_name: data.from_name || data.from || 'server',
 					body: data.body || '',
@@ -612,10 +636,12 @@
 					_isHovered = true;
 					if (_idleTimer) { clearTimeout(_idleTimer); _idleTimer = null; }
 					frame.classList.remove('dc-chat-idle');
+					inputArea.classList.add('visible');
 				});
 
 				inputEl.addEventListener('focusout', () => {
 					_isHovered = false;
+					inputArea.classList.remove('visible');
 					_resetIdleTimer(frame);
 				});
 
@@ -665,10 +691,9 @@
 				}
 
 				const trimmed = (text || '').trim();
-
 				if (!trimmed) return;
 
-				// Dispatch via DC_WS
+				// Dispatch via DC_WS only - server will echo back to us
 				if (window.DC_WS && typeof window.DC_WS.send === 'function') {
 					window.DC_WS.send('channel.publish', {
 						channel: CHANNEL_NOC,

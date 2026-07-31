@@ -498,6 +498,10 @@ function displayDatacenter() {
     buildCommunity(); // the other datacenters as exterior shells around this one
     spawnInside();    // place the player within the walls on load / location change
     attachKeyHandlers(); // Bug #1: re-attach key handlers after scene rebuild
+    // Re-add stats panel if it was removed by clearScene()
+    if (stats && stats.dom && !stats.dom.parentNode) {
+        document.body.appendChild(stats.dom);
+    }
 }
 
 function setNetworkVisible(visible) {
