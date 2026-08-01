@@ -855,9 +855,21 @@ function populateCharacterPicker() {
   if (!S.manifest || !S.manifest.characters || !S.manifest.characters.length) return;
   // Player controls live INSIDE the shared lil-gui (not free-floating buttons over it). The gui is
   // built only after the datacenter fetch resolves, which is later than this overlay boots -> poll.
+  // Bounded on the same budget whenReady() uses: when that fetch fails, displayGui() never runs and
+  // DC.gui never appears, and an unbounded poll then wakes the page every 120ms for as long as it
+  // stays open — forever, on a page meant to be left running.
+  const GUI_TIMEOUT_MS = 15000;
+  const start = performance.now();
   const build = () => {
     const gui = S.DC && S.DC.gui;
-    if (!gui) { setTimeout(build, 120); return; }
+    if (!gui) {
+      if (performance.now() - start > GUI_TIMEOUT_MS) {
+        console.error(`[dc-multi] populateCharacterPicker timeout - DC.gui not available after ${GUI_TIMEOUT_MS}ms`);
+        return;
+      }
+      setTimeout(build, 120);
+      return;
+    }
     if (S.playerGui) return;
     const f = gui.addFolder("Player");
     const opts = {};
@@ -934,6 +946,15 @@ function exposeDebug() {
     /** Character yaw in radians — dc-presence reads this so its join carries our real facing */
     getFacing: () => S.facing,
     getState: () => ({ mode: S.mode, spawned: S.spawned, charId: S.loadedCharId }),
+    /**
+     * Live movement state. getState() above is the stable three-field summary the console helpers and
+     * dc-presence read; this is the raw locomotion state (mode/vy/facing/camDist) that
+     * tests/playwright/dc.spec.ts Group 5 asserts on. A getter, not a stored object, so it can never
+     * report a stale pose and nothing outside can write S through it.
+     */
+    get state() {
+      return { mode: S.mode, vy: S.vy, facing: S.facing, camDist: S.camDist, grounded: S.grounded, spawned: S.spawned };
+    },
     setMode, toggleMode, gesture, endGesture, cycleGesture,
     play: (l) => play(l, 0.2),
     reload: () => location.reload(),

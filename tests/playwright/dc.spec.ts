@@ -40,32 +40,137 @@ async function waitForPageLoad(page: any, timeout = 60000): Promise<boolean> {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: wait for DCM state to be available
+// Hermetic boot — every page load in this file goes through here.
+//
+// What starves the single-threaded `php -S` fixture is NOT the rack/server inventory. dc.html is
+// loaded directly to bypass PHP session auth, but /ajax/datacenter.php enforces its OWN session
+// check, so an unstubbed load gets a 403 there and requests exactly zero rack or server GLBs —
+// measured across a full run. The load is dc-multi.js's character assets: it picks a character at
+// RANDOM per page load (Math.random()) and animation sets range from ~25 GLBs to ~2500, so the same
+// spec could pull 25 or 2500 files depending on the draw. That is what took the 30s budget away from
+// beforeEach. Three stubs remove all of it:
+//
+//   - window.WebSocket, installed before any page script runs, so the real datacentered hub
+//     (wss://…:7272) is NEVER contacted. dc-ws.js reads `WebSocket` as a bare identifier, which
+//     resolves to the window property, so the override takes effect. No op/re handling is touched —
+//     the socket simply never opens, which is a state the v1 protocol already has to survive.
+//   - /ajax/datacenter.php, which turns that 403 into a room: without it displayDatacenter() never
+//     runs, so #dcLoading never lifts, attachKeyHandlers() never fires and no HUD panel is built.
+//   - /images/3d/mixamo/manifest.json, answered 404 so dc-multi.js takes its "no character assets"
+//     branch. public_html/images/3d is gitignored, so 404 is exactly what CI sees. Nothing below
+//     asserts on characters; the overlay still boots, still exposes window.DCM and still handles
+//     V/R without a model (applyMode() guards S.model).
+//
+// The payload is keyed at location 4 ON PURPOSE. dc.js's options.location defaults to 4 and
+// buildRoom()/getRackModels() read locations[options.location] straight off the merged response, so
+// a payload without that id throws inside loadDatacenter()'s .then() — where the .catch() swallows
+// it, leaving #dcLoading (inset:0, z-index:40) up for the life of the page and eating every pointer
+// interaction, which is the same dead end as the 403. Keep this key and options.location in step.
 // ---------------------------------------------------------------------------
-async function waitForDCMState(page: any, stateTimeout = 30000): Promise<boolean> {
-  return page
-    .waitForFunction(() => (window as any).DCM?.state, { timeout: stateTimeout })
-    .then(() => true)
-    .catch(() => false);
+function datacenterStub() {
+  // Same shape /ajax/datacenter.php emits. Rack type 1 and server type 1 are real entries in dc.js's
+  // rackTypes/serverTypes, so the room resolves two small meshopt GLBs instead of the full set.
+  const racks: Record<string, any> = {};
+  for (let r = 1; r <= 4; r++) {
+    const servers: Record<string, any> = {};
+    for (let s = 0; s < 3; s++) {
+      servers[String(100 + r * 10 + s)] = { hostname: `web${r}${s}.test`, start: 1 + s * 2, size: 1, type: 1 };
+    }
+    racks[String(r)] = { x: r, y: 2, name: `R${r}`, type: 1, servers, switches: {} };
+  }
+  return { locations: { 4: { name: 'Test DC', region: 'Test', racks } } };
+}
+const DATACENTER_STUB = datacenterStub();
+
+/**
+ * 'throw' the WebSocket constructor throws (blocked / bad URL)
+ * 'close' the socket is created and closes immediately
+ * 'dead'  the socket is created already closed and stays silent
+ */
+type HubMode = 'throw' | 'close' | 'dead';
+
+async function stubHub(page: any, mode: HubMode) {
+  await page.addInitScript((m: string) => {
+    (window as any).__wsAttempts = 0;
+    function DeadSocket(this: any, url: string) {
+      (window as any).__wsAttempts++;
+      (window as any).__wsUrl = url;
+      if (m === 'throw') throw new Error('E2E: hub unreachable');
+      this.url = url;
+      this.readyState = m === 'dead' ? 3 : 0;
+      this.send = m === 'dead' ? () => {} : () => { throw new Error('E2E: socket is not open'); };
+      this.close = () => { this.readyState = 3; };
+      if (m === 'close') {
+        setTimeout(() => {
+          this.readyState = 3;
+          if (this.onclose) this.onclose({ code: 1006, reason: 'E2E: hub unreachable' });
+        }, 0);
+      }
+    }
+    (DeadSocket as any).CONNECTING = 0;
+    (DeadSocket as any).OPEN = 1;
+    (DeadSocket as any).CLOSING = 2;
+    (DeadSocket as any).CLOSED = 3;
+    (window as any).WebSocket = DeadSocket;
+  }, mode);
 }
 
-// ---------------------------------------------------------------------------
-// Helper: wait for DC.options to be available
-// ---------------------------------------------------------------------------
-async function waitForDCOptions(page: any, timeout = 30000): Promise<boolean> {
-  return page
-    .waitForFunction(() => (window as any).DC?.options, { timeout })
-    .then(() => true)
-    .catch(() => false);
+async function bootHermetic(page: any, url = '/admin/dc.html', hub: HubMode = 'dead') {
+  await stubHub(page, hub);
+  await page.route('**/ajax/datacenter.php*', (route: any) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(DATACENTER_STUB),
+    })
+  );
+  await page.route('**/images/3d/mixamo/manifest.json*', (route: any) =>
+    route.fulfill({ status: 404, contentType: 'text/plain', body: 'E2E: no character assets' })
+  );
+  await page.goto(url, { timeout: 120000 });
+  await page.waitForLoadState('domcontentloaded');
+}
+
+// #dcLoading is hidden on the last line of loadDatacenter()'s success path, after displayGui() and
+// displayDatacenter() have both run. That makes it the one signal covering everything a live-scene
+// test needs: the HUD panel is built, attachKeyHandlers() has run, and the curtain that intercepts
+// pointer events is gone.
+async function waitForSceneLoaded(page: any, timeout = 90000) {
+  await page.waitForFunction(() => {
+    const el = document.getElementById('dcLoading');
+    return !!(window as any).DC?.scene && !!el && getComputedStyle(el).display === 'none';
+  }, { timeout });
+}
+
+// dc-multi.js assigns window.DCM at the tail of its whenReady() bootstrap, after setupInput() has
+// attached the V/R handlers — so the global appearing is the readiness signal for this overlay.
+async function waitForDCM(page: any, timeout = 90000) {
+  await page.waitForFunction(() => (window as any).DCM, { timeout });
+}
+
+// DC.renderer goes truthy the instant the renderer is CONSTRUCTED, but _setupRendererSwitch() — the
+// only thing that ever assigns DC.backendName — runs after `await renderer.init()`, which in webgpu
+// mode is a real asynchronous device acquisition. Between those two points DC.backendName is still
+// dc.js's module-level 'webgl' default, so anything gating on DC.renderer alone can read a WebGPU boot
+// as a WebGL one. That same function writes the #dcRenderer label, which makes the label the honest
+// "backendName has been assigned" signal.
+async function waitForRendererSettled(page: any, timeout = 90000) {
+  await page.waitForFunction(
+    () => !!(window as any).DC?.renderer && !!document.getElementById('dcRenderer')?.textContent,
+    { timeout }
+  );
 }
 
 // ---------------------------------------------------------------------------
 // Group 1: Static HTML Structure (no JavaScript required)
 // ---------------------------------------------------------------------------
 test.describe('Group 1: Static HTML Structure', () => {
+  // Hermetic even though nothing here needs the scene: a bare goto still lets dc-multi.js pull a
+  // random character's whole animation set through the fixture server, which is a load these tests
+  // pay for and nobody collects on. See bootHermetic.
   test.beforeEach(async ({ page }) => {
-    await page.goto('/admin/dc.html', { timeout: 120000 });
-    await page.waitForLoadState('domcontentloaded');
+    test.setTimeout(150000);
+    await bootHermetic(page);
   });
 
   test('page has correct title', async ({ page }) => {
@@ -147,8 +252,8 @@ test.describe('Group 1: Static HTML Structure', () => {
 // ---------------------------------------------------------------------------
 test.describe('Group 2: CSS Styling', () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto('/admin/dc.html', { timeout: 120000 });
-    await page.waitForLoadState('domcontentloaded');
+    test.setTimeout(150000);
+    await bootHermetic(page);
   });
 
   test('#dcSearch has correct positioning', async ({ page }) => {
@@ -178,9 +283,13 @@ test.describe('Group 2: CSS Styling', () => {
 // Group 3: Input Functionality (no WebGL required)
 // ---------------------------------------------------------------------------
 test.describe('Group 3: Input Functionality', () => {
+  // Booted hermetically (see bootHermetic). These are HUD-level tests, but the HUD sits under
+  // #dcLoading until loadDatacenter() resolves, and unstubbed that never happens (403) — so the click
+  // below failed with "#dcLoading intercepts pointer events" no matter how long it waited, while the
+  // fill/clear pair lost its budget to the character-asset storm. Neither is what this group is about.
   test.beforeEach(async ({ page }) => {
-    await page.goto('/admin/dc.html', { timeout: 120000 });
-    await page.waitForLoadState('domcontentloaded');
+    test.setTimeout(150000);
+    await bootHermetic(page);
   });
 
   test('dcSearch accepts text input', async ({ page }) => {
@@ -199,8 +308,9 @@ test.describe('Group 3: Input Functionality', () => {
   });
 
   test('#dcViews button click changes active state', async ({ page }) => {
-    // Wait for any JS to initialize
-    await page.waitForTimeout(500);
+    // A real click, not dispatchEvent: hit-testing the button is half of what this test is worth,
+    // and it only becomes hittable once the loading curtain lifts.
+    await waitForSceneLoaded(page);
 
     // Click a view button
     const aisleBtn = page.locator('#dcViews button[data-view="aisle"]');
@@ -217,9 +327,12 @@ test.describe('Group 3: Input Functionality', () => {
 // Group 4: WebSocket/Presence Globals (defensive - may not connect)
 // ---------------------------------------------------------------------------
 test.describe('Group 4: WebSocket/Presence Globals', () => {
+  // The hub stub is what these assertions were always really about: the globals dc-ws.js/dc-presence.js
+  // publish have to exist whether or not a socket ever opened. Booting bare left that to whether an
+  // outbound wss://…:7272 happened to fail, which is not a test.
   test.beforeEach(async ({ page }) => {
-    await page.goto('/admin/dc.html', { timeout: 120000 });
-    await page.waitForLoadState('domcontentloaded');
+    test.setTimeout(150000);
+    await bootHermetic(page);
   });
 
   test('DC_WS global exists (may be null if not connected)', async ({ page }) => {
@@ -253,33 +366,29 @@ test.describe('Group 4: WebSocket/Presence Globals', () => {
 
 // ---------------------------------------------------------------------------
 // Group 5: DCM Debug Interface (requires full scene initialization)
-// These tests may skip if WebGL/scene isn't ready in headless mode
+//
+// Booted hermetically (see bootHermetic), which is what makes "requires full scene initialization"
+// affordable. Before that these waited on networkidle — unreachable while the fixture server is
+// still dribbling out a random character's animation set — so every test in the group burned its
+// whole budget in beforeEach and none of the assertions below ever ran.
+//
+// The readiness gate is window.DCM, not DCM.state: the global is assigned as one object at the end
+// of dc-multi.js's bootstrap, so waiting on any one of its members is waiting on all of them, and
+// gating on a member is how a missing member turned into six timeouts instead of one failure.
 // ---------------------------------------------------------------------------
 test.describe('Group 5: DCM Debug Interface', () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto('/admin/dc.html', { timeout: 120000 });
-    await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => {
-      // Network idle may not be reachable if assets are still loading
-    });
+    test.setTimeout(150000);
+    await bootHermetic(page);
+    await waitForDCM(page);
   });
 
   test('DCM global is exposed when scene is ready', async ({ page }) => {
-    const DCMReady = await waitForDCMState(page, 30000);
-    if (!DCMReady) {
-      test.skip();
-      return;
-    }
     const hasDCM = await page.evaluate(() => (window as any).DCM !== undefined);
     expect(hasDCM).toBe(true);
   });
 
   test('DCM.state has expected properties', async ({ page }) => {
-    const DCMReady = await waitForDCMState(page, 30000);
-    if (!DCMReady) {
-      test.skip();
-      return;
-    }
-
     const state = await page.evaluate(() => (window as any).DCM?.state);
     expect(state).toBeTruthy();
     expect(state.mode).toMatch(/^(first|third)$/);
@@ -289,34 +398,16 @@ test.describe('Group 5: DCM Debug Interface', () => {
   });
 
   test('DCM.setMode function exists', async ({ page }) => {
-    const DCMReady = await waitForDCMState(page, 30000);
-    if (!DCMReady) {
-      test.skip();
-      return;
-    }
-
     const hasSetMode = await page.evaluate(() => typeof (window as any).DCM?.setMode === 'function');
     expect(hasSetMode).toBe(true);
   });
 
   test('DCM.toggleMode function exists', async ({ page }) => {
-    const DCMReady = await waitForDCMState(page, 30000);
-    if (!DCMReady) {
-      test.skip();
-      return;
-    }
-
     const hasToggle = await page.evaluate(() => typeof (window as any).DCM?.toggleMode === 'function');
     expect(hasToggle).toBe(true);
   });
 
   test('V key toggles mode', async ({ page }) => {
-    const DCMReady = await waitForDCMState(page, 30000);
-    if (!DCMReady) {
-      test.skip();
-      return;
-    }
-
     const initialMode = await page.evaluate(() => (window as any).DCM?.state?.mode);
     await page.keyboard.press('v');
     await page.waitForTimeout(300);
@@ -325,12 +416,6 @@ test.describe('Group 5: DCM Debug Interface', () => {
   });
 
   test('R key triggers respawn', async ({ page }) => {
-    const DCMReady = await waitForDCMState(page, 30000);
-    if (!DCMReady) {
-      test.skip();
-      return;
-    }
-
     // Collect any errors during respawn
     const errors: string[] = [];
     page.on('pageerror', (err) => errors.push(err.message));
@@ -346,20 +431,19 @@ test.describe('Group 5: DCM Debug Interface', () => {
 
 // ---------------------------------------------------------------------------
 // Group 6: DC Options (requires scene init)
+//
+// Hermetic for the same reason as Group 5. WASD is wired by attachKeyHandlers() on the last line of
+// displayDatacenter(), so DC.options existing is NOT enough to press a key against — waitForSceneLoaded
+// is the gate that says the fetch chain got that far.
 // ---------------------------------------------------------------------------
 test.describe('Group 6: DC Options', () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto('/admin/dc.html', { timeout: 120000 });
-    await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => {});
+    test.setTimeout(150000);
+    await bootHermetic(page);
+    await waitForSceneLoaded(page);
   });
 
   test('DC.options exists with movement flags', async ({ page }) => {
-    const optionsReady = await waitForDCOptions(page, 30000);
-    if (!optionsReady) {
-      test.skip();
-      return;
-    }
-
     const options = await page.evaluate(() => (window as any).DC?.options);
     expect(options).toBeTruthy();
     expect(typeof options.moveForward).toBe('boolean');
@@ -369,12 +453,6 @@ test.describe('Group 6: DC Options', () => {
   });
 
   test('WASD keys modify movement flags', async ({ page }) => {
-    const optionsReady = await waitForDCOptions(page, 30000);
-    if (!optionsReady) {
-      test.skip();
-      return;
-    }
-
     // Initial state should be false
     const initial = await page.evaluate(() => ({
       forward: (window as any).DC?.options?.moveForward,
@@ -400,8 +478,12 @@ test.describe('Group 6: DC Options', () => {
 // Group 7: WebGL Availability Check
 // ---------------------------------------------------------------------------
 test.describe('Group 7: WebGL Availability', () => {
+  test.beforeEach(() => {
+    test.setTimeout(150000);
+  });
+
   test('WebGL context can be created', async ({ page }) => {
-    await page.goto('/admin/dc.html');
+    await bootHermetic(page);
     const webglAvailable = await page.evaluate(() => {
       try {
         const canvas = document.createElement('canvas');
@@ -422,8 +504,7 @@ test.describe('Group 7: WebGL Availability', () => {
       const errors: string[] = [];
       page.on('pageerror', (err) => errors.push(err.message));
 
-      await page.goto(url, { timeout: 120000 });
-      await page.waitForLoadState('domcontentloaded');
+      await bootHermetic(page, url);
       await page.waitForTimeout(3000);  // Wait for any async initialization
 
       // Filter out known non-critical errors
@@ -449,68 +530,17 @@ test.describe('Group 7: WebGL Availability', () => {
 //   "The scene must work fully when the WebSocket server is unreachable, just
 //    without multi-user."
 //
-// Hermetic by construction. Two things are stubbed before any page script runs:
-//   - window.WebSocket, so the real datacentered hub (wss://…:7272) is NEVER
-//     contacted. dc-ws.js reads `WebSocket` as a bare identifier, which resolves
-//     to the window property, so the override takes effect.
-//   - /ajax/datacenter.php, so no DB is touched and the room build is fast.
+// Hermetic by construction — see bootHermetic at the top of this file for what is
+// stubbed and why. The only thing this group adds is WHICH kind of dead hub.
 //
 // The Vitest specs (tests/js/dc-offline.test.js) are the real gate for this
-// behaviour; this group is the in-browser confirmation. Playwright is
-// continue-on-error in CI, so keep the assertions about the HUD and input
-// handling rather than about GLB assets the single-threaded php -S cannot serve.
+// behaviour; this group is the in-browser confirmation, so keep its assertions on
+// the HUD and input handling — what a dead hub can actually affect — rather than
+// on scene assets, which have nothing to do with the socket either way.
 // ---------------------------------------------------------------------------
 test.describe('Group 8: Hub unreachable (scene must still work)', () => {
-  const DATACENTER_STUB = {
-    locations: {
-      0: {
-        name: 'Test',
-        region: 'Test',
-        racks: {
-          1: { x: 0, y: 0, type: 0, servers: {}, switches: {} },
-          2: { x: 1, y: 0, type: 1, servers: {}, switches: {} },
-        },
-      },
-    },
-  };
-
-  /**
-   * @param mode 'throw'  the WebSocket constructor throws (blocked / bad URL)
-   *             'close'  the socket is created and closes immediately
-   */
   async function bootWithDeadHub(page: any, mode: 'throw' | 'close') {
-    await page.addInitScript((m: string) => {
-      (window as any).__wsAttempts = 0;
-      function DeadSocket(this: any, url: string) {
-        (window as any).__wsAttempts++;
-        (window as any).__wsUrl = url;
-        if (m === 'throw') throw new Error('E2E: hub unreachable');
-        this.url = url;
-        this.readyState = 0;
-        this.send = () => { throw new Error('E2E: socket is not open'); };
-        this.close = () => { this.readyState = 3; };
-        setTimeout(() => {
-          this.readyState = 3;
-          if (this.onclose) this.onclose({ code: 1006, reason: 'E2E: hub unreachable' });
-        }, 0);
-      }
-      (DeadSocket as any).CONNECTING = 0;
-      (DeadSocket as any).OPEN = 1;
-      (DeadSocket as any).CLOSING = 2;
-      (DeadSocket as any).CLOSED = 3;
-      (window as any).WebSocket = DeadSocket;
-    }, mode);
-
-    await page.route('**/ajax/datacenter.php*', (route: any) =>
-      route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify(DATACENTER_STUB),
-      })
-    );
-
-    await page.goto('/admin/dc.html', { timeout: 120000 });
-    await page.waitForLoadState('domcontentloaded');
+    await bootHermetic(page, '/admin/dc.html', mode);
     // dc-ws.js is a module script; under fixture contention it can arrive well after
     // domcontentloaded. Wait for it to have run so the assertions below have a base.
     await page
@@ -518,9 +548,9 @@ test.describe('Group 8: Hub unreachable (scene must still work)', () => {
       .catch(() => { /* asserted per-test below */ });
   }
 
-  // The single-threaded `php -S` fixture serialises the scene's ~100 GLB assets, so
-  // under full-suite contention every page load here is slow. Give each test a
-  // generous budget so contention shows up as slowness, not as a false regression.
+  // The single-threaded `php -S` fixture serialises every request, so under full-suite
+  // contention even a hermetic page load is slow. Give each test a generous budget so
+  // contention shows up as slowness, not as a false regression.
   test.beforeEach(() => {
     test.setTimeout(150000);
   });
@@ -589,11 +619,10 @@ test.describe('Group 8: Hub unreachable (scene must still work)', () => {
       await expect(page.locator('#dcSearch')).toHaveValue('');
       await expect(page.locator('#dcPresence')).toBeVisible();
 
-      // NOTE: keyboard movement is deliberately NOT asserted here. WASD handling is
-      // attached by attachKeyHandlers() inside displayDatacenter(), which waits on the
-      // scene's ~100 GLB assets that the single-threaded `php -S` fixture cannot serve
-      // in time (.claude/rules/js-tests.md). Group 6 covers keyboard movement, and
-      // tests/js/dc-offline.test.js covers scene liveness with a dead hub.
+      // NOTE: keyboard movement is deliberately NOT asserted here. WASD handling is attached by
+      // attachKeyHandlers() inside displayDatacenter(), which is downstream of the datacenter fetch
+      // rather than of the hub — so it is Group 6's subject, not this group's. Group 6 covers keyboard
+      // movement, and tests/js/dc-offline.test.js covers scene liveness with a dead hub.
     });
 
     test(`[${mode}] no unhandled JS errors from the dead hub`, async ({ page }) => {
@@ -661,44 +690,10 @@ test.describe('Group 8: Hub unreachable (scene must still work)', () => {
 // actually applies produces a renderer the scene can boot on.
 //
 // Booted hermetically, exactly like Group 8: the hub is stubbed so no WSS connection is attempted
-// and /ajax/datacenter.php is stubbed so the room builds without the DB or the ~100 GLBs the
-// single-threaded `php -S` fixture cannot serve in time (.claude/rules/js-tests.md).
+// and /ajax/datacenter.php is stubbed so the room builds without the DB (.claude/rules/js-tests.md).
 // ---------------------------------------------------------------------------
 test.describe('Group 9: Renderer modes', () => {
-  const DATACENTER_STUB = {
-    locations: {
-      0: {
-        name: 'Test',
-        region: 'Test',
-        racks: { 1: { x: 0, y: 0, type: 0, servers: {}, switches: {} } },
-      },
-    },
-  };
-
-  async function boot(page: any, url: string) {
-    await page.addInitScript(() => {
-      function DeadSocket(this: any, u: string) {
-        this.url = u;
-        this.readyState = 3;
-        this.send = () => {};
-        this.close = () => {};
-      }
-      (DeadSocket as any).CONNECTING = 0;
-      (DeadSocket as any).OPEN = 1;
-      (DeadSocket as any).CLOSING = 2;
-      (DeadSocket as any).CLOSED = 3;
-      (window as any).WebSocket = DeadSocket;
-    });
-    await page.route('**/ajax/datacenter.php*', (route: any) =>
-      route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify(DATACENTER_STUB),
-      })
-    );
-    await page.goto(url, { timeout: 120000 });
-    await page.waitForLoadState('domcontentloaded');
-  }
+  const boot = (page: any, url: string) => bootHermetic(page, url, 'dead');
 
   test.beforeEach(() => {
     // three.webgpu.js is a 2 MB unminified dev build off the same fixture server; give the boot
@@ -736,8 +731,7 @@ test.describe('Group 9: Renderer modes', () => {
     test(`[${label}] the scene boots and reports the backend it really got`, async ({ page }) => {
       await boot(page, url);
 
-      const ready = await page
-        .waitForFunction(() => (window as any).DC && (window as any).DC.renderer, { timeout: 90000 })
+      const ready = await waitForRendererSettled(page)
         .then(() => true)
         .catch(() => false);
       expect(ready).toBe(true);

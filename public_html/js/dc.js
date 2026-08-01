@@ -943,6 +943,18 @@ function notice(text, ms = 12000) {
 }
 
 function loadGlbWithFallback(basePath, relName, onLoad) {
+    // Index 0 of rackTypes/serverTypes is the empty-string placeholder for "no model", and neither
+    // getRackModels()/getServerModels() nor loadRackType()/loadServerType() screen for it — the latter
+    // two only reject an index that is missing entirely. A payload carrying type 0 therefore arrives
+    // here with nothing to fetch, and unguarded that is three doomed requests (<basePath>.glb,
+    // <basePath>meshopt/.glb, <basePath>webp-simplify/.glb) landing in the all-variants-failed branch,
+    // which now reaches the user through notice() — a "some 3D models failed to load" banner about a
+    // model nobody asked for. Warn once for the type instead; callers already tolerate onLoad never
+    // firing (loadBuildingModels' 12s race guard covers the promise that never settles).
+    if (!relName) {
+        console.warn('[dc] Skipping GLB load with no model name for', basePath);
+        return;
+    }
     let i = 0;
     const tryNext = () => {
         const url = glbVariantUrl(basePath, relName, GLB_VARIANTS[i]);
