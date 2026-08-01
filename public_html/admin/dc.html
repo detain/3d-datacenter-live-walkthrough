@@ -5,15 +5,31 @@
 	<title>InterServer DataCenter</title>
 	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<meta http-equiv="Cache-Control" content="max-age=0, must-revalidate">
-	<script type="importmap">
-		{
-		"imports": {
-			"three": "/lib/three/build/three.module.js",
-				"three/addons/": "/lib/three/examples/jsm/",
-				"lil-gui": "/lib/lil-gui/dist/lil-gui.esm.js"
-		}
-	}
-</script>
+	<script>
+		// Renderer mode switch — MUST run before any module script so the import map
+		// exists before three.js resolves. document.write is intentional: during parsing
+		// it inserts the import map synchronously at this exact position.
+		(function () {
+			var mode = new URLSearchParams(location.search).get('renderer');
+			if (mode !== 'webgpu' && mode !== 'webgpu-gl') mode = 'webgl';
+			window.DC_RENDERER_MODE = mode;
+			var base = '/lib/three/build/';
+			var three = base + (mode === 'webgl' ? 'three.module.js' : 'three.webgpu.js');
+			var imports = {
+				'three': three,
+				'three/addons/': '/lib/three/examples/jsm/',
+				'lil-gui': '/lib/lil-gui/dist/lil-gui.esm.js'
+			};
+			// Deliberately not mapped in webgl mode: an accidental webgpu-only import
+			// should fail loudly there rather than half-work.
+			if (mode !== 'webgl') {              // Inspector needs these two specifiers
+				imports['three/webgpu'] = three;
+				imports['three/tsl'] = base + 'three.tsl.js';
+			}
+			document.write('<script type="importmap">' + JSON.stringify({ imports: imports }) + '<\x2Fscript>');
+			document.write('<link rel="modulepreload" href="' + three + '">');
+		})();
+	</script>
 	<style>
 		#dcSearch { position: fixed; top: 10px; left: 170px; z-index: 30; width: 240px;
 			padding: 7px 10px; border: 1px solid #888; border-radius: 4px; font: 14px Arial, sans-serif;
@@ -78,7 +94,6 @@
 	</style>
 	<!-- DC: Three.js scene via importmap (standalone static fallback) -->
 	<link rel="stylesheet" href="/css/dc.css?v=p45">
-	<link rel="modulepreload" href="/lib/three/build/three.module.js">
 	<link rel="modulepreload" href="/lib/three/examples/jsm/controls/PointerLockControls.js">
 	<link rel="modulepreload" href="/lib/three/examples/jsm/loaders/GLTFLoader.js">
 	<link rel="modulepreload" href="/lib/three/examples/jsm/loaders/DRACOLoader.js">
@@ -114,6 +129,7 @@
 	<div id="dcPlayer">
 		<select id="dcChar" title="Character" style="display:none"></select>
 		<button id="dcPerson" type="button">🧍 Third-person</button>
+		<button id="dcRenderer" type="button" title="Switch renderer"></button>
 	</div>
 	<div id="dcViews">
 		<button data-view="overview">Overview</button>
@@ -155,11 +171,11 @@
 	  window.DC_USER_NAME  = "";
 	  window.DC_ACCOUNT_ID = 0;
 	</script>
-	<script type="module" src="/js/dc-ws.js?v=p52"></script>
-	<script type="module" src="/js/dc.js?v=p52"></script>
-	<script type="module" src="/js/dc-presence.js?v=p52"></script>
-	<script type="module" src="/js/dc-multi.js?v=p52"></script>
-	<script type="module" src="/js/dc-chat.js?v=p52"></script>
+	<script type="module" src="/js/dc-ws.js?v=p53"></script>
+	<script type="module" src="/js/dc.js?v=p53"></script>
+	<script type="module" src="/js/dc-presence.js?v=p53"></script>
+	<script type="module" src="/js/dc-multi.js?v=p53"></script>
+	<script type="module" src="/js/dc-chat.js?v=p53"></script>
 	<script>
 		// Feature 3: 'c' key focuses chat input when not in a text field.
 		// 'c' is unambiguous now: dc.js binds no 'c' key, and dc-multi.js's KeyC branch
