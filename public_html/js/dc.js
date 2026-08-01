@@ -3011,6 +3011,9 @@ const IDLE_VIEWS = ['overview', 'aisle', 'labels', 'cables', 'top'];
 const IDLE_VIEW_MS = 5000;
 let idleLastSwitch = performance.now(), idleViewIdx = -1;
 function maybeCycleIdleView() {
+    // DC.bench() drives the same presets on its own schedule; letting the demo also fire would
+    // move the camera mid-sample and mix two views into one measurement window.
+    if (_benchActive) { idleLastSwitch = performance.now(); return; }
     if (options.useFirstPerson || !controls || controls.isLocked || document.hidden || flyTo.active) { idleLastSwitch = performance.now(); return; }
     const bl = document.getElementById('blocker');
     if (!bl || bl.style.display === 'none') { idleLastSwitch = performance.now(); return; }
@@ -3623,6 +3626,69 @@ function _setupRendererSwitch() {
     });
 }
 
+// --- comparison harness: `await DC.bench()` from the console, once per ?renderer= mode ---
+// Inert unless called. Nothing here is wired into the render loop or into init(), so a normal page
+// load pays nothing for it. It walks the camera through the preset views so every mode is measured
+// over one identical path, samples the FPS ring buffer the auto-quality scaler already maintains,
+// and puts the camera back where it found it — a measurement must not leave the view somewhere else.
+let _benchActive = false;
+
+async function bench(seconds = 10) {
+    if (_benchActive) throw new Error('[dc] bench already running');
+    if (!renderer || !camera) throw new Error('[dc] scene not ready');
+    _benchActive = true;
+    const perView = Math.max(1000, Math.round((seconds * 1000) / IDLE_VIEWS.length));
+    const homePos = camera.position.clone();
+    const homeQuat = camera.quaternion.clone();
+    const wasFlying = flyTo.active;
+    const samples = [];
+    let drawCalls = 0;
+    try {
+        for (const name of IDLE_VIEWS) {
+            // Jump to the preset rather than setView(): a fly-to would spend most of the sample
+            // window in transit, and setView() also unlocks the pointer and repaints both the
+            // preset buttons and the GUI View dropdown — visible state a console measurement has
+            // no business changing.
+            const v = viewPreset(name);
+            flyTo.active = false;
+            camera.position.set(v.pos[0], v.pos[1], v.pos[2]);
+            camera.lookAt(v.look[0], v.look[1], v.look[2]);
+            const until = performance.now() + perView;
+            while (performance.now() < until) {
+                await new Promise((r) => setTimeout(r, 250));
+                // A page parked for _IDLE_FRAME_THRESHOLD frames has already switched _updateFPS()
+                // off, which leaves the window frozen at whatever it read minutes ago. Moving the
+                // camera is exactly the activity that clears that gate everywhere else.
+                _tickSkippedFrames = 0;
+                _skipExpensiveUpdates = false;
+                const fps = window.DC.quality._fps;   // rolling FPS_WINDOW average; null while filling
+                if (fps) samples.push(fps);
+                drawCalls = Math.max(drawCalls, _drawCalls());
+            }
+        }
+    } finally {
+        camera.position.copy(homePos);
+        camera.quaternion.copy(homeQuat);
+        flyTo.active = wasFlying;
+        _benchActive = false;
+    }
+    let sum = 0;
+    for (const f of samples) sum += f;
+    return {
+        mode: _rendererMode(),
+        backend: _backendName,
+        avgFps: samples.length ? Math.round(sum / samples.length) : null,
+        // worst rolling window seen, not the worst single frame — the ring buffer only ever
+        // reports an average, so a one-frame hitch is smeared across FPS_WINDOW frames
+        minFps: samples.length ? Math.min(...samples) : null,
+        drawCalls: drawCalls,
+        dpr: renderer.getPixelRatio(),
+        location: Number(options.location),
+        seconds: (perView * IDLE_VIEWS.length) / 1000,
+        samples: samples.length,
+    };
+}
+
 // --- Phase 1 measurement handle (admin-gated page; getters add zero render work) ---
 window.DC = {
     get renderer() { return renderer; },
@@ -3701,6 +3767,7 @@ window.DC = {
         const _fps = Math.round(1000 / (fpsSum / _fpsCount));
         return { ...S, _fps };
     },
+    bench: bench,   // await DC.bench(seconds) — renderer A/B/C harness, see docs/dc_renderer_modes.md
     // --- multi-building LOD + walk-between handles (used by dc-multi.js; inert for dc.html) ---
     collideWorld: collideWorld,                 // walls + current racks + neighbours' active interiors
     get buildings() { return dcBuildings; },    // wall/door rects for every building (current + neighbours)
