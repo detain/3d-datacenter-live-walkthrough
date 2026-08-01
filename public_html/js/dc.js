@@ -18,7 +18,7 @@ import Stats from "three/addons/libs/stats.module.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import * as BufferGeometryUtils from "three/addons/utils/BufferGeometryUtils.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
-let camera, scene, renderer, controls, controlObject, stats, gui, locations = {}, maxAnisotropy; // Declare global variables
+let camera, scene, renderer, controls, controlObject, stats, inspector, gui, locations = {}, maxAnisotropy; // Declare global variables
 const VIEW_OPTS = { Overview: 'overview', 'Top-down': 'top', Aisle: 'aisle', Labels: 'labels', Cables: 'cables' };
 const _viewProxy = { view: 'overview' };   // bound to the GUI 'View' dropdown (replaces the #dcViews button bar)
 let prevTime = performance.now();
@@ -3383,9 +3383,33 @@ async function init() {
     }
     // Load floor
     loadFloor();
-    // Add stats monitor
-    stats = new Stats();
-    document.body.appendChild(stats.dom);
+    // Perf readout. The node renderer gets the three.js Inspector instead of Stats: its Performance
+    // tab reads real GPU frame times off timestamp queries, where Stats only samples rAF cadence.
+    if (isNode) {
+        try {
+            // Dynamic import on purpose: the Inspector's Viewer tab statically imports "three/tsl",
+            // which dc.html deliberately leaves out of the webgl import map. A static import here
+            // would fail module resolution on the default page before any of the scene ran.
+            const { Inspector } = await import('three/addons/inspector/Inspector.js');
+            const created = new Inspector();
+            renderer.inspector = created;   // the setter wires renderer <-> inspector both ways
+            // The renderer calls inspector.init() itself, but only from inside its one-shot init()
+            // promise -- already resolved back at construction -- and init() only docks the panel
+            // when renderer.domElement has a parent. Both hold here, so drive it explicitly.
+            created.init();
+            inspector = created;
+        } catch (err) {
+            // A missing or broken addon must never cost us the scene; fall through to Stats.
+            inspector = null;
+            console.warn('[dc] three.js Inspector unavailable, using Stats:', err && err.message);
+        }
+    }
+    // renderer.inspector is never falsy on the node renderer (it defaults to an InspectorBase), so
+    // the module-level `inspector` is the only honest "the real Inspector attached" signal.
+    if (!inspector) {
+        stats = new Stats();
+        document.body.appendChild(stats.dom);
+    }
     // Wire up Phase 7 interaction (raycast picking + search box)
     setupInteraction();
     // Event listener for window resize
@@ -3430,8 +3454,8 @@ function animate() {
     if (!_skipExpensiveUpdates) updateLabels();
     if (!_skipExpensiveUpdates) updateBlinds();
     renderer.render(scene, camera);
-    // Update stats monitor
-    stats.update();
+    // Update stats monitor (absent in webgpu mode — the Inspector reports there instead)
+    if (stats) stats.update();
 }
 
 // Update controls based on user input
@@ -3594,6 +3618,7 @@ window.DC = {
     get controls() { return controls; },
     get options() { return options; },
     get gui() { return gui; },
+    get inspector() { return inspector; },        // null unless the webgpu-mode Inspector attached
     get locations() { return locations; },
     get locationNames() { return locationNames; },
     get objects() { return objects; },
