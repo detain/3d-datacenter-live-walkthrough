@@ -608,6 +608,24 @@ describe('Inspector backend — onChange fan-out and the onFinishChange debounce
     vi.advanceTimersByTime(FINISH_DEBOUNCE_MS * 4);
     expect(onFinish).not.toHaveBeenCalled();
   });
+
+  it('folder destroy() drops the folder\'s pending finish callback and nothing else', () => {
+    const inspector = makeInspector();
+    const panel = createPanel({ inspector });
+    const rootFinish = vi.fn();
+    const folderFinish = vi.fn();
+    panel.add({ v: 0 }, 'v', 0, 100, 1).onFinishChange(rootFinish);
+    const folder = panel.addFolder('Movement');
+    folder.add({ x: 0 }, 'x', 0, 100, 1).onFinishChange(folderFinish);
+    editorAt(rootGroup(inspector), 0).emit(9);
+    editorAt(rootGroup(inspector).folders[0], 0).emit(7);
+
+    folder.destroy();
+
+    vi.advanceTimersByTime(FINISH_DEBOUNCE_MS * 4);
+    expect(folderFinish).not.toHaveBeenCalled();
+    expect(rootFinish).toHaveBeenCalledTimes(1);
+  });
 });
 
 // ===========================================================================
@@ -752,6 +770,21 @@ describe('Inspector backend — destroy()', () => {
     expect(inspector.parameters.paramList.removed).toEqual([]);
   });
 
+  it('folder destroy() cancels that folder\'s polls and leaves the rest of the panel running', () => {
+    const inspector = makeInspector();
+    const panel = createPanel({ inspector });
+    panel.add({ v: 0 }, 'v', 0, 10).listen();
+    const folder = panel.addFolder('Movement');
+    folder.add({ x: 0 }, 'x', -250, 250).listen();
+    expect(pendingRaf()).toBe(2);
+
+    folder.destroy();
+
+    expect(pendingRaf()).toBe(1);   // only the folder's poll stopped
+    panel.destroy();
+    expect(pendingRaf()).toBe(0);
+  });
+
   it('destroying the root also tears down controllers built on its folders', () => {
     const inspector = makeInspector();
     const panel = createPanel({ inspector });
@@ -780,9 +813,10 @@ describe('Inspector backend — destroy()', () => {
 // The dc-multi.js "Player" folder — the contract that breaks in BOTH modes
 // ===========================================================================
 describe('the dc-multi.js Player folder builds on either backend', () => {
-  /** Replays populateCharacterPicker()'s folder verbatim (dc-multi.js:863-880). */
+  /** Replays populateCharacterPicker()'s folder verbatim (dc-multi.js:862-883). */
   function buildPlayerFolder(panel) {
-    const S = { pixelScale: 1, fov: 75, powerPreference: 'high-performance', loadedCharId: 'ninja' };
+    // S.DC is window.DC; the GPU Mode row reads its powerPreference rather than keeping a copy.
+    const S = { pixelScale: 1, fov: 75, loadedCharId: 'ninja', DC: { powerPreference: 'browser default' } };
     let WALK = 14;
     let RUN = 34;
     const opts = { 'Ninja': 'ninja', 'Robot (system)': 'robot' };
@@ -793,7 +827,7 @@ describe('the dc-multi.js Player folder builds on either backend', () => {
     f.add(S, 'pixelScale', 0.5, 1.0).name('Quality').step(0.1).onChange(() => {});
     f.add({ 'DPR Cap': 'max 2.0' }, 'DPR Cap').name('DPR Cap').enable(false);
     f.add(S, 'fov', 30, 120).name('FOV').step(1).onChange(() => {});
-    f.add({ 'GPU Mode': S.powerPreference }, 'GPU Mode').name('GPU Mode').enable(false);
+    f.add({ 'GPU Mode': (S.DC && S.DC.powerPreference) || 'unknown' }, 'GPU Mode').name('GPU Mode').enable(false);
     f.add({ get walk() { return WALK; }, set walk(v) { WALK = v; } }, 'walk', 1, 30)
       .name('Walk Speed').step(0.5).onChange((v) => { WALK = v; });
     f.add({ get run() { return RUN; }, set run(v) { RUN = v; } }, 'run', 5, 60)

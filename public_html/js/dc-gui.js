@@ -196,7 +196,21 @@ function inspectorController(object, property, editor, subItem, teardowns) {
     return w;
 }
 
-function inspectorPanel(inspector, group, isRoot, teardowns) {
+function inspectorPanel(inspector, group, isRoot, parentTeardowns) {
+    // Each panel owns the teardowns for the controllers added directly to it and registers a runner
+    // with its parent, so destroying a FOLDER stops that folder's rAF polls and only those, while
+    // destroying the root still cascades through every folder it handed out. One list shared down
+    // the whole tree (which is what this was) plus a root-only run meant folder.destroy() stopped
+    // nothing: dc.js only ever destroys the root, so the polls survived until the page did.
+    const teardowns = [];
+    const runTeardowns = () => {
+        for (const fn of teardowns) {
+            try { fn(); } catch (e) { /* teardown must not throw the panel away */ }
+        }
+        teardowns.length = 0;
+    };
+    if (parentTeardowns) parentTeardowns.push(runTeardowns);
+
     const p = {
         add(obj, prop, ...params) {
             // ParametersGroup.add() returns null for a value type it has no editor for; the wrapper
@@ -210,12 +224,7 @@ function inspectorPanel(inspector, group, isRoot, teardowns) {
         // Inspector groups are open by default and expose only close().
         open() { return p; },
         destroy() {
-            if (isRoot) {
-                for (const fn of teardowns) {
-                    try { fn(); } catch (e) { /* teardown must not throw the panel away */ }
-                }
-                teardowns.length = 0;
-            }
+            runTeardowns();
             // Both List (the Parameters tab) and Item (a parent group) implement remove(), and
             // paramList.parent is whichever one adopted it — there is no destroy() to call.
             const parent = group.paramList && group.paramList.parent;
@@ -244,7 +253,7 @@ function inspectorPanel(inspector, group, isRoot, teardowns) {
 export function createPanel({ inspector } = {}) {
     if (inspector && typeof inspector.createParameters === 'function') {
         try {
-            return inspectorPanel(inspector, inspector.createParameters('Scene settings'), true, []);
+            return inspectorPanel(inspector, inspector.createParameters('Scene settings'), true, null);
         } catch (err) {
             // The adapter reaches into Inspector internals that are still moving upstream; a
             // three.js bump breaking them must cost the panel's looks, not the panel.

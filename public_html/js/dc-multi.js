@@ -60,7 +60,6 @@ const S = {
   camDist: 11,                    // third-person follow distance (scene units)
   pixelScale,                     // exposed for GUI control
   fov: 75,                        // camera field of view (degrees), adjustable via GUI
-  powerPreference: 'high-performance', // GPU power preference (display-only; set at renderer creation)
   // Presence update deduplication — only send DC_PRESENCE_MOVE when position or facing changes
   _lastPresenceX: null,
   _lastPresenceZ: null,
@@ -874,8 +873,11 @@ function populateCharacterPicker() {
     f.add(S, 'fov', 30, 120).name('FOV').step(1).onChange(v => {
         if (S.camera) { S.camera.fov = v; S.camera.updateProjectionMatrix(); }
     });
-    // powerPreference is set at renderer creation and can't be changed afterwards — display-only
-    f.add({ 'GPU Mode': S.powerPreference }, 'GPU Mode').name('GPU Mode').enable(false);
+    // Display-only: powerPreference is fixed at renderer creation and can't be changed afterwards.
+    // dc.js owns that construction and is the only place a preference could be requested, so the
+    // value comes from there — a copy kept here read 'high-performance' for as long as dc.js has
+    // been requesting nothing at all.
+    f.add({ 'GPU Mode': (S.DC && S.DC.powerPreference) || 'unknown' }, 'GPU Mode').name('GPU Mode').enable(false);
     f.add({ get walk() { return WALK; }, set walk(v) { WALK = v; } }, 'walk', 1, 30).name('Walk Speed').step(0.5).onChange(v => { WALK = v; });
     f.add({ get run() { return RUN; }, set run(v) { RUN = v; } }, 'run', 5, 60).name('Run Speed').step(0.5).onChange(v => { RUN = v; });
     f.open();

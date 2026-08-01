@@ -912,6 +912,36 @@ function glbVariantUrl(basePath, relName, variant) {
     return basePath + dir + variant + '/' + file + '.glb';
 }
 
+// One-line banner for things the user has to be told about but that don't stop the scene. dc-multi.js
+// has hud() for the same job, but that is a module-local function inside an OPTIONAL overlay: dc.js
+// is the core module and dc.html can (and in the Playwright fixture does) run it with dc-multi absent,
+// so calling hud() from here was a straight ReferenceError — every "all GLB variants failed" ended in
+// an uncaught throw and the warning it was trying to show reached nobody. Styled inline, like the
+// context-lost overlay, because dc.html's stylesheet is not this module's to grow.
+let _noticeEl = null;
+let _noticeTimer = null;
+
+function notice(text, ms = 12000) {
+    if (_noticeTimer !== null) { clearTimeout(_noticeTimer); _noticeTimer = null; }
+    if (!text) {
+        if (_noticeEl && _noticeEl.parentNode) _noticeEl.parentNode.removeChild(_noticeEl);
+        _noticeEl = null;
+        return;
+    }
+    if (!_noticeEl) {
+        _noticeEl = document.createElement('div');
+        _noticeEl.id = 'dcNotice';
+        // z-index above #dcLoading (40): a load-time warning that the loading curtain covers is no
+        // warning at all. Sits below dc-multi's #dcPlayerHud (top:10px) so the two can't overlap.
+        _noticeEl.style.cssText = 'position:fixed;top:44px;left:50%;transform:translateX(-50%);z-index:41;'
+            + 'padding:6px 12px;background:rgba(120,28,28,0.9);color:#fff;border-radius:5px;'
+            + 'font:12px Arial, sans-serif;pointer-events:none;max-width:70vw;text-align:center;';
+        document.body.appendChild(_noticeEl);
+    }
+    _noticeEl.textContent = text;
+    if (ms > 0) _noticeTimer = setTimeout(() => { _noticeTimer = null; notice(''); }, ms);
+}
+
 function loadGlbWithFallback(basePath, relName, onLoad) {
     let i = 0;
     const tryNext = () => {
@@ -921,7 +951,7 @@ function loadGlbWithFallback(basePath, relName, onLoad) {
         loaderGltf.load(url, onLoad, undefined, isLast
             ? (err) => {
                 console.error('[dc] All GLB variants failed for', basePath, relName, err);
-                hud("Warning: Some 3D models failed to load — scene may be incomplete");
+                notice('Warning: Some 3D models failed to load — scene may be incomplete');
             }
             : tryNext);
     };
@@ -3151,9 +3181,16 @@ async function init() {
     // and the two builds export different renderers — three.webgpu.js has WebGPURenderer and NOT
     // WebGLRenderer — so the build itself is the discriminator, not the ?renderer= value.
     const isNode = !!THREE.WebGPURenderer;
+    // powerPreference is deliberately absent: neither renderer is told which GPU to ask for, so the
+    // browser decides (three's own default is 'default'), which on a dual-GPU laptop is normally the
+    // integrated one. dc-multi.js's settings panel reports THIS object rather than a preference of
+    // its own — it used to print a hardcoded 'high-performance' nothing had ever requested. Adding
+    // one here changes GPU selection for every page load, so the two have to move together.
+    const rendererParams = { antialias: true };
     renderer = isNode
-        ? new THREE.WebGPURenderer({ antialias: true, forceWebGL: window.DC_RENDERER_MODE === 'webgpu-gl' })
-        : new THREE.WebGLRenderer({ antialias: true });
+        ? new THREE.WebGPURenderer({ ...rendererParams, forceWebGL: window.DC_RENDERER_MODE === 'webgpu-gl' })
+        : new THREE.WebGLRenderer(rendererParams);
+    _powerPreference = rendererParams.powerPreference || 'browser default';
     // The node renderer acquires its device asynchronously. render() before that resolves warns, and
     // getMaxAnisotropy() on the WebGL2 backend reads an extension that isn't there yet. Awaiting init()
     // is the r181+ pattern (renderAsync() is deprecated); the classic renderer is ready on construction.
@@ -3596,6 +3633,9 @@ function _drawCalls() {
 // The requested mode is a request, not an outcome: WebGPURenderer falls back to its WebGL2 backend
 // whenever navigator.gpu is missing, so everything user-visible reports the BACKEND, not the URL.
 let _backendName = 'webgl';
+// Set from the renderer parameters in init(); read by dc-multi.js's "GPU Mode" row, which has no
+// other way to know what was asked for and must not guess.
+let _powerPreference = 'browser default';
 const _MODE_LABELS = { webgl: 'WebGL', webgpu: 'WebGPU', 'webgpu-gl': 'WebGPU/GL' };
 const _BACKEND_LABELS = { webgl: 'WebGL', webgpu: 'WebGPU', 'webgl2-fallback': 'WebGPU (GL)' };
 
@@ -3693,6 +3733,7 @@ async function bench(seconds = 10) {
 window.DC = {
     get renderer() { return renderer; },
     get backendName() { return _backendName; },   // 'webgl' | 'webgpu' | 'webgl2-fallback' — actual, not requested
+    get powerPreference() { return _powerPreference; },   // what the renderer was constructed with, not a wish
     get scene() { return scene; },
     get camera() { return camera; },
     get controls() { return controls; },
