@@ -42,6 +42,14 @@ let _skipExpensiveUpdates = false;
 // IDEA-2: WebGL context loss state (set by context loss/restored event listeners in init())
 let _contextLost = false;
 let _sessionBackup = null;
+// Device loss on the node renderer (webgpu mode, either backend) has no "restored" counterpart — a lost
+// WebGPU device never comes back — so recovery is a reload plus this sessionStorage handoff. It is
+// written ONLY by onDeviceLost, and read exactly once on the next boot: an ordinary page load and the
+// renderer-switch button's reload must never be mistaken for a device-loss recovery, and a tab reloaded
+// long afterwards must not be teleported to wherever the lost session happened to be standing.
+const _RESTORE_KEY = 'dcSessionBackup';
+const _RESTORE_MAX_AGE_MS = 60000;
+let _pendingRestore = null;
 // Animation loop callback storage (Fix: module-level declaration for setAnimationLoop)
 let _animationLoopCb = null;
 
@@ -646,14 +654,63 @@ function buildLocationButtons() {
     }
 }
 
+// Pull the device-loss handoff, if any. Consumed exactly once: the key is removed on read, so a later
+// reload can never replay it, and anything older than _RESTORE_MAX_AGE_MS or not shaped like a backup
+// is dropped. Storage access itself can throw (blocked cookies / private mode), which must not stop the
+// scene from booting.
+function _takeSessionRestore() {
+    let raw = null;
+    try {
+        raw = window.sessionStorage.getItem(_RESTORE_KEY);
+        if (raw !== null) window.sessionStorage.removeItem(_RESTORE_KEY);
+    } catch (e) {
+        return null;
+    }
+    if (!raw) return null;
+    let data = null;
+    try { data = JSON.parse(raw); } catch (e) { return null; }
+    if (!data || typeof data !== 'object') return null;
+    const age = Date.now() - Number(data.ts);
+    if (!(age >= 0 && age < _RESTORE_MAX_AGE_MS)) return null;
+    return data;
+}
+
+// Location half of the restore, and it has to land before displayDatacenter() builds a room. Only a
+// location the fetch actually returned is accepted — buildRoom() reads racks straight off
+// locations[options.location], so a backup naming a location that no longer exists would throw.
+function _restoreLocation() {
+    if (!_pendingRestore) return;
+    const loc = Number(_pendingRestore.loc);
+    if (!Number.isFinite(loc) || loc <= 0 || !locationLoaded(loc)) return;
+    options.location = loc;
+}
+
+// Camera half, after displayDatacenter()'s spawnInside() has dropped the player at the room default.
+// Same two fields the webglcontextrestored handler replays, but these came back through JSON, so the
+// coordinates are re-checked rather than trusted — and they only mean anything in the room they were
+// captured in, so a refused location restore has to take the position with it rather than drop the
+// player at another building's coordinates.
+function _restoreCamera() {
+    const s = _pendingRestore;
+    _pendingRestore = null;
+    if (!s || !camera || !s.pos) return;
+    if (Number(s.loc) !== Number(options.location)) return;
+    const x = Number(s.pos.x), y = Number(s.pos.y), z = Number(s.pos.z), yaw = Number(s.yaw);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return;
+    camera.position.set(x, y, z);
+    camera.rotation.y = Number.isFinite(yaw) ? yaw : 0;
+}
+
 function loadDatacenter() {
     // Fetch ALL locations at once so every building's footprint is known for the community layout.
     fetch(dcUrl('/ajax/datacenter.php'))
         .then((r) => { if (!r.ok) throw new Error('Network response was not ok'); return r.json(); })
         .then((data) => {
             mergeLocations(data);
+            _restoreLocation();     // before the dropdown and the room read options.location
             displayGui();
             displayDatacenter();
+            _restoreCamera();       // after spawnInside() placed the player at the room default
             const loading = document.getElementById('dcLoading');
             if (loading) loading.style.display = 'none';
         })
@@ -3049,6 +3106,9 @@ function setupInteraction() {
 }
 
 async function init() {
+    // Claim the device-loss handoff before anything can read options.location — loadDatacenter()'s
+    // fetch resolves straight into displayGui() + displayDatacenter(), which is where it gets applied.
+    _pendingRestore = _takeSessionRestore();
     // Load the datacenter information
     loadDatacenter();
     // Set up the camera
@@ -3234,37 +3294,63 @@ async function init() {
         if (overlay) overlay.remove();  // remove from DOM
     }
 
-    renderer.domElement.addEventListener('webglcontextlost', (e) => {
-        e.preventDefault();
-        _contextLost = true;
-        _backupSession();
-        _showContextLostOverlay();
-        console.warn('WebGL context lost - session backed up');
-        document.dispatchEvent(new CustomEvent('dc:context-lost', { bubbles: true }));
-    }, false);
+    // Only the classic renderer surfaces context loss as canvas events. The node renderer's WebGL2
+    // backend installs its OWN webglcontextlost listener (which preventDefaults and forwards to
+    // onDeviceLost), so attaching these there would run both recovery paths against one loss.
+    if (renderer.isWebGLRenderer) {
+        renderer.domElement.addEventListener('webglcontextlost', (e) => {
+            e.preventDefault();
+            _contextLost = true;
+            _backupSession();
+            _showContextLostOverlay();
+            console.warn('WebGL context lost - session backed up');
+            document.dispatchEvent(new CustomEvent('dc:context-lost', { bubbles: true }));
+        }, false);
 
-    renderer.domElement.addEventListener('webglcontextrestored', () => {
-        console.warn('WebGL context restored - rebuilding scene');
-        _contextLost = false;
-        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-        renderer.setSize(window.innerWidth, window.innerHeight);
-        clearScene();
-        displayDatacenter();
-        if (_sessionBackup && _sessionBackup.pos) {
-            camera.position.set(_sessionBackup.pos.x, _sessionBackup.pos.y, _sessionBackup.pos.z);
-            camera.rotation.y = _sessionBackup.yaw || 0;
-        }
-        if (_sessionBackup && _sessionBackup.authenticated && window.DC_WS) {
-            if (_wsConnected()) {
-                _rejoinPresence(_sessionBackup);
-            } else {
-                _reconnectAndRejoin(_sessionBackup);
+        renderer.domElement.addEventListener('webglcontextrestored', () => {
+            console.warn('WebGL context restored - rebuilding scene');
+            _contextLost = false;
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            clearScene();
+            displayDatacenter();
+            if (_sessionBackup && _sessionBackup.pos) {
+                camera.position.set(_sessionBackup.pos.x, _sessionBackup.pos.y, _sessionBackup.pos.z);
+                camera.rotation.y = _sessionBackup.yaw || 0;
             }
-        }
-        renderer.setAnimationLoop(_guardLoop(_animationLoopCb));
-        _hideContextLostOverlay();
-        document.dispatchEvent(new CustomEvent('dc:context-restored', { bubbles: true }));
-    }, false);
+            if (_sessionBackup && _sessionBackup.authenticated && window.DC_WS) {
+                if (_wsConnected()) {
+                    _rejoinPresence(_sessionBackup);
+                } else {
+                    _reconnectAndRejoin(_sessionBackup);
+                }
+            }
+            renderer.setAnimationLoop(_guardLoop(_animationLoopCb));
+            _hideContextLostOverlay();
+            document.dispatchEvent(new CustomEvent('dc:context-restored', { bubbles: true }));
+        }, false);
+    } else {
+        // The node renderer reports loss through one callback for both backends (WebGPU's
+        // device.lost promise and the WebGL2 backend's canvas event both land here), and there is
+        // no restored counterpart to pair with it: a lost device is gone for good. So this backs the
+        // session up the same way, hands it to the next page through sessionStorage and reloads —
+        // rebuilding a node renderer in place means disposing it and re-uploading every resource,
+        // which is exactly the fragile path the classic handler above avoids by reusing its context.
+        renderer.onDeviceLost = (info) => {
+            if (_contextLost) return;   // WebGPU can report loss more than once; one reload is enough
+            _contextLost = true;
+            _backupSession();
+            _showContextLostOverlay();
+            try {
+                window.sessionStorage.setItem(_RESTORE_KEY, JSON.stringify(_sessionBackup));
+            } catch (e) {
+                // storage blocked or full — still reload, just without landing on the same spot
+            }
+            console.warn('GPU device lost (' + ((info && info.api) || 'unknown') + ') - reloading to restore session');
+            document.dispatchEvent(new CustomEvent('dc:context-lost', { bubbles: true }));
+            setTimeout(() => window.location.reload(), 1500);
+        };
+    }
     // Neutral image-based environment so metallic surfaces (galvanized ducts/pipes, cable sheen)
     // reflect something instead of rendering black. Subtle intensity so it doesn't wash the racks.
     const pmrem = new THREE.PMREMGenerator(renderer);
@@ -3487,6 +3573,10 @@ function _setupRendererSwitch() {
     btn.textContent = here + ' ⇄ ' + _MODE_LABELS[next];
     btn.title = 'Renderer: ' + here + ' — click to reload with ' + _MODE_LABELS[next];
     btn.addEventListener('click', () => {
+        // A switch is a user action, not a device-loss recovery, so the next boot must not find a
+        // handoff waiting for it. init() already consumed any, this keeps that true if the order ever
+        // changes.
+        try { window.sessionStorage.removeItem(_RESTORE_KEY); } catch (e) { /* storage blocked */ }
         // the mode lives in the URL rather than storage, so switching is a reload with the other
         // value — every other param (?dc=, ?location=) has to survive it
         const params = new URLSearchParams(location.search);
