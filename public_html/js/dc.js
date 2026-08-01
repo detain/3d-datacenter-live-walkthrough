@@ -3048,7 +3048,7 @@ function setupInteraction() {
     }
 }
 
-function init() {
+async function init() {
     // Load the datacenter information
     loadDatacenter();
     // Set up the camera
@@ -3075,11 +3075,23 @@ function init() {
     sunGlow.position.copy(sunPos); sunGlow.frustumCulled = false; scene.add(sunGlow);
     // flat ambient fill -> overall brighter room + lifts dark undersides the hemisphere misses
     scene.add(new THREE.AmbientLight(0xfff6ec, 0.5));
-    // Set up the renderer
-    renderer = new THREE.WebGLRenderer({ antialias: true });
+    // Set up the renderer. The import map (dc.html's mode script) decided which three build loaded,
+    // and the two builds export different renderers — three.webgpu.js has WebGPURenderer and NOT
+    // WebGLRenderer — so the build itself is the discriminator, not the ?renderer= value.
+    const isNode = !!THREE.WebGPURenderer;
+    renderer = isNode
+        ? new THREE.WebGPURenderer({ antialias: true, forceWebGL: window.DC_RENDERER_MODE === 'webgpu-gl' })
+        : new THREE.WebGLRenderer({ antialias: true });
+    // The node renderer acquires its device asynchronously. render() before that resolves warns, and
+    // getMaxAnisotropy() on the WebGL2 backend reads an extension that isn't there yet. Awaiting init()
+    // is the r181+ pattern (renderAsync() is deprecated); the classic renderer is ready on construction.
+    if (isNode) await renderer.init();
     renderer.setSize(window.innerWidth, window.innerHeight);
     document.body.appendChild(renderer.domElement);
-    maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
+    // no .capabilities on the node renderer — it exposes getMaxAnisotropy() directly
+    maxAnisotropy = renderer.getMaxAnisotropy ? renderer.getMaxAnisotropy()
+                                              : renderer.capabilities.getMaxAnisotropy();
+    _setupRendererSwitch();
 
     // IDEA-2: WebGL context loss handling
     _animationLoopCb = animate;  // stored callback; honoured on restore
@@ -3445,9 +3457,48 @@ function onWindowResize() {
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 }
 
+// Draw calls for the frame just rendered. The node renderer redefined info.render.calls as the
+// lifetime render() count and moved the per-frame draw count to info.render.drawCalls; the classic
+// renderer only has .calls, and reading it there still means draw calls.
+function _drawCalls() {
+    const r = renderer.info.render;
+    return r.drawCalls !== undefined ? r.drawCalls : r.calls;
+}
+
+// --- renderer mode (?renderer=, resolved into the import map by the mode script in dc.html) ---
+// The requested mode is a request, not an outcome: WebGPURenderer falls back to its WebGL2 backend
+// whenever navigator.gpu is missing, so everything user-visible reports the BACKEND, not the URL.
+let _backendName = 'webgl';
+const _MODE_LABELS = { webgl: 'WebGL', webgpu: 'WebGPU', 'webgpu-gl': 'WebGPU/GL' };
+const _BACKEND_LABELS = { webgl: 'WebGL', webgpu: 'WebGPU', 'webgl2-fallback': 'WebGPU (GL)' };
+
+function _rendererMode() {
+    const m = window.DC_RENDERER_MODE;
+    return (m === 'webgpu' || m === 'webgpu-gl') ? m : 'webgl';
+}
+
+function _setupRendererSwitch() {
+    // classic WebGLRenderer has no .backend at all
+    _backendName = renderer.backend ? (renderer.backend.isWebGPUBackend ? 'webgpu' : 'webgl2-fallback') : 'webgl';
+    const btn = document.getElementById('dcRenderer');
+    if (!btn) return;
+    const next = _rendererMode() === 'webgl' ? 'webgpu' : 'webgl';
+    const here = _BACKEND_LABELS[_backendName] || _backendName;
+    btn.textContent = here + ' ⇄ ' + _MODE_LABELS[next];
+    btn.title = 'Renderer: ' + here + ' — click to reload with ' + _MODE_LABELS[next];
+    btn.addEventListener('click', () => {
+        // the mode lives in the URL rather than storage, so switching is a reload with the other
+        // value — every other param (?dc=, ?location=) has to survive it
+        const params = new URLSearchParams(location.search);
+        params.set('renderer', next);
+        location.search = params.toString();
+    });
+}
+
 // --- Phase 1 measurement handle (admin-gated page; getters add zero render work) ---
 window.DC = {
     get renderer() { return renderer; },
+    get backendName() { return _backendName; },   // 'webgl' | 'webgpu' | 'webgl2-fallback' — actual, not requested
     get scene() { return scene; },
     get camera() { return camera; },
     get controls() { return controls; },
@@ -3468,7 +3519,7 @@ window.DC = {
         if (_skipExpensiveUpdates) {
             renderer.render(scene, camera);
             if (stats) stats.update();
-            return renderer.info.render.calls;
+            return _drawCalls();
         }
         // MINOR-10: FPS monitoring — only runs when not in idle skip mode
         if (!_skipExpensiveUpdates) {
@@ -3496,7 +3547,7 @@ window.DC = {
         renderer.render(scene, camera);
         if (stats) stats.update();
         if (++_tickSkippedFrames > _IDLE_FRAME_THRESHOLD) _skipExpensiveUpdates = true;
-        return renderer.info.render.calls;
+        return _drawCalls();
     },
     pick: function () { return raycastInstances(_centerNdc); },
     info: showInfo,
@@ -3533,6 +3584,9 @@ window.DC = {
     lodState: function () { return lodBuildings.map((b) => ({ id: b.id, full: !!b.full, loading: b.loading, dist: Math.round(b._dist) })); },
 };
 
-init();
+// Top-level await: init() has to await the node renderer's device acquisition before anything can
+// draw. window.DC is already assigned above, and the satellite modules poll for DC.renderer rather
+// than reading it eagerly, so the extra microtask/device wait is absorbed.
+await init();
 _animationLoopCb = animate;
 renderer.setAnimationLoop(_guardLoop(animate));
