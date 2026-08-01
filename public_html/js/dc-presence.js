@@ -740,7 +740,7 @@ import * as THREE from "three";
 	 * The callback registered into DC._presenceTicks.
 	 *
 	 * The try/catch is the point. dc.js's DC.tick wrapper calls these AFTER the render, and
-	 * DC.tick is driven by WebGLRenderer.setAnimationLoop, which schedules the next frame
+	 * DC.tick is driven by the renderer's setAnimationLoop, which schedules the next frame
 	 * only after the callback returns — so a single throw from presence code (a malformed
 	 * hub frame reaching the scene graph, a disposed material) would kill the animation loop
 	 * for good and freeze the whole datacenter. Multiplayer is the optional part; the scene
@@ -773,7 +773,7 @@ import * as THREE from "three";
     const tryReady = function () {
       if (!sceneReady()) {
         if (Date.now() > deadline) {
-          // dc.js never produced a scene (module blocked, WebGL init threw, standalone
+          // dc.js never produced a scene (module blocked, renderer init threw, standalone
           // page). Stop the 80ms chain instead of polling for the lifetime of the tab,
           // and re-arm the latch so a later auth-success / join starts a fresh watch if
           // the scene does eventually turn up. pendingJoin is left intact for it.
