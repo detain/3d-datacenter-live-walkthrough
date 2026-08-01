@@ -16,6 +16,20 @@
 import { test, expect } from '@playwright/test';
 
 // ---------------------------------------------------------------------------
+// The ?renderer= modes the page smoke-tests run against (plan_dc.md §3, phase 8).
+//
+// The mode is a request, not an outcome. Headless chromium here runs on SwiftShader and has no
+// navigator.gpu, so ?renderer=webgpu constructs a WebGPURenderer that resolves to its WebGL2
+// fallback backend — which is precisely the path worth pinning, since it is what every browser
+// without WebGPU gets. Real WebGPU is not asserted anywhere; see the PW_WEBGPU project in
+// playwright.config.ts for why.
+// ---------------------------------------------------------------------------
+const RENDERER_MODES = [
+  { label: 'default', url: '/admin/dc.html', mode: 'webgl', build: 'three.module.js' },
+  { label: '?renderer=webgpu', url: '/admin/dc.html?renderer=webgpu', mode: 'webgpu', build: 'three.webgpu.js' },
+] as const;
+
+// ---------------------------------------------------------------------------
 // Helper: wait for the page to be fully loaded (static HTML ready)
 // ---------------------------------------------------------------------------
 async function waitForPageLoad(page: any, timeout = 60000): Promise<boolean> {
@@ -84,6 +98,16 @@ test.describe('Group 1: Static HTML Structure', () => {
   test('#dcPlayer exists with person toggle button', async ({ page }) => {
     await expect(page.locator('#dcPlayer')).toHaveCount(1);
     await expect(page.locator('#dcPerson')).toHaveCount(1);
+  });
+
+  test('#dcRenderer sits outside both #dcViews and #dcPlayer', async ({ page }) => {
+    // Placement, not decoration. Inside #dcViews it would break the "5 buttons" count above
+    // (that locator is an unqualified `#dcViews button`); inside #dcPlayer it would vanish the
+    // moment dc-multi.js hides that row after migrating its controls into the settings panel.
+    await expect(page.locator('#dcRenderer')).toHaveCount(1);
+    await expect(page.locator('#dcViews #dcRenderer')).toHaveCount(0);
+    await expect(page.locator('#dcPlayer #dcRenderer')).toHaveCount(0);
+    await expect(page.locator('#dcRenderer')).toHaveAttribute('type', 'button');
   });
 
   test('#dcPresence indicator exists', async ({ page }) => {
@@ -391,28 +415,32 @@ test.describe('Group 7: WebGL Availability', () => {
     console.log('WebGL available:', webglAvailable);
   });
 
-  test('no critical JS errors on page load', async ({ page }) => {
-    const errors: string[] = [];
-    page.on('pageerror', (err) => errors.push(err.message));
+  // Run for both renderer modes: a broken import map or a three.webgpu.js that fails to parse
+  // shows up here as a module error and nowhere else.
+  for (const { label, url } of RENDERER_MODES) {
+    test(`[${label}] no critical JS errors on page load`, async ({ page }) => {
+      const errors: string[] = [];
+      page.on('pageerror', (err) => errors.push(err.message));
 
-    await page.goto('/admin/dc.html', { timeout: 120000 });
-    await page.waitForLoadState('domcontentloaded');
-    await page.waitForTimeout(3000);  // Wait for any async initialization
+      await page.goto(url, { timeout: 120000 });
+      await page.waitForLoadState('domcontentloaded');
+      await page.waitForTimeout(3000);  // Wait for any async initialization
 
-    // Filter out known non-critical errors
-    const criticalErrors = errors.filter(
-      (e) =>
-        !e.includes('WebGL') &&
-        !e.includes('GPU') &&
-        !e.includes('context') &&
-        !e.includes('Failed to load resource')
-    );
+      // Filter out known non-critical errors
+      const criticalErrors = errors.filter(
+        (e) =>
+          !e.includes('WebGL') &&
+          !e.includes('GPU') &&
+          !e.includes('context') &&
+          !e.includes('Failed to load resource')
+      );
 
-    if (criticalErrors.length > 0) {
-      console.log('Critical errors found:', criticalErrors);
-    }
-    expect(criticalErrors).toHaveLength(0);
-  });
+      if (criticalErrors.length > 0) {
+        console.log('Critical errors found:', criticalErrors);
+      }
+      expect(criticalErrors).toHaveLength(0);
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -622,4 +650,134 @@ test.describe('Group 8: Hub unreachable (scene must still work)', () => {
     expect(second).toBeLessThanOrEqual(12);
     expect(second).toBeGreaterThanOrEqual(first);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Group 9: Renderer modes — the same scene smoke, once per ?renderer= value
+//
+// The import map that decides which build of three.js loads is written by an inline classic
+// script during parse (dc.html, top of <head>). tests/js/dc-renderer-mode.test.js proves that
+// script writes the right map; this group is the half it cannot cover — that the map the browser
+// actually applies produces a renderer the scene can boot on.
+//
+// Booted hermetically, exactly like Group 8: the hub is stubbed so no WSS connection is attempted
+// and /ajax/datacenter.php is stubbed so the room builds without the DB or the ~100 GLBs the
+// single-threaded `php -S` fixture cannot serve in time (.claude/rules/js-tests.md).
+// ---------------------------------------------------------------------------
+test.describe('Group 9: Renderer modes', () => {
+  const DATACENTER_STUB = {
+    locations: {
+      0: {
+        name: 'Test',
+        region: 'Test',
+        racks: { 1: { x: 0, y: 0, type: 0, servers: {}, switches: {} } },
+      },
+    },
+  };
+
+  async function boot(page: any, url: string) {
+    await page.addInitScript(() => {
+      function DeadSocket(this: any, u: string) {
+        this.url = u;
+        this.readyState = 3;
+        this.send = () => {};
+        this.close = () => {};
+      }
+      (DeadSocket as any).CONNECTING = 0;
+      (DeadSocket as any).OPEN = 1;
+      (DeadSocket as any).CLOSING = 2;
+      (DeadSocket as any).CLOSED = 3;
+      (window as any).WebSocket = DeadSocket;
+    });
+    await page.route('**/ajax/datacenter.php*', (route: any) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(DATACENTER_STUB),
+      })
+    );
+    await page.goto(url, { timeout: 120000 });
+    await page.waitForLoadState('domcontentloaded');
+  }
+
+  test.beforeEach(() => {
+    // three.webgpu.js is a 2 MB unminified dev build off the same fixture server; give the boot
+    // the same generous budget Group 8 uses so contention reads as slowness, not as a regression.
+    test.setTimeout(150000);
+  });
+
+  for (const { label, url, mode, build } of RENDERER_MODES) {
+    test(`[${label}] the mode script sets DC_RENDERER_MODE and maps the matching build`, async ({ page }) => {
+      await boot(page, url);
+
+      const applied = await page.evaluate(() => {
+        const el = document.querySelector('script[type="importmap"]');
+        return {
+          mode: (window as any).DC_RENDERER_MODE,
+          maps: document.querySelectorAll('script[type="importmap"]').length,
+          imports: el ? JSON.parse(el.textContent || '{}').imports : null,
+        };
+      });
+
+      expect(applied.mode).toBe(mode);
+      // A second map would be ignored by the browser, which is the silent-wrong-build failure.
+      expect(applied.maps).toBe(1);
+      expect(applied.imports.three).toContain(build);
+      expect(applied.imports['three/addons/']).toBe('/lib/three/examples/jsm/');
+      if (mode === 'webgl') {
+        expect(applied.imports['three/webgpu']).toBeUndefined();
+        expect(applied.imports['three/tsl']).toBeUndefined();
+      } else {
+        expect(applied.imports['three/webgpu']).toBe(applied.imports.three);
+        expect(applied.imports['three/tsl']).toContain('three.tsl.js');
+      }
+    });
+
+    test(`[${label}] the scene boots and reports the backend it really got`, async ({ page }) => {
+      await boot(page, url);
+
+      const ready = await page
+        .waitForFunction(() => (window as any).DC && (window as any).DC.renderer, { timeout: 90000 })
+        .then(() => true)
+        .catch(() => false);
+      expect(ready).toBe(true);
+
+      const backend = await page.evaluate(() => (window as any).DC.backendName);
+      // Logged rather than pinned to one value: what you get depends on the machine. Here it is
+      // 'webgl' for the default build and 'webgl2-fallback' for the node build under SwiftShader,
+      // but the same spec on a WebGPU-capable host reports 'webgpu' and must still pass.
+      console.log(`[${label}] DC.backendName = ${backend}`);
+      expect(['webgl', 'webgpu', 'webgl2-fallback']).toContain(backend);
+      if (mode === 'webgl') {
+        expect(backend).toBe('webgl');
+      } else {
+        // The node renderer always exposes a backend; the classic one has none.
+        expect(['webgpu', 'webgl2-fallback']).toContain(backend);
+      }
+
+      const scene = await page.evaluate(() => !!(window as any).DC.scene);
+      expect(scene).toBe(true);
+    });
+
+    test(`[${label}] the switch button labels itself and survives #dcPlayer being hidden`, async ({ page }) => {
+      await boot(page, url);
+      await page.waitForFunction(() => (window as any).DC && (window as any).DC.renderer, { timeout: 90000 });
+
+      const btn = page.locator('#dcRenderer');
+      // #dcRenderer:empty is display:none, so a visible button also proves dc.js labelled it.
+      await expect(btn).toBeVisible();
+      await expect(btn).toHaveText(/⇄/);
+
+      // dc-multi.js:883 does exactly this once the character manifest lands and its controls have
+      // migrated into the settings panel. Done by hand rather than waited for, because the manifest
+      // needs assets the fixture server cannot deliver — the regression being pinned is the button
+      // being adopted back into that container, and this catches it either way.
+      await page.evaluate(() => {
+        const pl = document.getElementById('dcPlayer');
+        if (pl) pl.style.display = 'none';
+      });
+      await expect(page.locator('#dcPlayer')).toBeHidden();
+      await expect(btn).toBeVisible();
+    });
+  }
 });
