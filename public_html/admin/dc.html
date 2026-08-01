@@ -68,6 +68,19 @@
 		#dcPlayer button, #dcPlayer select { padding: 7px 11px; border: 1px solid #888; border-radius: 5px; cursor: pointer;
 			background: rgba(255,255,255,0.93); font: 13px Arial, sans-serif; color: #222; }
 		#dcPlayer button:hover, #dcPlayer select:hover { background: #ffe9a8; }
+		/* Renderer switch. Deliberately NOT inside #dcPlayer: dc-multi.js hides that whole row
+		   (`pl.style.display = "none"`) as soon as it moves the player controls into the gui's
+		   "Player" folder, which took this button with it and left the renderer unswitchable.
+		   Parked in the left column under the Stats panel (80x48 at 0,0) and left of #dcSearch
+		   (x >= 170) — the right edge belongs to the lil-gui panel, which can run the full
+		   viewport height. Empty until dc.js labels it, so a renderer that never comes up shows
+		   no orphan box. */
+		#dcRenderer { position: fixed; top: 56px; left: 10px; z-index: 32;
+			padding: 7px 11px; border: 1px solid #888; border-radius: 5px; cursor: pointer; white-space: nowrap;
+			background: rgba(255,255,255,0.93); font: 13px Arial, sans-serif; color: #222;
+			opacity: 0.4; transition: opacity 0.22s ease; }
+		#dcRenderer:hover { opacity: 1; background: #ffe9a8; }
+		#dcRenderer:empty { display: none; }
 		#dcPlayerHud { position: fixed; top: 10px; left: 50%; transform: translateX(-50%); z-index: 31;
 			padding: 6px 12px; background: rgba(20,20,28,0.82); color: #fff; border-radius: 5px;
 			font: 12px Arial, sans-serif; pointer-events: none; max-width: 70vw; text-align: center; }
@@ -129,8 +142,11 @@
 	<div id="dcPlayer">
 		<select id="dcChar" title="Character" style="display:none"></select>
 		<button id="dcPerson" type="button">🧍 Third-person</button>
-		<button id="dcRenderer" type="button" title="Switch renderer"></button>
 	</div>
+	<!-- Outside #dcPlayer on purpose — dc-multi.js hides that container once the character
+	     manifest lands, which is the normal case on staging/production. dc.js finds this by
+	     id, so it only has to survive; it does not have to stay next to the player controls. -->
+	<button id="dcRenderer" type="button" title="Switch renderer"></button>
 	<div id="dcViews">
 		<button data-view="overview">Overview</button>
 		<button data-view="top">Top-down</button>
