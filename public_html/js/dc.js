@@ -13,7 +13,10 @@ import * as THREE from "three";
 import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
 import { FirstPersonControls } from "three/addons/controls/FirstPersonControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-import GUI from 'lil-gui';
+// Relative, but with the cache-buster spelled out: a bare "./dc-gui.js" would resolve against
+// dc.js's own URL and drop the ?v=, so the adapter would go on being served from cache after an
+// edit that only bumped the <script> tags. dc.html modulepreloads the same URL.
+import { createPanel } from './dc-gui.js?v=p53';
 import Stats from "three/addons/libs/stats.module.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import * as BufferGeometryUtils from "three/addons/utils/BufferGeometryUtils.js";
@@ -250,6 +253,10 @@ let wallColliders = []; // thin AABB slabs for all building walls (door gaps ope
 let neighborBlinds = []; // venetian-blind handles for the neighbour windows (slats+cords InstancedMeshes), animated by updateBlinds
 let neighborDoors = []; // iS-logo glass double doors per neighbour (swing open on approach), animated by updateNeighborDoors
 let _posCtrls = null, _guiPosLast = 0; // the x/y/z GUI controllers; their left labels are refreshed by updateGuiPos()
+// Resolved once init() knows whether the three.js Inspector attached, i.e. which backend the settings
+// panel gets. Pre-resolved so the classic renderer never waits on it (see init()).
+let _panelBackendReady = Promise.resolve();
+let _panelBackendSettled = () => {};
 let roomDoors = [];     // the main building's solid SWING doors (back + left), animated by updateRoomDoors
 let roomSideDoors = []; // their {side,c,half} descriptors -> the current building's extra collision door gaps
 let lodFocus = null;    // {x,z} the player's ground position (set by dc-multi); the LOD keys off this, not the orbit camera
@@ -517,34 +524,27 @@ function setNetworkVisible(visible) {
     for (const b of lodBuildings) if (b.full && b.full.network) b.full.network.visible = visible;   // full neighbours' cabling too
 }
 
-// Set a lil-gui controller's left label to "name  value" with the VALUE in a colored span so it stands
-// out (the right number box is hidden via css). Uses $name.innerHTML directly since lil-gui's name() is
-// plain text. No parentheses — the colour separates the value.
-function valLabel(c, name, val) { c.$name.innerHTML = name + '&nbsp;&nbsp;<span class="dc-val">' + val + '</span>'; }
 // Refresh the x/y/z controllers' labels with the live camera position (throttled; programmatic camera
-// moves don't fire onChange).
+// moves don't fire onChange). Deliberately not the Inspector's own .listen() label loop — that one is
+// per-frame and cannot be cancelled.
 function updateGuiPos() {
     if (!_posCtrls || !camera) return;
     const now = performance.now();
     if (now - _guiPosLast < 200) return; _guiPosLast = now;
-    for (const c of _posCtrls) valLabel(c, c._ax, Math.round(camera.position[c._ax]));
+    for (const c of _posCtrls) c.label(c._ax, Math.round(camera.position[c._ax]));
 }
 function displayGui() {
-    // Fix #17: Dispose old gui before creating a new one to prevent ghost DOM elements
+    // Fix #17: Dispose old gui before creating a new one to prevent ghost DOM elements. The
+    // backend-specific teardown (MAJOR-15's controller off() sweep for lil-gui, the paramList
+    // removal for the Inspector) lives in the adapter's destroy().
     if (gui) {
-        // MAJOR-15: Manually clean up controller callbacks before destroy().
-        // lil-gui's destroy() removes the DOM element but may not remove all internal
-        // event listeners. Attempt to off() any onChange callbacks on controllers.
-        if (gui.controllers && gui.controllers.length) {
-            for (const c of gui.controllers) {
-                if (typeof c.off === 'function') c.off();
-            }
-        }
-        gui.domElement.remove();
         gui.destroy();
         gui = null;
     }
-    gui = new GUI();
+    // In webgpu mode the panel is the Inspector's Parameters tab; everywhere else it is lil-gui.
+    // `inspector` is null unless the real addon attached, which is the only honest signal —
+    // renderer.inspector is never falsy on the node renderer.
+    gui = createPanel({ inspector });
     gui.add( options, 'location', locationNames).listen().onChange( () => { switchLocation(); });
     const displayFolder = gui.addFolder( 'Display' );
     displayFolder.add(options, 'showLabels'); // honored per-frame by updateLabels()
@@ -552,8 +552,8 @@ function displayGui() {
     displayFolder.add(options, 'showWalls').name('walls').onChange((v) => { if (objects.room) objects.room.walls.visible = v; });
     displayFolder.add(options, 'showCeiling').name('ceiling').onChange((v) => { if (objects.room) objects.room.ceiling.visible = v; });
     const fc = displayFolder.add(options, 'faultyLights', 0, 100, 1);
-    fc.onChange(() => valLabel(fc, 'faulty lights', options.faultyLights + '%')).onFinishChange(() => displayDatacenter());
-    valLabel(fc, 'faulty lights', options.faultyLights + '%');
+    fc.onChange(() => fc.label('faulty lights', options.faultyLights + '%')).onFinishChange(() => displayDatacenter());
+    fc.label('faulty lights', options.faultyLights + '%');
     displayFolder.add(options, 'disco').name('disco').onChange((v) => { if (!v) resetDisco(); });   // unchecked default; cycles each fixture's colour
     displayFolder.add(options, 'useFirstPerson').onChange( () => { setupControls(); });
     const moveFolder = gui.addFolder( 'Movement' );
@@ -563,24 +563,24 @@ function displayGui() {
     const yc = moveFolder.add(camera.position, 'y', -250, 250).listen(); yc._ax = 'y';
     const zc = moveFolder.add(camera.position, 'z', -250, 250).listen(); zc._ax = 'z';
     _posCtrls = [xc, yc, zc];
-    for (const c of _posCtrls) valLabel(c, c._ax, Math.round(camera.position[c._ax]));
+    for (const c of _posCtrls) c.label(c._ax, Math.round(camera.position[c._ax]));
     /*moveFolder.add( options, 'moveLeft').listen().disable();
 			moveFolder.add( options, 'moveRight').listen().disable();
 			moveFolder.add( options, 'moveForward').listen().disable();
 			moveFolder.add( options, 'moveBackward').listen().disable();*/
     moveFolder.add( options, 'collisionMovement');
-    const gc = moveFolder.add( options, 'gravityMs2', 1.6, 14, 0.1 ).onChange(() => valLabel(gc, 'Gravity', options.gravityMs2 + ' m/s²'));
-    valLabel(gc, 'Gravity', options.gravityMs2 + ' m/s²');
+    const gc = moveFolder.add( options, 'gravityMs2', 1.6, 14, 0.1 ).onChange(() => gc.label('Gravity', options.gravityMs2 + ' m/s²'));
+    gc.label('Gravity', options.gravityMs2 + ' m/s²');
     const lodFolder = gui.addFolder('LOD');
     lodFolder.add({ distanceMult: 1.0 }, 'distanceMult', 0.5, 2.0).name('LOD Distance').step(0.1).onChange(v => {
         _lodDistanceMult = v;
     });
     // height + waist: the formatted value lives in the controller label (colourised) and refreshes on change.
     const hLbl = (i) => `${Math.floor(i / 12)}' ${i % 12}"`;
-    const hc = moveFolder.add( options, 'heightInches', 42, 96, 1 ).onChange(() => { camera.position.y = eyeHeight(); valLabel(hc, 'height', hLbl(options.heightInches)); });
-    valLabel(hc, 'height', hLbl(options.heightInches));
-    const wc = moveFolder.add( options, 'waistInches', 15, 60, 1 ).onChange(() => valLabel(wc, 'waist', options.waistInches + '"'));
-    valLabel(wc, 'waist', options.waistInches + '"');
+    const hc = moveFolder.add( options, 'heightInches', 42, 96, 1 ).onChange(() => { camera.position.y = eyeHeight(); hc.label('height', hLbl(options.heightInches)); });
+    hc.label('height', hLbl(options.heightInches));
+    const wc = moveFolder.add( options, 'waistInches', 15, 60, 1 ).onChange(() => wc.label('waist', options.waistInches + '"'));
+    wc.label('waist', options.waistInches + '"');
     moveFolder.open(); // expanded on load
     buildLocationButtons();
 }
@@ -708,6 +708,9 @@ function loadDatacenter() {
         .then((data) => {
             mergeLocations(data);
             _restoreLocation();     // before the dropdown and the room read options.location
+            return _panelBackendReady;
+        })
+        .then(() => {
             displayGui();
             displayDatacenter();
             _restoreCamera();       // after spawnInside() placed the player at the room default
@@ -3109,6 +3112,12 @@ async function init() {
     // Claim the device-loss handoff before anything can read options.location — loadDatacenter()'s
     // fetch resolves straight into displayGui() + displayDatacenter(), which is where it gets applied.
     _pendingRestore = _takeSessionRestore();
+    // Which panel backend displayGui() gets isn't known until the Inspector's dynamic import down
+    // below settles, and the fetch loadDatacenter() is about to start can beat it — the panel would
+    // then come up as lil-gui in webgpu mode, on top of the Inspector, at random. Only the node
+    // renderer arms the gate; on the classic build init() runs to completion synchronously before
+    // any fetch callback can, so leaving the promise pre-resolved keeps that path bit-for-bit.
+    if (THREE.WebGPURenderer) _panelBackendReady = new Promise((res) => { _panelBackendSettled = res; });
     // Load the datacenter information
     loadDatacenter();
     // Set up the camera
@@ -3398,6 +3407,10 @@ async function init() {
             // when renderer.domElement has a parent. Both hold here, so drive it explicitly.
             created.init();
             inspector = created;
+            // The Inspector's #profiler-toggle is fixed top-right at z-index 1001, over the page's
+            // own top-right control row. dc.html moves that row out from under it off this class,
+            // so the default page never sees the rule.
+            document.body.classList.add('dc-has-inspector');
         } catch (err) {
             // A missing or broken addon must never cost us the scene; fall through to Stats.
             inspector = null;
@@ -3410,6 +3423,7 @@ async function init() {
         stats = new Stats();
         document.body.appendChild(stats.dom);
     }
+    _panelBackendSettled();   // displayGui() may now pick its backend
     // Wire up Phase 7 interaction (raycast picking + search box)
     setupInteraction();
     // Event listener for window resize
