@@ -84,8 +84,8 @@ describe('dc.js — Bug F-08: onKeyDown input-field guard + Alt+digit requiremen
     // dc-multi.js should NOT have the input-field guard pattern we added to dc.js
     // (it may have its own _onKeyDown but that's separate)
     const hasInputGuard = /if\s*\(\s*target\.tagName\s*===\s*['"]INPUT['"]\s*\|\|\s*target\.tagName\s*===\s*['"]TEXTAREA['"]\s*\|\|\s*target\.isContentEditable\s*\)/.test(DC_MULTI_SRC);
-    // If dc-multi.js has a similar guard, that's fine - but it must be its own independent implementation
-    // This test just confirms we didn't accidentally copy our guard there
-    expect(true).toBe(true); // Placeholder to ensure test suite runs
+    // dc-multi.js must NOT have event.altKey checks (F-08 Alt+digit requirement applies only to dc.js)
+    // This verifies we didn't incorrectly apply the Alt+digit fix to dc-multi.js
+    expect(DC_MULTI_SRC).not.toMatch(/event\.altKey/);
   });
 });
