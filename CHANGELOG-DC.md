@@ -166,6 +166,14 @@ The new file slices each function directly from the real `dc.js` source at runti
 
 **Why it matters:** A future refactor that renames `eyeHeight()` to `getEyeHeight()` in `dc.js` without updating the test will now cause the test suite to fail immediately, not after the next release when someone notices the old name still passes.
 
+#### `dc-fixes.test.js` — delete re-implementation tests
+
+`tests/js/dc-fixes.test.js` was trimmed from 726 lines to 63. The old file contained re-implementation copies of every function it tested — local copies of `send`, `on`, `off`, `emit`, and helpers like `throttle` declared afresh inside the test file. Those tests asserted the copy against itself, so they passed even when the real source was completely broken.
+
+The new file keeps only source-text assertion tests (guarding contracts that must not silently drift) and one multi-tab presence test that reads `dc-presence.js` and `dc-ws.js` directly. The "RULE" comment that permitted re-implementation has been replaced with an explicit anti-pattern warning: **never re-implement the logic under test in the test file itself**. The old rule was self-contradictory — it banned re-implementation while the file was full of it.
+
+**What was deleted:** ~660 lines of tests that re-implemented `dc-ws.js` send/receive/presence logic and `dc-presence.js` LRU/name-cache logic locally.
+
 ---
 
 ### Debugging & Graceful Degradation

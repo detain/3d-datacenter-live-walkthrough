@@ -2,19 +2,13 @@
  * Unit tests for DataCenter 3D critical fixes
  *
  * Tests the following fixes:
- * 1. dc-multi.js - whenReady() timeout: callback not called after timeout, error logged
- * 2. dc-multi.js - Cleanup removes all listeners including wheel {passive:false}
- * 3. dc-ws.js - Exponential backoff capped at 45000 (30000 * 1.5 max jitter)
- * 4. dc-ws.js - v1 error reply sets authed = false on envelope.ok === false
- * 5. dc-ws.js - keepalive only fires when authenticated
- * 6. dc-presence.js - LRU cache dedup: duplicate names don't create duplicate entries
- * 7. dc.js - Null collider guard: null entries in colliders array don't cause errors
+ * 6. dc-presence.js - Multi-tab presence: LRU cache dedup + per-clientId tracking
  *
- * RULE: every test in this file must exercise the REAL source file, either by
- * importing it, by slicing a declaration out of the source text and recompiling it
- * (see tests/js/dc-model-guards.test.js), or by running it in a vm sandbox (see
- * tests/js/dc-ws.test.js). Never re-implement the logic under test inside this file —
- * such a test asserts a local copy against itself and can never fail.
+ * ANTI-PATTERN: Never re-implement the logic under test inside this file. Such a
+ * test asserts a local copy against itself and can never fail. Every test must
+ * exercise the REAL source file by importing it, by slicing a declaration out
+ * of the source text (see tests/js/dc-model-guards.test.js), or by reading the
+ * compiled source at runtime and asserting on its actual text.
  *
  * Run: yarn test:js
  */
