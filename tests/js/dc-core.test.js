@@ -236,10 +236,6 @@ describe('dc.js — glbVariantUrl', () => {
 // ---------------------------------------------------------------------------
 describe('dc.js — constants from source', () => {
 
-    it('VIEW_OPTS has 5 entries', () => {
-        expect(DC_SOURCE).toMatch(/const VIEW_OPTS = \{[^}]+Overview[^}]+'overview'[^}]+\}/);
-    });
-
     it('MAX_TEXTURE_CACHE = 128', () => {
         expect(DC_SOURCE).toMatch(/const MAX_TEXTURE_CACHE = 128\b/);
     });

@@ -22,10 +22,7 @@ import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import * as BufferGeometryUtils from "three/addons/utils/BufferGeometryUtils.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 let camera, scene, renderer, controls, controlObject, stats, inspector, gui, locations = {}, maxAnisotropy; // Declare global variables
-const VIEW_OPTS = { Overview: 'overview', 'Top-down': 'top', Aisle: 'aisle', Labels: 'labels', Cables: 'cables' };
-const _viewProxy = { view: 'overview' };   // bound to the GUI 'View' dropdown (replaces the #dcViews button bar)
 let prevTime = performance.now();
-let racksShown = false, showServers = true;
 let objects = {instanced: [], network: null, rackLabels: [], labels: [], room: null, community: null}, models = { racks: {}, servers: {} }, locationNames = {};
 let sunCore = null, sunGlow = null;  // sun spheres (Fix #5 disposal)
 let rackColliders = []; // x/z footprints of placed racks (for collision)
@@ -143,7 +140,6 @@ const UPGRADE_COOLDOWN = 3000;   // ms between upgrades (debounce)
 // Quality settings — progressively reduced when FPS drops. Exposed via DC.quality.
 const S = {
     pixelScale: 1.0,    // renderer pixel ratio multiplier (1.0 = full, 0.75 = 75%, etc.)
-    shadowMapEnabled: true,
     shadowMapSize: 2048, // shadow map resolution (reduced on quality downgrade)
     lodBias: 0,         // LOD bias offset added to S.lodBias; >0 makes LOD more aggressive (culls sooner)
 };
@@ -3219,7 +3215,6 @@ function setView(name, keepBlocker) {
     flyTo.onDone = null; flyTo.speed = 0.012; // not a location transition
     if (controls && controls.isLocked) controls.unlock();
     if (!keepBlocker) { const bl = document.getElementById('blocker'); if (bl) bl.style.display = 'none'; }
-    _viewProxy.view = name;   // keep the GUI 'View' dropdown showing the current view (it .listen()s)
     // highlight the matching preset button so the idle demo shows which view it's currently on
     document.querySelectorAll('#dcViews button[data-view]').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
 }
