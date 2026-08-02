@@ -300,7 +300,15 @@ async function loadCharacter(ch) {
   // character switch mid-load: a late clip must not attach to a different character's mixer.
   if (S.actions.idle) play("idle", 0);
   const myMixer = S.mixer;
-  for (const a of (ch.animations || [])) {
+  const allClips = ch.animations || [];
+  const playable = allClips.filter((a) => a && a.label && PLAYABLE_LABELS.has(a.label));
+  if (allClips.length !== playable.length) {
+    log('character', ch.name, '— loading', playable.length, 'playable clips of', allClips.length, 'in the manifest');
+  }
+  if (playable.length === 0 && allClips.length > 0) {
+    console.warn('[dc-multi] character', ch.name, 'has', allClips.length, 'clips but none carry a playable label — only idle will work');
+  }
+  for (const a of playable) {
     S.loader.loadAsync(a.clip + cb).then((ag) => {
       if (S.mixer !== myMixer) return;                 // character changed while this clip loaded
       const clip = ag.animations && ag.animations[0];
@@ -770,6 +778,12 @@ function endGesture() {
 // cycle through whatever the loaded character actually has (queries can miss for some characters).
 const GESTURE_ORDER = ["dance1", "dance2", "clap", "dying", "wave", "dance3", "dance4", "salute", "cheer",
   "bow", "point", "thumbsup", "talk", "laugh", "think", "shrug", "punch", "kick", "sit", "backflip", "jacks"];
+// The complete set of animation labels this module can ever play: the four locomotion
+// states chooseAnimation() selects between, plus every gesture bound to a key.
+// Anything outside this set is unreachable — no keybinding, no code path plays it.
+// The manifest lists up to 3346 clips for some characters, of which exactly these 25
+// are usable, so loadCharacter() filters against this before issuing a single request.
+const PLAYABLE_LABELS = new Set(['idle', 'walk', 'run', 'jump', ...GESTURE_ORDER]);
 const GESTURE_NAMES = { dance1: "Samba", dance2: "Hip-Hop", dance3: "Breakdance", dance4: "Gangnam",
   clap: "Clap", wave: "Wave", dying: "Dying", salute: "Salute", cheer: "Cheer", bow: "Bow", point: "Point",
   thumbsup: "Thumbs Up", talk: "Talk", laugh: "Laugh", think: "Think", shrug: "Shrug", punch: "Punch",
@@ -949,6 +963,10 @@ function exposeDebug() {
     /** Character yaw in radians — dc-presence reads this so its join carries our real facing */
     getFacing: () => S.facing,
     getState: () => ({ mode: S.mode, spawned: S.spawned, charId: S.loadedCharId }),
+    /** Internal S state — used exclusively by the animation-filter unit test */
+    _S: S,
+    /** loadCharacter — used exclusively by the animation-filter unit test */
+    loadCharacter,
     /**
      * Live movement state. getState() above is the stable three-field summary the console helpers and
      * dc-presence read; this is the raw locomotion state (mode/vy/facing/camDist) that
