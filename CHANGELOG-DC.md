@@ -158,6 +158,14 @@ The three.js test stub (`tests/js/__mocks__/three.js`) was updated so that stub 
 
 **Rule added:** `.claude/rules/js-tests.md` now states that stub methods must compute correct values or throw — never silently return `this`.
 
+#### `dc-core.test.js` rewrite
+
+`tests/js/dc-core.test.js` was completely rewritten. The old file re-implemented every function it tested locally — copies of `convertRackCoordinatesToPosition`, `makeRng`, `escapeHtml`, etc. declared afresh inside the test file. That pattern is a maintenance hazard: the copies can silently diverge from the real implementations in `public_html/js/dc.js` and the tests would still pass.
+
+The new file slices each function directly from the real `dc.js` source at runtime using a column-0-anchored regex extractor (the same technique already used by `dc-model-guards.test.js`). The extractor throws if the declaration is renamed or removed, so a rename in `dc.js` fails loudly in CI instead of silently testing nothing. Eight pure-logic helpers are now covered: `convertRackCoordinatesToPosition`, `convertServerCoordinatesToPosition`, `eyeHeight`, `playerRadius`, `makeRng`, `escapeHtml`, `distToRect`, `glbVariantUrl`. The `loadDcJs` loader that produced the redundant copies is deleted.
+
+**Why it matters:** A future refactor that renames `eyeHeight()` to `getEyeHeight()` in `dc.js` without updating the test will now cause the test suite to fail immediately, not after the next release when someone notices the old name still passes.
+
 ---
 
 ### Debugging & Graceful Degradation
