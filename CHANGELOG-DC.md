@@ -22,6 +22,26 @@ Two browser tabs with the same session (same user) can now see each other in Dat
 
 ---
 
+### Phase 6
+
+#### Step 6.1 — Enable shadow rendering with PCFSoftShadowMap
+
+Shadow rendering is now enabled in the WebGL renderer for realistic shadows from the sun directional light.
+
+**Changes in `dc.js`:**
+
+| What | How |
+|------|-----|
+| `_sunLight` variable | Declared at module scope to hold the sun `DirectionalLight` |
+| Sun light shadow config | `castShadow = true`, `shadow.bias = -0.001`, `shadow.normalBias = 0.02`, `shadow.camera.near = 1`, `shadow.camera.far = 500` |
+| Shadow camera fit | New `_fitShadowCamera()` function fits orthographic shadow camera to `roomBounds` with 20-unit margin |
+| `scene.add(_sunLight.target)` | Target object added to scene — without this, the shadow camera has no position and shadows don't work |
+| Renderer shadow map | `renderer.shadowMap.enabled = true` and `renderer.shadowMap.type = THREE.PCFSoftShadowMap` |
+
+**Tests:** New Vitest test in `tests/js/dc-shadow.test.js`
+
+---
+
 ### Bot Presence System (NEW FEATURE)
 
 When a real user joins DataCenter 3D, a simulated bot avatar is spawned that wanders around the datacenter. When the last real user leaves, the bot is cleaned up.
@@ -65,6 +85,27 @@ When a real user joins DataCenter 3D, a simulated bot avatar is spawned that wan
 **Tests:** 19 new bot tests added
 
 ---
+
+### Phase 6
+
+#### WebGPU Shadow Support Investigation (Step 6.4)
+
+Investigated `PCFSoftShadowMap` support on the WebGPU renderer path in three.js 0.184.0.
+
+**Findings:**
+
+| Renderer path | `PCFSoftShadowMap` support | Implementation |
+|---------------|---------------------------|----------------|
+| `WebGLRenderer` (classic) | Deprecated → converted to `PCFShadowMap` | `WebGLShadowMap.js` issues console warning and sets `this.type = PCFShadowMap` |
+| `WebGPURenderer` (node/TSL) | **Fully supported** | `ShadowNode.js` and `ShadowFilterNode.js` include `PCFSoftShadowFilter` in the `_shadowFilterLib` array; `shadowMap.type` is read by `NodeManager.js` and `Renderer.js` |
+
+**Implication:** The existing `renderer.shadowMap.type = THREE.PCFSoftShadowMap` assignment in `dc.js` works correctly on **both** paths. No `isNode` guard is required.
+
+**Files changed:**
+
+- `public_html/js/dc.js` — added comment explaining WebGPU shadow support
+- `docs/dc_renderer_modes.md` — added shadow map type row to the comparison table
+- `CHANGELOG-DC.md` — this entry
 
 ### Comprehensive Audit Fixes (2026-07-29)
 

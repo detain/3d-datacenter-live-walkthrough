@@ -3449,6 +3449,10 @@ async function init() {
     _setupRendererSwitch();
 
     // Phase 6: enable shadow rendering
+    // NOTE: PCFSoftShadowMap is supported on the WebGPU/node-renderer path (via TSL ShadowFilterNode
+    // which includes PCFSoftShadowFilter in its filter library). On the classic WebGL path,
+    // PCFSoftShadowMap is deprecated and three.js automatically converts it to PCFShadowMap with a
+    // console warning — no guard needed since both paths produce valid shadows.
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     _fitShadowCamera();

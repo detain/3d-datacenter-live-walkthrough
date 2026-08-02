@@ -67,6 +67,7 @@ no `?renderer=` always lands back on the default renderer.
 | per-frame draw calls | `info.render.calls` | `info.render.drawCalls` (`calls` was redefined as the lifetime `render()` count) — both go through `_drawCalls()` in `dc.js` |
 | device loss | `webglcontextlost` / `webglcontextrestored` DOM events, in-place recovery | `renderer.onDeviceLost` callback; there is **no** restored counterpart, so the handler stashes a session backup in `sessionStorage` and reloads. The WebGL 2 backend routes canvas context loss into the same callback |
 | init | synchronous | `await renderer.init()` before anything draws — `init()` in `dc.js` is `async` and the module tail is a top-level `await` |
+| shadow map type | `PCFSoftShadowMap` deprecated → `PCFShadowMap` (console warning); both paths work, WebGPU just uses the TSL node shadow filter instead | `PCFSoftShadowMap` supported via TSL `ShadowFilterNode` (`PCFSoftShadowFilter` in `_shadowFilterLib`); `shadowMap.type` is read in `NodeManager.js` and `Renderer.js` |
 
 `body.dc-has-inspector` shifts `#dcPlayer` / `#dcPresence` / `#dcWsToggle` clear of the
 Inspector's fixed `#profiler-toggle`; the class is only added when the Inspector really
