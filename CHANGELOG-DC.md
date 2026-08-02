@@ -38,6 +38,22 @@ The `?renderer=webgpu-gl` mode was described as a "comparison" tool but its fram
 
 ---
 
+#### Step 7.1 — Create a renderer-capability module
+
+A new `dc-caps.js` module centralises renderer capability detection. Instead of ad-hoc `renderer.backend` or `instanceof` checks scattered through `dc.js`, callers now use the normalised `describeRenderer(renderer)` function which returns a capability object with `isNode`, `backend`, `shadowTypeSettable`, `supportsTSL`, `supportsCompute`, `supportsOcclusionQuery`, and `supportsEffectComposer` booleans.
+
+**Changes:**
+
+| File | Change |
+|------|--------|
+| `public_html/js/dc-caps.js` | New module exporting `describeRenderer(renderer)` |
+| `public_html/js/dc.js` | Imports `describeRenderer`; calls it in `init()` after renderer creation to populate `caps`; replaces `renderer.isWebGLRenderer` context-loss check with `!caps.isNode` |
+| `public_html/admin/dc.html` | Added `<link rel="modulepreload" href="/js/dc-caps.js">` |
+
+**Tests:** New Vitest test in `tests/js/dc-caps.test.js`
+
+---
+
 #### Step 7.2 — Restore frustum culling for neighbours and player
 
 Re-enabled frustum culling (`frustumCulled = true`) for neighbour building instanced meshes and the player character. The current building's meshes keep `frustumCulled = false` because their room-spanning bounding spheres make culling ineffective.
