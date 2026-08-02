@@ -158,6 +158,8 @@ The three.js test stub (`tests/js/__mocks__/three.js`) was updated so that stub 
 
 **Rule added:** `.claude/rules/js-tests.md` now states that stub methods must compute correct values or throw — never silently return `this`.
 
+The orphaned `ws_terminal.test.js` and `ws_vmstat.test.js` (using `node:test`) were renamed to `dc-ws-terminal.test.js` and `dc-ws-vmstat.test.js` and converted to Vitest format, bringing them into the vitest suite.
+
 #### `dc-core.test.js` rewrite
 
 `tests/js/dc-core.test.js` was completely rewritten. The old file re-implemented every function it tested locally — copies of `convertRackCoordinatesToPosition`, `makeRng`, `escapeHtml`, etc. declared afresh inside the test file. That pattern is a maintenance hazard: the copies can silently diverge from the real implementations in `public_html/js/dc.js` and the tests would still pass.
