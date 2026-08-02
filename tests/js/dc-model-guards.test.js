@@ -88,8 +88,8 @@ function extractLine(name) {
 // type indexes so a per-type assertion cannot be satisfied by the wrong building's models.
 function defaultLocations() {
     return {
-        4: { racks: { 1: { type: 1, x: 1, y: 1, name: 'R1', servers: { 10: { type: 1, start: 1 } } } } },
-        5: { racks: { 2: { type: 2, x: 2, y: 1, name: 'R2', servers: { 20: { type: 2, start: 1 } } } } },
+        4: { _full: true, racks: { 1: { type: 1, x: 1, y: 1, name: 'R1', servers: { 10: { type: 1, start: 1 } } } } },
+        5: { _full: true, racks: { 2: { type: 2, x: 2, y: 1, name: 'R2', servers: { 20: { type: 2, start: 1 } } } } },
     };
 }
 
@@ -152,6 +152,7 @@ function makeHarness(urlOutcome = () => 'ok', opts = {}) {
         extractFn('loadRackType'),
         extractFn('loadServerType'),
         extractFn('loadBuildingModels'),
+        extractFn('locationLoaded'),
         extractFn('enterFull'),
     ].join('\n\n');
     const factory = new Function(
@@ -160,7 +161,7 @@ function makeHarness(urlOutcome = () => 'ok', opts = {}) {
         'buildBuildingFull', 'buildNeighborInterior', 'scene',
         prelude + '\nreturn { rackTypes, serverTypes, GLB_VARIANTS, _failedGlbs, _inflightGlbs, glbVariantUrl,'
         + ' rackModelName, serverModelName, loadGlbWithFallback, getRackModels, getServerModels,'
-        + ' loadRackType, loadServerType, loadBuildingModels, enterFull };'
+        + ' loadRackType, loadServerType, loadBuildingModels, locationLoaded, enterFull };'
     );
     const api = factory(
         loaderGltf,
@@ -870,7 +871,7 @@ describe('dc.js — the two getters name the type they gave up on', () => {
 
     it('says nothing for the index-0 placeholder — a skip is not a failure', () => {
         const h = makeHarness(() => 'ok', {
-            locations: { 4: { racks: { 1: { type: 0, x: 1, y: 1, servers: { 10: { type: 0, start: 1 } } } } } },
+            locations: { 4: { _full: true, racks: { 1: { type: 0, x: 1, y: 1, servers: { 10: { type: 0, start: 1 } } } } } },
         });
         h.getRackModels();
         h.getServerModels();

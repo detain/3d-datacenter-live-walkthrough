@@ -598,14 +598,19 @@ function displayGui() {
     moveFolder.open(); // expanded on load
     buildLocationButtons();
 }
-function mergeLocations(data) {
-    // The response always carries the full locations list (names, for the dropdown); only the
-    // requested location has its racks populated. Keep already-loaded full data; fill in names.
+function mergeLocations(data, isFull) {
     for (const idx of Object.keys(data.locations)) {
         const incoming = data.locations[idx];
+        const existing = locations[idx];
         const hasRacks = incoming.racks && Object.keys(incoming.racks).length > 0;
-        if (hasRacks || !locations[idx]) {
+        // Never let an index-tier skeleton overwrite a location we already hold in full.
+        if (existing && existing._full && !isFull) {
+            locationNames[incoming.name] = Number(idx);
+            continue;
+        }
+        if (hasRacks || !existing) {
             locations[idx] = incoming;
+            locations[idx]._full = !!isFull;
         }
         locationNames[incoming.name] = Number(idx);
     }
@@ -616,16 +621,13 @@ function mergeLocations(data) {
 function dcUrl(path) { return (options.domain ? 'https://' + options.domain : '') + path; }
 function fetchLocation(locId) {
     return fetch(dcUrl('/ajax/datacenter.php?location=' + Number(locId)))
-        .then((response) => {
-            if (!response.ok) throw new Error('Network response was not ok');
-            return response.json();
-        })
-        .then((data) => { mergeLocations(data); });
+        .then((response) => { if (!response.ok) throw new Error('Network response was not ok'); return response.json(); })
+        .then((data) => { mergeLocations(data, true); });
 }
 
 function locationLoaded(locId) {
     const loc = locations[locId];
-    return !!(loc && loc.racks && Object.keys(loc.racks).length > 0);
+    return !!(loc && loc._full);
 }
 
 function switchLocation() {
@@ -716,28 +718,37 @@ function _restoreCamera() {
 }
 
 function loadDatacenter() {
-    // Fetch ALL locations at once so every building's footprint is known for the community layout.
-    fetch(dcUrl('/ajax/datacenter.php'))
+    // Tier 1: fetch a tiny index (location names + rack grid positions, no assets)
+    const indexReq = fetch(dcUrl('/ajax/datacenter.php?tier=index'))
+        .then((r) => { if (!r.ok) throw new Error('Network response was not ok'); return r.json(); })
+        .then((data) => { mergeLocations(data, false); });
+
+    indexReq
+        .then(() => {
+            _restoreLocation();
+            // Tier 2: fetch only the current location in full detail
+            return fetch(dcUrl('/ajax/datacenter.php?location=' + Number(options.location)));
+        })
         .then((r) => { if (!r.ok) throw new Error('Network response was not ok'); return r.json(); })
         .then((data) => {
-            mergeLocations(data);
-            _restoreLocation();     // before the dropdown and the room read options.location
+            mergeLocations(data, true);
             return _panelBackendReady;
         })
         .then(() => {
-            // The gate settling means init() STOPPED, not that it got far enough to pick a backend:
-            // _failInit() settles it on the way out of a throw too. There is no camera and no renderer
-            // to build a panel or a room against in that case, and the failure has already been logged
-            // and shown, so stop here rather than throw a second, more confusing error out of
-            // displayGui(). Never set on the classic path unless init() itself threw.
             if (_initError) return;
             displayGui();
             displayDatacenter();
-            _restoreCamera();       // after spawnInside() placed the player at the room default
+            _restoreCamera();
             const loading = document.getElementById('dcLoading');
             if (loading) loading.style.display = 'none';
         })
-        .catch((error) => console.error('There was a problem with the fetch operation:', error));
+        .catch((error) => {
+            console.error('There was a problem with the fetch operation:', error);
+            // F-29 fix: user-visible error instead of silent failure
+            if (typeof notice === 'function') notice('Could not load datacenter inventory: ' + ((error && error.message) || error), 0);
+            const loading = document.getElementById('dcLoading');
+            if (loading) loading.textContent = 'Could not load datacenter inventory — see the browser console.';
+        });
 }
 
 function clearScene() {
@@ -2533,18 +2544,32 @@ function loadServerType(t) {
 // than resolves — loaderGltf.load() throwing straight out of loadRackType()'s promise executor, say —
 // which rejected the race with it, and the timeout could not rescue it because a settled race stays
 // settled. Hence the explicit rejection handler, and a single settle latch behind all three paths.
-function loadBuildingModels(id, cb) {
-	const racks = (locations[id] || {}).racks || {};
-	const rt = new Set(), st = new Set();
-	for (const k in racks) { rt.add(racks[k].type); const sv = racks[k].servers || {}; for (const sk in sv) st.add(sv[sk].type); }
-	const tasks = [];
-	rt.forEach((t) => { if (models.racks[t] === undefined) tasks.push(loadRackType(t)); });
-	st.forEach((t) => { if (models.servers[t] === undefined) tasks.push(loadServerType(t)); });
-	if (!tasks.length) return cb();
-	let settled = false;
-	const finish = () => { if (settled) return; settled = true; clearTimeout(timer); cb(); };
-	const timer = setTimeout(finish, 12000);   // backstop; the loaders settle themselves on every known path
-	Promise.all(tasks).then(finish, (err) => { console.error('[dc] Model load failed for location', id, err); finish(); });
+function loadBuildingModels(id, cb, _retried) {
+    if (!locationLoaded(id)) {
+        if (_retried) {
+            console.warn('[dc] location', id, 'has no inventory; skipping');
+            return cb();
+        }
+        fetchLocation(id)
+            .then(() => loadBuildingModels(id, cb, true))
+            .catch((err) => {
+                console.error('[dc] neighbour inventory fetch failed', id, err);
+                cb();
+            });
+        return;
+    }
+    // existing body below this point — unchanged:
+    const racks = (locations[id] || {}).racks || {};
+    const rt = new Set(), st = new Set();
+    for (const k in racks) { rt.add(racks[k].type); const sv = racks[k].servers || {}; for (const sk in sv) st.add(sv[sk].type); }
+    const tasks = [];
+    rt.forEach((t) => { if (models.racks[t] === undefined) tasks.push(loadRackType(t)); });
+    st.forEach((t) => { if (models.servers[t] === undefined) tasks.push(loadServerType(t)); });
+    if (!tasks.length) return cb();
+    let settled = false;
+    const finish = () => { if (settled) return; settled = true; clearTimeout(timer); cb(); };
+    const timer = setTimeout(finish, 12000);   // backstop; the loaders settle themselves on every known path
+    Promise.all(tasks).then(finish, (err) => { console.error('[dc] Model load failed for location', id, err); finish(); });
 }
 // Build a neighbour's FULL racks+servers (same instanced models as the current building) into its own
 // group at the neighbour's world offset (dx,dz), with its own collider list. No labels/highlight (cheap,
