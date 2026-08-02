@@ -982,6 +982,16 @@ function serverModelName(t) {
 // which builds a fresh Set. A reload is the retry.
 const _failedGlbs = new Set();
 
+// Requests currently IN FLIGHT, keyed the same way as _failedGlbs and holding the waiters queued behind
+// the one fetch of that asset. _failedGlbs only closes the duplicate-request window once the first
+// attempt has finished failing; until then nothing stopped two callers opening the same three requests
+// and raising the same banner twice — two neighbours entering full detail in the same frame both call
+// loadRackType() for a shared type, and getRackModels() at boot races the loadRackType() a neighbour
+// triggers for a type the current building also uses.
+// Waiters get the same gltf, in registration order, and the same give-up they would have got from a
+// request of their own, so WHAT loads and how it looks is unchanged — only the request count is.
+const _inflightGlbs = new Map();
+
 function loadGlbWithFallback(basePath, relName, onLoad, onGiveUp) {
     // onGiveUp fires on every path that will NOT produce a model — a missing name, the
     // all-variants-failed branch, an onLoad that threw, and a request already known bad — so a caller
@@ -1004,18 +1014,25 @@ function loadGlbWithFallback(basePath, relName, onLoad, onGiveUp) {
         if (onGiveUp) onGiveUp();
         return;
     }
-    const giveUp = (what, detail) => {
+    const queued = _inflightGlbs.get(failKey);
+    if (queued) { queued.push({ onLoad, onGiveUp }); return; }   // ride the request already out there
+    const waiters = [{ onLoad, onGiveUp }];
+    _inflightGlbs.set(failKey, waiters);
+    // Handed out exactly once: the request is over the moment its waiters are taken, and anything
+    // arriving after that starts a fresh one (or is answered by _failedGlbs).
+    const takeWaiters = () => { _inflightGlbs.delete(failKey); return waiters.splice(0); };
+    const giveUp = (who, what, detail) => {
         console.error('[dc] ' + what, basePath, relName, detail);
         _failedGlbs.add(failKey);
         notice('Warning: Some 3D models failed to load — scene may be incomplete');
-        if (onGiveUp) onGiveUp();
+        for (const w of who) { if (w.onGiveUp) w.onGiveUp(); }
     };
     let i = 0;
     const tryNext = () => {
         const url = glbVariantUrl(basePath, relName, GLB_VARIANTS[i]);
         const isLast = i === GLB_VARIANTS.length - 1;
         i += 1;
-        loaderGltf.load(url, (gltf) => {
+        const onVariant = (gltf) => {
             // The onLoad bodies build meshes out of the parsed GLB and that can throw — a GLB that parses
             // but carries no scene (glTF makes `scenes` optional) leaves gltf.scene undefined and takes
             // `model.traverse` down with a TypeError. Left uncaught this did not hang, but it did land
@@ -1027,9 +1044,28 @@ function loadGlbWithFallback(basePath, relName, onLoad, onGiveUp) {
             // re-run, double-building whatever did land. Catching it here gives one give-up, logged as
             // unusable rather than missing, without depending on that loader internal to settle the
             // caller. Anything awaiting the load still gets its answer.
-            try { onLoad(gltf); }
-            catch (e) { giveUp('GLB loaded but could not be used for', e); }
-        }, undefined, isLast ? (err) => giveUp('All GLB variants failed for', err) : tryNext);
+            // One waiter's throw is that waiter's failure alone: the others were handed the same model
+            // and are already settled by their own onLoad, so only the ones that threw get given up on.
+            const who = takeWaiters();
+            const threw = [];
+            let last = null;
+            for (const w of who) {
+                try { w.onLoad(gltf); }
+                catch (e) { threw.push(w); last = e; }
+            }
+            if (threw.length) giveUp(threw, 'GLB loaded but could not be used for', last);
+        };
+        const onVariantError = isLast
+            ? (err) => giveUp(takeWaiters(), 'All GLB variants failed for', err)
+            : tryNext;
+        // loaderGltf.load() can throw synchronously — three's FileLoader builds a Request and calls
+        // fetch() inline, so a request the browser refuses to construct comes straight back out. That
+        // throw belongs to whoever called us and is re-thrown untouched (loadBuildingModels() handles
+        // the rejection it becomes), but the in-flight entry has to go with it: a request that is over
+        // must never park later callers behind it. Waiters queued behind a THROWN fallback variant are
+        // dropped unsettled, exactly as they were when each of them owned its own doomed request.
+        try { loaderGltf.load(url, onVariant, undefined, onVariantError); }
+        catch (e) { _inflightGlbs.delete(failKey); throw e; }
     };
     tryNext();
 }
@@ -1169,7 +1205,14 @@ function getRackModels() {
 
 						//console.log("checking racks len "+Object.keys(models.racks).length+" against type len "+rackTypes.length);
 						displayRacks(modelIdx);
-					}
+					},
+					// The give-up path the async loaders have always had. loadGlbWithFallback() logs the
+					// failure and raises the banner itself, but nothing said WHICH type went missing:
+					// this getter simply never reached displayRacks(), so the current building's racks of
+					// that type were absent from the scene with no line connecting them to the failure.
+					// Only real failures land here — rackModelName() screened the index-0 placeholder out
+					// above, and that skip stays silent.
+					() => console.warn('[dc] Rack type', modelIdx, '(' + currentModel + ') has no usable model — its racks will not be drawn')
 				);
 			})(idx);
 		} else {
@@ -1221,7 +1264,10 @@ function getServerModels() {
 						//console.log(gltf);
 						//console.log("finished loading server " + currentModel);
 						displayServers(modelIdx);
-					}
+					},
+					// Same give-up path as the rack getter above, for the same reason: without it a
+					// failed server model left this building's servers of that type undrawn and unnamed.
+					() => console.warn('[dc] Server type', modelIdx, '(' + currentModel + ') has no usable model — its servers will not be drawn')
 				);
 			})(idxServer);
 		} else {
@@ -2430,8 +2476,15 @@ function loadServerType(t) {
 		}, res);
 	});
 }
-// Ensure every rack + server type used by location `id` is loaded, then call cb. The 12s race guard means
-// a 404'd variant can never permanently wedge a building in the "loading" state.
+// Ensure every rack + server type used by location `id` is loaded, then call cb EXACTLY once — on
+// success, on REJECTION and on the 12s backstop alike. cb is what clears b.loading in enterFull(), and
+// updateLOD() skips any building that still has that flag set, so an outcome that never reaches cb does
+// not make a building slow, it makes it permanently unreachable: it can never swap to full detail again
+// for the life of the page, which is strictly worse than the timeout this guard exists to provide.
+// Promise.race([...]).then(cb) covered two outcomes of three. The third is a task that rejects rather
+// than resolves — loaderGltf.load() throwing straight out of loadRackType()'s promise executor, say —
+// which rejected the race with it, and the timeout could not rescue it because a settled race stays
+// settled. Hence the explicit rejection handler, and a single settle latch behind all three paths.
 function loadBuildingModels(id, cb) {
 	const racks = (locations[id] || {}).racks || {};
 	const rt = new Set(), st = new Set();
@@ -2440,7 +2493,10 @@ function loadBuildingModels(id, cb) {
 	rt.forEach((t) => { if (models.racks[t] === undefined) tasks.push(loadRackType(t)); });
 	st.forEach((t) => { if (models.servers[t] === undefined) tasks.push(loadServerType(t)); });
 	if (!tasks.length) return cb();
-	Promise.race([Promise.all(tasks), new Promise((r) => setTimeout(r, 12000))]).then(cb);
+	let settled = false;
+	const finish = () => { if (settled) return; settled = true; clearTimeout(timer); cb(); };
+	const timer = setTimeout(finish, 12000);   // backstop; the loaders settle themselves on every known path
+	Promise.all(tasks).then(finish, (err) => { console.error('[dc] Model load failed for location', id, err); finish(); });
 }
 // Build a neighbour's FULL racks+servers (same instanced models as the current building) into its own
 // group at the neighbour's world offset (dx,dz), with its own collider list. No labels/highlight (cheap,
@@ -2554,12 +2610,19 @@ function enterFull(b) {
 	b.loading = true;
 	loadBuildingModels(b.id, () => {
 		if (!b.loading) return;                         // cancelled by exitFull while loading
-		b.full = buildBuildingFull(b.id, b.dx, b.dz);
-		const ri = buildNeighborInterior(b.full.group, b);             // interior; returns its flicker + disco handles
-		b.full.faulty = ri.faulty || []; b.full.bulbDisco = ri.bulbDisco;
-		scene.add(b.full.group);
-		if (b.blocks) b.blocks.visible = false;
-		b.loading = false;
+		// finally, not a trailing assignment: a throw out of the build (buildBuildingFull() reads
+		// inventory that came off the wire) would otherwise leave the flag set, which is the same
+		// permanent block a continuation that never ran caused — updateLOD() never looks at a building
+		// that is still "loading" again. The throw itself still escapes; only the flag is guaranteed.
+		try {
+			b.full = buildBuildingFull(b.id, b.dx, b.dz);
+			const ri = buildNeighborInterior(b.full.group, b);             // interior; returns its flicker + disco handles
+			b.full.faulty = ri.faulty || []; b.full.bulbDisco = ri.bulbDisco;
+			scene.add(b.full.group);
+			if (b.blocks) b.blocks.visible = false;
+		} finally {
+			b.loading = false;
+		}
 	});
 }
 // Swap FULL -> BLOCKS: drop the full group, show the blocks again, cancel any in-flight load. InstancedMesh
