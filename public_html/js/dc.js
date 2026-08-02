@@ -3005,15 +3005,7 @@ const _centerNdc = new THREE.Vector2(0, 0);   // screen centre = "what you're lo
 const _hoverMatrix = new THREE.Matrix4();
 const _hoverPos = new THREE.Vector3();
 const _hoverSize = new THREE.Vector3();
-// Fix #4: Camera forward direction helper and distance pre-check for raycastInstances
-const _camFwd = new THREE.Vector3();
-const _rcTempV = new THREE.Vector3();
 const MAX_RAYCAST_DIST = 50;  // only raycast instanced meshes within this distance
-
-function _getCameraForward(cam) {
-    cam.getWorldDirection(_camFwd);
-    return _camFwd;
-}
 
 let highlightBox = null;
 let hovered = null;                            // { mesh, instanceId, kind, asset }
@@ -3037,13 +3029,17 @@ function ensureHighlightBox() {
 
 function raycastInstances(ndc) {
     if (objects.instanced.length === 0) return null;
-    // Fix #4: Fast distance pre-check — only test instanced meshes within MAX_RAYCAST_DIST
+    // Fast distance pre-check — only test instanced meshes within MAX_RAYCAST_DIST
     const nearbyInstanced = objects.instanced.filter(mesh => {
         if (!mesh.isMesh) return false;
-        _rcTempV.copy(mesh.position).sub(camera.position);
-        const dot = _rcTempV.dot(_getCameraForward(camera));
-        if (dot < 0 || dot > MAX_RAYCAST_DIST) return false;  // behind camera or too far
-        return true;
+        // Fix F-02: mesh.position is always (0,0,0) on InstancedMesh — use boundingSphere.center instead
+        if (!mesh.boundingSphere) {
+            mesh.geometry.computeBoundingSphere();
+        }
+        const worldCenter = mesh.boundingSphere.center.clone().applyMatrix4(mesh.matrixWorld);
+        worldCenter.sub(camera.position);
+        const camFwd = camera.getWorldDirection(new THREE.Vector3());
+        return worldCenter.dot(camFwd) <= MAX_RAYCAST_DIST;
     });
     if (nearbyInstanced.length === 0) return null;
     raycaster.setFromCamera(ndc, camera);
