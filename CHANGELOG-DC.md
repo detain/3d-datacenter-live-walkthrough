@@ -139,6 +139,27 @@ window.DCM.getWsState()           // { connected, authenticated, clientId, sessi
 window.DCM.getPresenceEnabled()  // Boolean presence system status
 ```
 
+### Test Infrastructure (2026-08-02)
+
+The three.js test stub (`tests/js/__mocks__/three.js`) was updated so that stub methods compute correct mathematical values instead of silently returning `this`. Previously, no-op stubs allowed tests to pass even when the code under test produced mathematically wrong results — the assertions never caught the error because the mock never changed.
+
+**What was fixed:**
+
+| Method | Before | After |
+|--------|--------|-------|
+| `Vector3.addScaledVector(v, s)` | No-op: returned `this` | Adds `v × s` to each component |
+| `Vector3.normalize()` | No-op: returned `this` | Divides by vector length |
+| `Vector3.lerp(v, alpha)` | No-op: returned `this` | Linear interpolation toward `v` |
+| `Euler.setFromQuaternion(q, order)` | No-op: returned `this` | Computes Euler angles from quaternion |
+| `Box3.setFromObject(object)` | No-op: always returned unit box (0,0,0)–(1,1,1) | Reads `userData.__testBounds` when provided |
+| `DoubleSide` | `undefined` | Exports `2` (real Three.js value) |
+
+**Why it matters:** Camera smooth-follow tests passed because `lerp` never moved the vector — the target was already at its final value so the test assertion passed against the unchanging mock. `setFromQuaternion` returned y=0 for every quaternion, so camera yaw assertions compared against a fake zero. `Box3.setFromObject` always reported 1-unit-tall models, so auto-scale code paths that handle non-unit heights were never exercised. `DoubleSide` was `undefined` under test, so `side: THREE.DoubleSide` was falsy and double-sided rendering was never actually verified.
+
+**Rule added:** `.claude/rules/js-tests.md` now states that stub methods must compute correct values or throw — never silently return `this`.
+
+---
+
 ### Debugging & Graceful Degradation
 
 #### Console Debug Logs (when `DC_DEBUG` enabled)
