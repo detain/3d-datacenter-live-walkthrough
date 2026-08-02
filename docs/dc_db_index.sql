@@ -1,0 +1,23 @@
+-- DataCenter 3D — index for the /ajax/datacenter.php assets query.
+--
+-- WHY: that query currently runs as `type: ALL` (a full scan of ~12,500 rows) with
+-- `Using temporary; Using filesort`, measured at 91 ms. The existing `rack` index
+-- cannot serve it because the WHERE clause casts a char(2) column:
+--     where rack is not null and unit_start != '' and cast(unit_start as decimal) > 0
+--     order by rack_location, rack, cast(unit_start as decimal)
+-- A cast is not sargable, so no index can satisfy that predicate. This composite index
+-- still helps: it covers the `rack is not null` filter and gives the optimiser an
+-- ordered path for the `rack` leg of the sort.
+--
+-- THE REAL FIX, deliberately not done here: `assets.unit_start` and `assets.unit_end`
+-- are char(2). Migrating them to smallint removes both casts, makes the predicate
+-- sargable and lets this index serve the ordering outright. That touches every consumer
+-- of those columns, so it needs its own scoped piece of work.
+--
+-- HOW TO APPLY (a human must run this; the plan does not run DDL automatically):
+--     mysql -h mysqlcluster1 my < docs/dc_db_index.sql
+--
+-- NOTE: the `my` database is a three-node writable cluster. Confirm the DDL replicated
+-- to all nodes before assuming it is live.
+
+ALTER TABLE assets ADD INDEX dc_rack_unit (rack, unit_start);
