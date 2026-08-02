@@ -757,8 +757,8 @@ test.describe('Group 9: Renderer modes', () => {
       await boot(page, url);
       // Settle, not construction. DC.renderer is truthy from `new WebGPURenderer(...)` onward, but the
       // label this test is about is written by _setupRendererSwitch(), which dc.js only calls after
-      // `await renderer.init()` — a real device acquisition in webgpu mode. Gating on DC.renderer left
-      // the assertions below racing that await with their default 5s expect timeout, and headlessly the
+      // `await renderer.init()` — a real device acquisition in webgpu mode. Gating on DC.renderer alone
+      // left the assertions below racing that await with their default 5s expect timeout, and headlessly the
       // device sometimes lost: the button was still empty, and #dcRenderer:empty is display:none, so
       // toBeVisible() read 'hidden'. waitForRendererSettled() waits for the label itself, which is the
       // documented "the switch has been set up" signal (see the helper). Nothing is weakened — if dc.js
@@ -782,4 +782,42 @@ test.describe('Group 9: Renderer modes', () => {
       await expect(btn).toBeVisible();
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Group 10: Performance regression guard
+//
+// DC.bench(frames) runs the render loop for `frames` frames with a frozen
+// camera and returns { drawCalls, triangles, fps } measured during that run.
+// This group asserts those numbers stay within agreed CI thresholds so that
+// a code change that inflates draw calls or triangle count fails the gate
+// rather than silently degrading frame rate on every PR.
+//
+// Thresholds are conservative headroom around what the stub room (4 racks,
+// 12 servers, 0 character assets) actually produces; they are NOT the
+// numbers a production room with full character assets would show.
+//
+// Uses continue-on-error: false in CI so a regression here BLOCKS the PR.
+// ---------------------------------------------------------------------------
+test.describe('Group 10: Performance regression', () => {
+  test.beforeEach(async ({ page }) => {
+    test.setTimeout(300000);
+    await bootHermetic(page);
+    await waitForSceneLoaded(page);
+  });
+
+  test('DC.bench(10) drawCalls < 400 and triangles < 2000000', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      // DC.bench is async because it awaits renderer.compile() the first time.
+      return (window as any).DC.bench(10);
+    });
+
+    test.info().annotations.push({
+      type: 'performance',
+      description: `drawCalls=${result.drawCalls} triangles=${result.triangles} fps=${result.fps}`,
+    });
+
+    expect(result.drawCalls).toBeLessThan(400);
+    expect(result.triangles).toBeLessThan(2000000);
+  });
 });
