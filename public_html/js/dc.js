@@ -3694,18 +3694,18 @@ async function init() {
     window.addEventListener("resize", onWindowResize);
 }
 
-// Animation loop
+// Animation loop — delegates to DC.tick() to collapse the former separate animate()/tick()
+// render paths into a single canonical loop (Bug F-16). animate() handles per-frame input/effects,
+// then defers all rendering and expensive-update decisions to tick(), which is also called directly
+// by dc-multi.js (via DC.setAnimationLoop(frame)) so both code paths share identical rendering.
 function animate() {
     // IDEA-2: skip rendering when WebGL context is lost
     if (_contextLost) return;
 
-    const now = performance.now();
+    // Add document.hidden guard to match tick()'s early-exit behaviour
+    if (document.hidden) return;
 
-    // Track idle frames and enable skip mode after threshold (Fix #6)
-    _tickSkippedFrames++;
-    if (_tickSkippedFrames >= _IDLE_FRAME_THRESHOLD) {
-        _skipExpensiveUpdates = true;
-    }
+    const now = performance.now();
 
     if (options.useFirstPerson === true) {
         controls.update( clock.getDelta() );
@@ -3718,22 +3718,13 @@ function animate() {
     // Idle: auto-cycle the preset views while the "click to enable" prompt is up
     maybeCycleIdleView();
     maybeFlicker();
+    updateDisco();
 
-    // FPS monitoring for automatic quality scaling (MINOR-6: skip during idle mode)
-    if (!_skipExpensiveUpdates) {
-        _updateFPS(now);
-        _autoQualityScale(now);
-    }
-
-    // Phase 7: glide toward a search fly-to target, then highlight what we're looking at (throttled)
-    updateFlyTo();
-    if (!_skipExpensiveUpdates && (_hlFrame++ % 4) === 0) updateHighlight();
-    // Distance-cull + lazily build labels, then render the scene (guarded by _skipExpensiveUpdates)
-    if (!_skipExpensiveUpdates) updateLabels();
-    if (!_skipExpensiveUpdates) updateBlinds();
-    renderer.render(scene, camera);
-    // Update stats monitor (absent in webgpu mode — the Inspector reports there instead)
-    if (stats) stats.update();
+    // Delegate to tick() — the single canonical render path shared by dc.html and dc-multi.js.
+    // tick() owns _tickSkippedFrames / _skipExpensiveUpdates so both the animate→tick chain
+    // (dc.html) and the direct tick() call (dc-multi via DC.setAnimationLoop) reach the same
+    // idle-skip behaviour at the same frame count — no double-increment.
+    tick();
 }
 
 // Update controls based on user input

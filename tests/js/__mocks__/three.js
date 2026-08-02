@@ -130,10 +130,15 @@ export const LoopRepeat = { REPEAT: 0 };
 export const LoopOnce = { LOOP_ONCE: 0 };
 
 export const AnimationMixer = class {
-  constructor() {}
+  constructor() {
+    this._uncachedActions = [];
+  }
   clipAction() { return new AnimationAction(); }
   stopAllAction() {}
   uncacheRoot() {}
+  uncacheAction(clip) {
+    if (clip) this._uncachedActions.push(clip);
+  }
   update() {}
 };
 
