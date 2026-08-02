@@ -25,6 +25,7 @@ let camera, scene, renderer, controls, controlObject, stats, inspector, gui, loc
 let prevTime = performance.now();
 let objects = {instanced: [], network: null, rackLabels: [], labels: [], room: null, community: null}, models = { racks: {}, servers: {} }, locationNames = {};
 let sunCore = null, sunGlow = null;  // sun spheres (Fix #5 disposal)
+let _sunLight = null;               // Phase 6: directional sun light with shadow camera
 let rackColliders = []; // x/z footprints of placed racks (for collision)
 let roomBounds = null;  // {minX,maxX,minZ,maxZ} wall extents (collide against the walls)
 let roomSpawn = null;   // {x,y,z,lookX,lookZ} a safe spot inside the room to drop the player
@@ -221,6 +222,16 @@ function cacheWithEvict(cacheMap, key, value, orderSet) {
     }
     orderSet.add(key);  // O(1) add
     cacheMap.set(key, value);
+}
+
+// Step 6.5: Shadow policy — sun neither casts nor receives; cables receive but never cast;
+// racks and servers cast and receive (already set in their respective loaders, included here for completeness).
+function applyShadowPolicy(root) {
+    root.traverse((n) => {
+        if (!n.isMesh) return;
+        n.castShadow = true;
+        n.receiveShadow = true;
+    });
 }
 
 function _rackGridKey(x, z) {
@@ -1735,6 +1746,8 @@ function displaySwitches(locId, dx, dz, sink) {
             }
             const material = new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: 0.6, metalness: 0.0, clearcoat: 0.6, clearcoatRoughness: 0.25 });
             const cables = new THREE.Mesh(geometry, material);
+            cables.castShadow = false;
+            cables.receiveShadow = true;
             cables.visible = options.showNetwork;
             cables.frustumCulled = false;
             (sink ? sink.group : scene).add(cables);
@@ -1762,6 +1775,8 @@ function displaySwitches(locId, dx, dz, sink) {
     // matte plastic base + a clearcoat layer for a slight gloss / rounded depth on the cables
     const material = new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: 0.6, metalness: 0.0, clearcoat: 0.6, clearcoatRoughness: 0.25 });
     const cables = new THREE.Mesh(geometry, material);
+    cables.castShadow = false;
+    cables.receiveShadow = true;
     cables.visible = options.showNetwork;
     cables.frustumCulled = false;
     (sink ? sink.group : scene).add(cables);
@@ -2998,6 +3013,8 @@ function setupControls() {
     }
     if (options.useFirstPerson === true) {
         controls = new FirstPersonControls(camera, renderer.domElement);
+        // r185 changed default dampingFactor from 0 to 0.1 — preserve instant-response camera feel
+        controls.dampingFactor = 1;
         if (instructions) instructions.style.display = "none";
         if (blocker) blocker.style.display = "none";
         detachKeyHandlers();
@@ -3383,14 +3400,26 @@ async function init() {
     light.position.set(0.5, 1, 0.75);
     scene.add(light);
     // soft directional light so cables (and racks) get specular highlights / depth, not flat ambient
-    const sun = new THREE.DirectionalLight(0xffffff, 1.1);
-    sun.position.set(60, 120, 40);
-    scene.add(sun);
+    _sunLight = new THREE.DirectionalLight(0xffffff, 1.1);
+    _sunLight.position.set(60, 120, 40);
+    // Phase 6: enable shadow casting
+    _sunLight.castShadow = true;
+    _sunLight.shadow.bias = -0.001;
+    _sunLight.shadow.normalBias = 0.02;
+    _sunLight.shadow.camera.near = 1;
+    _sunLight.shadow.camera.far = 500;
+    // Fit orthographic shadow camera to roomBounds in _fitShadowCamera()
+    scene.add(_sunLight);
+    scene.add(_sunLight.target); // target must be in scene for shadows to work
     // a big, glowing sun up in the sky (the directional light above is its illumination)
     const sunPos = new THREE.Vector3(560, 430, 360);
     sunCore = new THREE.Mesh(new THREE.SphereGeometry(42, 28, 20), new THREE.MeshBasicMaterial({ color: 0xfff4c8 }));
+    sunCore.castShadow = false;
+    sunCore.receiveShadow = false;
     sunCore.position.copy(sunPos); sunCore.frustumCulled = false; scene.add(sunCore);
     sunGlow = new THREE.Mesh(new THREE.SphereGeometry(80, 28, 20), new THREE.MeshBasicMaterial({ color: 0xffeeaa, transparent: true, opacity: 0.32, depthWrite: false }));
+    sunGlow.castShadow = false;
+    sunGlow.receiveShadow = false;
     sunGlow.position.copy(sunPos); sunGlow.frustumCulled = false; scene.add(sunGlow);
     // flat ambient fill -> overall brighter room + lifts dark undersides the hemisphere misses
     scene.add(new THREE.AmbientLight(0xfff6ec, 0.5));
@@ -3418,6 +3447,11 @@ async function init() {
     maxAnisotropy = renderer.getMaxAnisotropy ? renderer.getMaxAnisotropy()
                                               : renderer.capabilities.getMaxAnisotropy();
     _setupRendererSwitch();
+
+    // Phase 6: enable shadow rendering
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    _fitShadowCamera();
 
     // IDEA-2: WebGL context loss handling
     _animationLoopCb = animate;  // stored callback; honoured on restore
@@ -3848,6 +3882,18 @@ function onWindowResize() {
 function _drawCalls() {
     const r = renderer.info.render;
     return r.drawCalls !== undefined ? r.drawCalls : r.calls;
+}
+
+// --- fit orthographic shadow camera to roomBounds (Phase 6) ---
+function _fitShadowCamera() {
+    if (!_sunLight || !roomBounds) return;
+    const margin = 20; // extra margin so shadows aren't cut off at room edges
+    const cam = _sunLight.shadow.camera;
+    cam.left   = roomBounds.minX - margin;
+    cam.right  = roomBounds.maxX + margin;
+    cam.top    = roomBounds.maxZ + margin;
+    cam.bottom = roomBounds.minZ - margin;
+    cam.updateProjectionMatrix();
 }
 
 // --- renderer mode (?renderer=, resolved into the import map by the mode script in dc.html) ---
