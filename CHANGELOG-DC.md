@@ -42,6 +42,25 @@ Shadow rendering is now enabled in the WebGL renderer for realistic shadows from
 
 ---
 
+#### Step 6.2 — Add shadow controls to the settings panel
+
+Shadow rendering can now be toggled and configured via the lil-gui settings panel (Display folder).
+
+**Changes in `dc.js`:**
+
+| What | How |
+|------|-----|
+| `options.shadows` | New boolean option, default `true` |
+| `options.shadowQuality` | New string option, default `'Medium'` — Low=512 / Medium=1024 / High=2048 |
+| `setShadowsEnabled(bool)` | New function: sets `renderer.shadowMap.enabled` and marks all scene materials `needsUpdate` |
+| `setShadowMapSize(quality)` | New function: disposes old shadow map and recreates at 512/1024/2048 based on quality |
+| Display folder controls | Checkbox for `options.shadows` and dropdown for `options.shadowQuality` with Low/Medium/High |
+| `window.DC` exposure | `setShadowsEnabled` and `setShadowMapSize` exposed for testing |
+
+**Tests:** New Vitest test in `tests/js/dc-shadow-gui.test.js`
+
+---
+
 ### Bot Presence System (NEW FEATURE)
 
 When a real user joins DataCenter 3D, a simulated bot avatar is spawned that wanders around the datacenter. When the last real user leaves, the bot is cleaned up.

@@ -146,6 +146,8 @@ const S = {
     shadowsEnabled: false, // Phase 6: shadow map quality tier
 };
 let _shadowMapSize = 2048; // internal shadow map size state (applied when shadows are active)
+const UPGRADE_LOCKOUT_MS = 30000; // don't upgrade shadow map within 30s of a downgrade (oscillation guard)
+let _lastDowngradeAt = 0;         // timestamp of last shadow map or quality downgrade
 
 function _gridKey(x, z) {
     return Math.floor(x / _gridCellSize) + ',' + Math.floor(z / _gridCellSize);
@@ -306,6 +308,8 @@ const options = {
 	waistInches: 36,    // player waist size -> collision radius: 15" .. 60", default 36"
 	scaleX: 8,  // Scale factor for x position
 	scaleZ: 9,  // Scale factor for z position
+	shadows: true,        // shadow rendering toggle (checkbox in Display folder)
+	shadowQuality: 'Medium', // Low=512 / Medium=1024 / High=2048
 };
 const clock = new THREE.Clock();
 const velocity = new THREE.Vector3();
@@ -441,23 +445,24 @@ function _autoQualityScale(now) {
 }
 
 function _reduceQuality() {
-    // Step 1: reduce pixel scale (renderer resolution)
-    if (S.pixelScale > 0.5) {
-        S.pixelScale = Math.max(0.5, S.pixelScale - 0.25);
-        if (renderer) {
-            renderer.setPixelRatio(Math.min(window.devicePixelRatio * S.pixelScale, 2));
-        }
-        _notifyQualityChange('pixelScale', S.pixelScale);
-        return;
-    }
-
-    // Step 2: halve the shadow map size — Phase 6
+    // Step 1: halve the shadow map size — Phase 6.3 (tried first, before pixelScale)
     if (S.shadowsEnabled && _shadowMapSize >= 1024) {
         _shadowMapSize = Math.max(512, _shadowMapSize / 2);
         S.shadowMapSize = _shadowMapSize;
         // Re-configure the active shadow lights with the new map size
         _applyShadowMapSize();
         _notifyQualityChange('shadowMap', _shadowMapSize);
+        _lastDowngradeAt = Date.now();
+        return;
+    }
+
+    // Step 2: reduce pixel scale (renderer resolution)
+    if (S.pixelScale > 0.5) {
+        S.pixelScale = Math.max(0.5, S.pixelScale - 0.25);
+        if (renderer) {
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio * S.pixelScale, 2));
+        }
+        _notifyQualityChange('pixelScale', S.pixelScale);
         return;
     }
 
@@ -474,15 +479,6 @@ function _upgradeQuality() {
         return;
     }
 
-    // Reverse Step 2: double the shadow map size — Phase 6
-    if (S.shadowsEnabled && _shadowMapSize <= 1024) {
-        _shadowMapSize = Math.min(2048, _shadowMapSize * 2);
-        S.shadowMapSize = _shadowMapSize;
-        _applyShadowMapSize();
-        _notifyQualityChange('shadowMap', _shadowMapSize);
-        return;
-    }
-
     // Reverse Step 1: increase pixel scale
     if (S.pixelScale < 1.0) {
         S.pixelScale = Math.min(1.0, S.pixelScale + 0.25);
@@ -490,6 +486,18 @@ function _upgradeQuality() {
             renderer.setPixelRatio(Math.min(window.devicePixelRatio * S.pixelScale, 2));
         }
         _notifyQualityChange('pixelScale', S.pixelScale);
+        return;
+    }
+
+    // Reverse Step 2: double the shadow map size — Phase 6.3 (last, with oscillation lockout)
+    if (S.shadowsEnabled && _shadowMapSize <= 1024) {
+        if (Date.now() - _lastDowngradeAt < UPGRADE_LOCKOUT_MS) {
+            return; // lockout: don't upgrade shadow map within 30s of a downgrade
+        }
+        _shadowMapSize = Math.min(2048, _shadowMapSize * 2);
+        S.shadowMapSize = _shadowMapSize;
+        _applyShadowMapSize();
+        _notifyQualityChange('shadowMap', _shadowMapSize);
         return;
     }
 }
@@ -549,6 +557,33 @@ function setNetworkVisible(visible) {
     for (const b of lodBuildings) if (b.full && b.full.network) b.full.network.visible = visible;   // full neighbours' cabling too
 }
 
+// Step 6.2: Enable/disable shadow rendering and update all materials
+function setShadowsEnabled(bool) {
+    renderer.shadowMap.enabled = bool;
+    // Mark all materials as needing update to reflect shadow state change
+    scene.traverse((obj) => {
+        if (obj.isMesh && obj.material) {
+            const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+            for (const m of mats) m.needsUpdate = true;
+        }
+    });
+}
+
+// Step 6.2: Change shadow map resolution (Low=512, Medium=1024, High=2048)
+function setShadowMapSize(quality) {
+    const sizeMap = { 'Low': 512, 'Medium': 1024, 'High': 2048 };
+    const size = sizeMap[quality] || 1024;
+    // Dispose old shadow map and force recreation at new resolution
+    if (_sunLight && _sunLight.shadow) {
+        if (_sunLight.shadow.map) {
+            _sunLight.shadow.map.dispose();
+            _sunLight.shadow.map = null;
+        }
+        _sunLight.shadow.mapSize.set(size, size);
+        _sunLight.shadow.camera.updateProjectionMatrix();
+    }
+}
+
 // Refresh the x/y/z controllers' labels with the live camera position (throttled; programmatic camera
 // moves don't fire onChange). Deliberately not the Inspector's own .listen() label loop — that one is
 // per-frame and cannot be cancelled.
@@ -581,6 +616,8 @@ function displayGui() {
     fc.label('faulty lights', options.faultyLights + '%');
     displayFolder.add(options, 'disco').name('disco').onChange((v) => { if (!v) resetDisco(); });   // unchecked default; cycles each fixture's colour
     displayFolder.add(options, 'useFirstPerson').onChange( () => { setupControls(); });
+    displayFolder.add(options, 'shadows').name('shadows').onChange((v) => { setShadowsEnabled(v); });
+    displayFolder.add(options, 'shadowQuality', ['Low', 'Medium', 'High']).name('shadow quality').onChange((v) => { setShadowMapSize(v); });
     const moveFolder = gui.addFolder( 'Movement' );
     // live camera position. value lives in the LEFT label (the right number box is hidden via css);
     // refreshed by updateGuiPos() each frame since programmatic camera moves don't fire onChange.
@@ -4080,6 +4117,9 @@ window.DC = {
         return { ...S, _fps };
     },
     bench: bench,   // await DC.bench(seconds) — renderer A/B/C harness, see docs/dc_renderer_modes.md
+    // --- Step 6.2 shadow controls (exposed for testing) ---
+    setShadowsEnabled: setShadowsEnabled,
+    setShadowMapSize: setShadowMapSize,
     // --- multi-building LOD + walk-between handles (used by dc-multi.js; inert for dc.html) ---
     collideWorld: collideWorld,                 // walls + current racks + neighbours' active interiors
     get buildings() { return dcBuildings; },    // wall/door rects for every building (current + neighbours)
