@@ -942,17 +942,42 @@ function notice(text, ms = 12000) {
     if (ms > 0) _noticeTimer = setTimeout(() => { _noticeTimer = null; notice(''); }, ms);
 }
 
-function loadGlbWithFallback(basePath, relName, onLoad) {
-    // Index 0 of rackTypes/serverTypes is the empty-string placeholder for "no model", and neither
-    // getRackModels()/getServerModels() nor loadRackType()/loadServerType() screen for it — the latter
-    // two only reject an index that is missing entirely. A payload carrying type 0 therefore arrives
-    // here with nothing to fetch, and unguarded that is three doomed requests (<basePath>.glb,
-    // <basePath>meshopt/.glb, <basePath>webp-simplify/.glb) landing in the all-variants-failed branch,
-    // which now reaches the user through notice() — a "some 3D models failed to load" banner about a
-    // model nobody asked for. Warn once for the type instead; callers already tolerate onLoad never
-    // firing (loadBuildingModels' 12s race guard covers the promise that never settles).
+// Resolve a rack/server TYPE index to the model name to fetch, or null when there is nothing to
+// fetch. Two very different cases both land on null and must stay distinguishable:
+//   - index 0 is the deliberate "no model" placeholder ('' in rackTypes, ['',1] in serverTypes).
+//     A payload may legitimately carry it, so it is skipped SILENTLY.
+//   - an index past the end of the array is bad inventory data. /ajax/datacenter.php's ?test=1
+//     grid emitted server type 22 against a 22-entry serverTypes (max index 21), and
+//     getServerModels()'s destructuring of the resulting undefined threw a TypeError that took
+//     displayDatacenter() down with it — no switches, no community, no key handlers, loading
+//     curtain never lifted. Warn and skip; a scene missing one model beats no scene.
+// Neither case is a load FAILURE, so neither may reach notice() — that banner is reserved for
+// GLBs that were actually requested and 404'd.
+function rackModelName(t) {
+    const name = rackTypes[t];
+    if (name === undefined) { console.warn('[dc] Unknown rack type', t, '— skipping'); return null; }
+    return name || null;
+}
+function serverModelName(t) {
+    const entry = serverTypes[t];
+    if (entry === undefined) { console.warn('[dc] Unknown server type', t, '— skipping'); return null; }
+    return entry[0] || null;
+}
+
+function loadGlbWithFallback(basePath, relName, onLoad, onGiveUp) {
+    // onGiveUp fires on every path that will NOT produce a model — a missing name and the
+    // all-variants-failed branch — so a caller awaiting this load always gets an answer. Without it
+    // loadRackType()/loadServerType() resolved only from onLoad, and one skipped or 404'd model in a
+    // neighbouring building parked loadBuildingModels() on its full 12s Promise.race timeout before
+    // the building could swap to full detail. The timeout stays as a backstop, not as the normal path.
+    // The name guard below is a backstop too: rackModelName()/serverModelName() screen index 0 (the
+    // empty-string placeholder) out before it gets here, and it must stay screened — unguarded it is
+    // three doomed requests (<basePath>.glb, <basePath>meshopt/.glb, <basePath>webp-simplify/.glb)
+    // landing in the failure branch, i.e. a user-facing "some 3D models failed to load" banner about a
+    // model nobody asked for.
     if (!relName) {
         console.warn('[dc] Skipping GLB load with no model name for', basePath);
+        if (onGiveUp) onGiveUp();
         return;
     }
     let i = 0;
@@ -964,6 +989,7 @@ function loadGlbWithFallback(basePath, relName, onLoad) {
             ? (err) => {
                 console.error('[dc] All GLB variants failed for', basePath, relName, err);
                 notice('Warning: Some 3D models failed to load — scene may be incomplete');
+                if (onGiveUp) onGiveUp();
             }
             : tryNext);
     };
@@ -1062,7 +1088,7 @@ function buildInstanced(model, placements, kind, sink) {
 }
 
 function getRackModels() {
-	let idx, modelName;
+	let idx;
 	const usedRacksSet = new Set();
 	let usedRacks;
 	usedRacksSet.clear();
@@ -1072,12 +1098,14 @@ function getRackModels() {
 	usedRacks = Array.from(usedRacksSet);
 	//console.log(usedRacks);
 	usedRacks.forEach((idx) => {
-		modelName = rackTypes[idx];
 		if (typeof models.racks[idx] == 'undefined') {
-			//console.log("Loading Rack "+modelName);
+			//console.log("Loading Rack "+idx);
 			// Create a closure to capture the current value of idx
 			(function (modelIdx) {
-				const currentModel = rackTypes[modelIdx];
+				// Same screen loadRackType() has always had, which this loader was missing: a type
+				// with no model of its own is skipped, not handed to the loader.
+				const currentModel = rackModelName(modelIdx);
+				if (currentModel === null) return;
 				loadGlbWithFallback(dcUrl('/images/3d/racks/'), currentModel, function (gltf) {
 						const scale = 10;
 						const rotationAngle = Math.PI / 2; // 90 degrees in radians
@@ -1129,8 +1157,10 @@ function getServerModels() {
 		if (typeof models.servers[idxServer] == 'undefined') {
 			// Create a closure to capture the current value of idx
 			(function (modelIdx) {
-				let currentModel, currentUnits;
-				[currentModel, currentUnits] = serverTypes[modelIdx];
+				// Was an unguarded destructure of the raw serverTypes entry; a type the array has
+				// no entry for threw out of the forEach and killed the rest of displayDatacenter().
+				const currentModel = serverModelName(modelIdx);
+				if (currentModel === null) return;
                 //console.log("Loading Server "+currentModel);
 				//loaderDae.load('https://'+options.domain+'/images/3d/servers/dae/'+currentModel+'/model.dae', function (collada) {
 				loadGlbWithFallback(dcUrl('/images/3d/servers/gltf/exported-centered/'), currentModel, function (gltf) {
@@ -2342,20 +2372,24 @@ function collideWorld(x, z, r) {
 // current building and neighbours, so any type a neighbour needs is fetched once and shared thereafter.
 function loadRackType(t) {
 	return new Promise((res) => {
-		if (models.racks[t] !== undefined || rackTypes[t] === undefined) return res();
-		loadGlbWithFallback(dcUrl('/images/3d/racks/'), rackTypes[t], (gltf) => {
+		if (models.racks[t] !== undefined) return res();
+		const name = rackModelName(t);
+		if (name === null) return res();          // nothing to fetch -> settle now, don't wait out the race below
+		loadGlbWithFallback(dcUrl('/images/3d/racks/'), name, (gltf) => {
 			const model = gltf.scene; model.traverse((n) => { if (n.isMesh) { n.castShadow = true; n.receiveShadow = true; } });
 			models.racks[t] = extractModelMeshes(model, 10); res();
-		});
+		}, res);                                  // every variant 404'd: already logged + noticed, just stop blocking
 	});
 }
 function loadServerType(t) {
 	return new Promise((res) => {
-		if (models.servers[t] !== undefined || serverTypes[t] === undefined) return res();
-		loadGlbWithFallback(dcUrl('/images/3d/servers/gltf/exported-centered/'), serverTypes[t][0], (gltf) => {
+		if (models.servers[t] !== undefined) return res();
+		const name = serverModelName(t);
+		if (name === null) return res();
+		loadGlbWithFallback(dcUrl('/images/3d/servers/gltf/exported-centered/'), name, (gltf) => {
 			const model = gltf.scene; model.traverse((n) => { if (n.isMesh) { n.castShadow = true; n.receiveShadow = true; } });
 			models.servers[t] = extractModelMeshes(model, 10); res();
-		});
+		}, res);
 	});
 }
 // Ensure every rack + server type used by location `id` is loaded, then call cb. The 12s race guard means
