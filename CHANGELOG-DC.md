@@ -107,6 +107,25 @@ Investigated `PCFSoftShadowMap` support on the WebGPU renderer path in three.js 
 - `docs/dc_renderer_modes.md` — added shadow map type row to the comparison table
 - `CHANGELOG-DC.md` — this entry
 
+#### Reduce Shadow Cost by Excluding Unnecessary Casters (Step 6.5)
+
+Optimized shadow rendering by excluding unnecessary shadow casters, reducing GPU cost.
+
+**Shadow Policy:**
+
+| Object type | `castShadow` | `receiveShadow` | Reason |
+|-------------|--------------|-----------------|--------|
+| Sun core & glow | `false` | `false` | Decorative; directional light drives scene illumination |
+| Cables | `false` | `true` | Thin geometry; receive shadows from racks/servers |
+| Racks & servers | `true` | `true` | Primary scene objects; cast and receive shadows |
+
+**Changes:**
+
+- `public_html/js/dc.js` — added `applyShadowPolicy(root)` helper; set `castShadow = false, receiveShadow = false` on `sunCore` and `sunGlow` after creation; set `castShadow = false, receiveShadow = true` on all cable meshes (2 sites: async and sync paths)
+- `tests/js/dc-shadow-policy.test.js` — new test verifying shadow policy via source-code pattern matching
+
+**Tests:** New shadow policy tests in `tests/js/dc-shadow-policy.test.js`
+
 ### Comprehensive Audit Fixes (2026-07-29)
 
 A full code audit was performed across all DataCenter 3D frontend modules (`dc.js`, `dc-ws.js`, `dc-presence.js`, `dc-multi.js`) and the backend Events.php handler. All critical, major, minor, and bug-level fixes have been applied and committed.
