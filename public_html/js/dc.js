@@ -3576,7 +3576,7 @@ async function init() {
         renderer.domElement.addEventListener('webglcontextrestored', () => {
             console.warn('WebGL context restored - rebuilding scene');
             _contextLost = false;
-            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio * S.pixelScale, 2));
             renderer.setSize(window.innerWidth, window.innerHeight);
             clearScene();
             displayDatacenter();
@@ -3839,7 +3839,7 @@ function onWindowResize() {
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
     // Also re-apply pixel ratio cap in case devicePixelRatio changed (e.g., moving between displays)
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio * S.pixelScale, 2));
 }
 
 // Draw calls for the frame just rendered. The node renderer redefined info.render.calls as the
@@ -4033,7 +4033,16 @@ window.DC = {
     // --- multi-building LOD + walk-between handles (used by dc-multi.js; inert for dc.html) ---
     collideWorld: collideWorld,                 // walls + current racks + neighbours' active interiors
     get buildings() { return dcBuildings; },    // wall/door rects for every building (current + neighbours)
-    setLodFocus: function (x, z) { lodFocus = { x, z }; _tickSkippedFrames = 0; _skipExpensiveUpdates = false; },   // dc-multi feeds the player ground pos each frame
+    setLodFocus: function (x, z) {
+        const moved = !lodFocus || Math.abs(x - lodFocus.x) > 0.01 || Math.abs(z - lodFocus.z) > 0.01;
+        lodFocus = { x, z };
+        // Only reset idle skip when position actually changes — prevents setLodFocus (called every
+        // frame from dc-multi.js) from suppressing the idle-skip before it can trigger (F-17)
+        if (moved) {
+            _tickSkippedFrames = 0;
+            _skipExpensiveUpdates = false;
+        }
+    },
     setAnimationLoop: function (cb) {
         _animationLoopCb = cb || animate;
         if (renderer) renderer.setAnimationLoop(_guardLoop(_animationLoopCb));
