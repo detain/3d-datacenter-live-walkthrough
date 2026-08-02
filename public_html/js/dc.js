@@ -1442,10 +1442,18 @@ function updateLabels() {
             distSq: s.position.distanceToSquared(_labelCamPos),
         }));
         withDist.sort((a, b) => a.distSq - b.distSq);
-        // Mark all beyond MAX_LABELS as not-to-render, so updateLabels below skips them
-        for (let i = MAX_LABELS; i < withDist.length; i++) {
-            withDist[i].sprite.userData.dePrioritized = true;
+        // Start at 0 and assign the flag BOTH ways. The old loop started at MAX_LABELS and
+        // only ever set it true, and nothing anywhere set it false again — so the first frame
+        // a label fell outside the nearest 200 it was hidden for the rest of the session, even
+        // at point-blank range. In a room with 3137 labels that meant every label died within
+        // seconds of walking.
+        for (let i = 0; i < withDist.length; i++) {
+            withDist[i].sprite.userData.dePrioritized = (i >= MAX_LABELS);
         }
+    } else {
+        // Below the cap nothing is de-prioritised; clear any flag left over from a frame
+        // when the count was higher (e.g. after a neighbouring building unloaded).
+        for (const s of allLabels) s.userData.dePrioritized = false;
     }
 
     for (const arr of [objects.labels, objects.rackLabels]) {
