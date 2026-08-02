@@ -233,6 +233,41 @@ whenReady(async () => {
   document.addEventListener('dc:context-restored', _onContextRestored);
 });
 
+/**
+ * Load animation clips with a bounded number of requests in flight.
+ *
+ * The previous code fired every clip request in a single tick with no limit. Even after
+ * filtering to playable labels that is ~25 simultaneous fetches competing with the rack
+ * and server GLB loads and the inventory JSON, on a page whose whole problem is boot
+ * time. Four at a time keeps the connection busy without starving the rest of the boot.
+ *
+ * @param {Array<Object>} clips   manifest entries, each with .clip (url) and .label
+ * @param {string} cacheBuster    query string appended to each url (may be '')
+ * @param {THREE.AnimationMixer} myMixer  the mixer that owned the character when the
+ *        load started; a late clip must not attach to a different character
+ * @param {number} limit          maximum requests in flight
+ * @returns {Promise<void>} resolves when every clip has settled (success or failure)
+ */
+async function loadClipsPooled(clips, cacheBuster, myMixer, limit = 4) {
+  const queue = clips.slice();
+  const worker = async () => {
+    while (queue.length) {
+      const a = queue.shift();
+      try {
+        const ag = await S.loader.loadAsync(a.clip + cacheBuster);
+        if (S.mixer !== myMixer) return;
+        const clip = ag.animations && ag.animations[0];
+        if (clip) S.actions[a.label || clip.name] = makeAction(clip, a);
+      } catch (e) {
+        log('failed clip', a.clip, e);
+      }
+    }
+  };
+  const workers = [];
+  for (let i = 0; i < Math.min(limit, clips.length); i++) workers.push(worker());
+  await Promise.all(workers);
+}
+
 // ---------------------------------------------------------------- character
 async function loadCharacter(ch) {
   S.loadedCharId = ch.id;                           // remembered for the (deferred) GUI dropdown default
@@ -308,13 +343,9 @@ async function loadCharacter(ch) {
   if (playable.length === 0 && allClips.length > 0) {
     console.warn('[dc-multi] character', ch.name, 'has', allClips.length, 'clips but none carry a playable label — only idle will work');
   }
-  for (const a of playable) {
-    S.loader.loadAsync(a.clip + cb).then((ag) => {
-      if (S.mixer !== myMixer) return;                 // character changed while this clip loaded
-      const clip = ag.animations && ag.animations[0];
-      if (clip) S.actions[a.label || clip.name] = makeAction(clip, a);
-    }).catch((e) => log("failed clip", a.clip, e));
-  }
+  // Deliberately not awaited: the character appears as soon as its skinned base GLB is
+  // in, and the gesture clips stream in behind it.
+  loadClipsPooled(playable, cb, myMixer, 4);
 }
 
 function makeAction(clip, meta) {
@@ -967,6 +998,8 @@ function exposeDebug() {
     _S: S,
     /** loadCharacter — used exclusively by the animation-filter unit test */
     loadCharacter,
+    /** loadClipsPooled — used exclusively by the animation-filter unit test */
+    loadClipsPooled,
     /**
      * Live movement state. getState() above is the stable three-field summary the console helpers and
      * dc-presence read; this is the raw locomotion state (mode/vy/facing/camDist) that

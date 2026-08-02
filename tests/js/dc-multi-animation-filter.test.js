@@ -267,4 +267,83 @@ describe('dc-multi.js — loadCharacter() animation filtering', () => {
     expect(MULTI_SOURCE).toContain('allClips.filter');
     expect(MULTI_SOURCE).toContain('PLAYABLE_LABELS.has');
   });
+
+  it('loadClipsPooled caps concurrency at the given limit', async () => {
+    // Build 10 fake clips
+    const clips = Array.from({ length: 10 }, (_, i) => ({
+      clip: `/clip_${i}.glb`,
+      label: 'idle',
+    }));
+
+    const DCM = globalThis.DCM;
+    const S = DCM._S;
+
+    // Track how many calls are in-flight at any moment using a controlled semaphore.
+    // Each call to loadAsync increments inFlight; resolving the promise decrements it.
+    let maxInFlight = 0;
+    let currentInFlight = 0;
+    const originalLoadAsync = S.loader.loadAsync.bind(S.loader);
+
+    S.loader.loadAsync = vi.fn().mockImplementation(() => {
+      currentInFlight++;
+      maxInFlight = Math.max(maxInFlight, currentInFlight);
+      // Return a promise that does NOT resolve immediately — that is the key to
+      // testing concurrency: we stall the first `limit` calls so we can observe
+      // that no more than `limit` are started before any of them resolve.
+      return new Promise((resolve) => {
+        // Defer the resolve to a future tick so the workers' inner loop can run,
+        // but leave the promise pending so in-flight stays high.
+        setTimeout(() => resolve(fakeGltf([{ name: 'test_clip', duration: 1 }])), 100);
+      });
+    });
+
+    // Call loadClipsPooled with limit=4 and 10 clips (NOT awaited — fire and check)
+    DCM.loadClipsPooled(clips, '', S.mixer, 4);
+
+    // Allow the event loop to breathe so the worker coroutines spin up
+    await new Promise((r) => setTimeout(r, 10));
+
+    // With limit=4 and 4 workers, at most 4 calls should have been made at this point
+    expect(maxInFlight).toBeLessThanOrEqual(4);
+    expect(S.loader.loadAsync).toHaveBeenCalledTimes(4);
+
+    // Now let the stalled promises resolve — this should allow more calls to start
+    // Wait for the 100ms setTimeout to fire plus a buffer for the resolve callbacks
+    await new Promise((r) => setTimeout(r, 200));
+
+    // All 10 should have been attempted once the stalled ones resolved
+    expect(S.loader.loadAsync).toHaveBeenCalledTimes(10);
+
+    // Cleanup
+    S.loader.loadAsync = originalLoadAsync;
+  });
+
+  it('loadClipsPooled does not stop other clips when one rejects', async () => {
+    const clips = [
+      { clip: '/clip_0.glb', label: 'idle' },
+      { clip: '/clip_1.glb', label: 'walk' },
+      { clip: '/clip_2.glb', label: 'run' },
+    ];
+
+    const DCM = globalThis.DCM;
+    const S = DCM._S;
+
+    let callCount = 0;
+    const loadAsyncMock = vi.fn().mockImplementation((url) => {
+      callCount++;
+      if (url.includes('clip_1')) {
+        return Promise.reject(new Error('network error'));
+      }
+      return Promise.resolve(fakeGltf([{ name: 'test_clip', duration: 1 }]));
+    });
+    const originalLoadAsync = S.loader.loadAsync.bind(S.loader);
+    S.loader.loadAsync = loadAsyncMock;
+
+    await DCM.loadClipsPooled(clips, '', S.mixer, 4);
+
+    // All 3 clips should have been attempted despite the rejection of clip_1
+    expect(loadAsyncMock).toHaveBeenCalledTimes(3);
+
+    S.loader.loadAsync = originalLoadAsync;
+  });
 });
