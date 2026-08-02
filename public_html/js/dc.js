@@ -1554,16 +1554,17 @@ function displaySwitches(locId, dx, dz, sink) {
     locId = (locId === undefined) ? options.location : locId;
     dx = dx || 0; dz = dz || 0;
     const intraOnly = !!sink;   // neighbours: only draw cables whose endpoints are inside THIS building
-    const cacheKey = sink ? locId + ':n' : locId;  // cache main and neighbour cable geometry separately
-    const racks = (locations[locId] || {}).racks; if (!racks) return;
 
     // IDEA-4: Cable geometry LOD — reduce tubular segments when camera is far (overview mode)
     const camY = camera ? camera.position.y : 0;
     const farFromCables = camY > 25;
     const maxTubular = farFromCables ? 40 : 220;
 
+    const cacheKey = (sink ? locId + ':n' : locId) + ':' + maxTubular;  // cache main and neighbour cable geometry separately (LOD-aware)
+    const racks = (locations[locId] || {}).racks; if (!racks) return;
+
     // Fix #10: Cache cable geometry per location (main and neighbours separately, not LOD-reduced)
-    if (!farFromCables && _cableGeometryCache.has(cacheKey)) {
+    if (_cableGeometryCache.has(cacheKey)) {
         const cached = _cableGeometryCache.get(cacheKey);
         // Reuse cached merged geometry (clone so dispose doesn't affect cache)
         const geo = cached.geometry.clone();
