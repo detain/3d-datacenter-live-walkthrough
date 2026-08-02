@@ -286,9 +286,19 @@ async function loadCharacter(ch) {
       }
     });
   }
+  // Preserve old actions for proper mixer cleanup (must happen before S.actions is cleared)
+  const oldActions = S.actions;
   S.actions = {}; S.current = null;
   if (S.mixer) {
     S.mixer.stopAllAction();
+    // F-14: uncache all previously-cached actions from the old mixer to prevent memory leak.
+    // stopAllAction() halts animations but does not release AnimationClip data cached in the mixer.
+    for (const action of Object.values(oldActions)) {
+      if (action && typeof action.getClip === 'function') {
+        const clip = action.getClip();
+        if (clip) S.mixer.uncacheAction(clip);
+      }
+    }
     if (S.model) S.mixer.uncacheRoot(S.model);
     S.mixer = null;
   }
@@ -680,7 +690,12 @@ function trySpawn(x, z, facing) {
       if (o.geometry) o.geometry.dispose();
       if (o.isMesh) {
         const mats = Array.isArray(o.material) ? o.material : [o.material];
-        mats.forEach(m => { if (m.map) m.map.dispose(); m.dispose(); });
+        mats.forEach(m => {
+          // F-15: don't dispose cached/shared materials — they are reused across all doors
+          // _cachedGlassMaterial is reused by every door pane; _cachedLogoTexture by every logo plane
+          if (m.map && m.map !== _cachedLogoTexture) m.map.dispose();
+          if (m !== _cachedGlassMaterial) m.dispose();
+        });
       }
     });
     S.scene.remove(S.door.group);
