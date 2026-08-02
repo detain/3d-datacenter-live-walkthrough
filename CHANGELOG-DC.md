@@ -119,6 +119,21 @@ Added a capacity overlay system that tints rack InstancedMeshes with a red→amb
 
 ### Phase 8
 
+#### Step 8.2 — Register KTX2Loader for compressed texture support
+
+Added `KTX2Loader` registration on the shared `GLTFLoader` instance (`loaderGltf`) to enable GPU-native transcoding of UASTC/ETC1S-compressed textures. The loader is configured with the Basis Universal transcoder path and `detectSupport(renderer)` is called to probe hardware capabilities.
+
+**Changes:**
+
+| File | Change |
+|------|--------|
+| `public_html/js/dc.js` | Imported `KTX2Loader`; registered `loaderGltf.ktx2Loader = new KTX2Loader()`; set transcoder path to `/node_modules/three/examples/jsm/libs/basis/`; called `detectSupport(renderer)` |
+| `docs/dc_asset_pipeline.md` | New document describing the KTX2 conversion pipeline using `gltf-transform cli uastc/etc1s`, noting that `public_html/images/3d/` is gitignored |
+
+**Tests:** New Vitest test in `tests/js/dc-ktx2.test.js` verifying KTX2Loader registration, detectSupport call, and documentation
+
+---
+
 #### Step 8.3 — Reduce the cable triangle bill
 
 Lowered cable geometry LOD to reduce draw call triangle count without visible quality loss at typical viewing distances.

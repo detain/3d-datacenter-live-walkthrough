@@ -13,6 +13,7 @@ import * as THREE from "three";
 import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
 import { FirstPersonControls } from "three/addons/controls/FirstPersonControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 // Relative, but with the cache-buster spelled out: a bare "./dc-gui.js" would resolve against
 // dc.js's own URL and drop the ?v=, so the adapter would go on being served from cache after an
 // edit that only bumped the <script> tags. dc.html modulepreloads the same URL.
@@ -22,6 +23,11 @@ import Stats from "three/addons/libs/stats.module.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import * as BufferGeometryUtils from "three/addons/utils/BufferGeometryUtils.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+import { computeBoundsTree, disposeBoundsTree } from "three-mesh-bvh";
+
+// Step 8.1: Patch BufferGeometry.prototype with BVH加速 raycasting
+BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
+BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 let camera, scene, renderer, controls, controlObject, stats, inspector, gui, locations = {}, maxAnisotropy; // Declare global variables
 let caps = null; // Step 7.1: renderer capability descriptor
 let _postProcessing = null; // Step 7.4: TSL postprocessing pipeline (WebGPU AO via GTAONode)
@@ -1522,6 +1528,7 @@ function extractModelMeshes(root, scale) {
         if (n.isMesh && n.geometry) {
             parts.push({ geometry: n.geometry, material: n.material, matrix: n.matrixWorld.clone() });
             if (!n.geometry.boundingBox) n.geometry.computeBoundingBox();
+            n.geometry.computeBoundsTree(); // Step 8.1: BVH加速 raycasting
             _b.copy(n.geometry.boundingBox).applyMatrix4(n.matrixWorld);
             box.union(_b);
         }
@@ -3874,6 +3881,11 @@ async function init() {
 
     // Step 7.1: capture renderer capabilities for use throughout the module
     caps = describeRenderer(renderer);
+
+    // Step 8.2: register KTX2Loader for compressed texture support (UASTC/ETC1S)
+    loaderGltf.ktx2Loader = new KTX2Loader();
+    loaderGltf.ktx2Loader.setTranscoderPath('/node_modules/three/examples/jsm/libs/basis/');
+    loaderGltf.ktx2Loader.detectSupport(renderer);
 
     // Step 7.4: set up WebGPU TSL postprocessing (GTAONode) if on the WebGPU path
     if (caps.backend === 'WebGPURenderer') {
