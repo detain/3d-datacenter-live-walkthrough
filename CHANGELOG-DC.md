@@ -47,6 +47,19 @@ Rewrote `showInfo()` in `dc.js` to display more asset information when a server 
 
 ---
 
+#### Step 9.3 — Deep links into the scene
+
+Added support for `?location=`, `?rack=`, and `?asset=` URL parameters to deep-link directly into the 3D scene. `_readDeepLink()` reads and parses URL params early in `init()` (before room build) using `Number()` coercion for safety. `_applyDeepLinkTarget()` is called after `displayDatacenter()` in the load chain and handles: `?location=X` switches to that location if not already there; `?rack=X` flies the camera to that rack; `?asset=X` searches the current location's racks for the asset and flies to it. Added `_copyDeepLink()` and a "Copy Link" button in the info panel (both server and rack cases) that copies the current URL with appropriate `location=`, `rack=`, and `asset=` params to clipboard.
+
+| File | What Changed |
+|------|-------------|
+| `public_html/js/dc.js` | Added `_readDeepLink()`, `_applyDeepLinkTarget()`, `flyToRackPosition()`, `_copyDeepLink()`; modified `loadDatacenter()` to use deep link location for initial fetch and call `_applyDeepLinkTarget()` at end of promise chain; added copy button to `showInfo()` for both server and rack cases |
+| `tests/js/dc-deep-link.test.js` | New Vitest test verifying URL param parsing, Number() coercion, deep link application logic, and copy link button presence |
+
+**Tests:** New Vitest test in `tests/js/dc-deep-link.test.js`
+
+---
+
 #### Step 9.5 — The "isolate" render pass
 
 Added `setIsolate(keepSet)` / `clearIsolate()` functionality for highlighting specific objects by dimming everything else. The isolate mechanism works with a `Set` of object identifiers (mesh `id` values). Calling `setIsolate(keepSet)` dims all transparent meshes NOT in the keepSet to 0.3 opacity while preserving original opacity values. `clearIsolate()` restores all meshes to their original opacity and clears the state. The isolate state is automatically cleared on `clearScene()` and when the Escape key is pressed.
@@ -72,6 +85,22 @@ Added cable tracing functionality to visualize individual cable routes in the 3D
 | `public_html/js/dc.js` | Added `_cableRoutes` Map (stores route points per `switchId:portId`); added `_portsByAsset` Map (reverse index `assetId → [{switchId, portId, port, sw}]`); added `buildPortsByAsset(locId)` to build the reverse index; modified `displaySwitches` to capture route points in `addCable`; added `traceCable(routeKey)` to draw the trace overlay; added `clearTrace()` to remove overlay; added `traceCableForAsset(assetId)` helper; modified `showInfo` to show trace button for connected assets; `displayDatacenter` calls `buildPortsByAsset` before `displaySwitches`; all new functions exported on `window.DC` |
 
 **Tests:** New Vitest test in `tests/js/dc-cable-trace.test.js`
+
+---
+
+#### Step 9.7 — Free-U capacity overlay
+
+Added a capacity overlay system that tints rack InstancedMeshes with a red→amber→green color ramp based on available U slots. When "Free U" overlay is selected from the Display dropdown, each rack is colored by its free capacity: red (0% free/full), amber (50% free), green (100% free/empty).
+
+**Changes:**
+
+| File | Change |
+|------|--------|
+| `public_html/js/dc.js` | Added `options.overlay` ('none'\|'freeU'); added `OVERLAY_SOURCES` registry (`{none: null, freeU: computeFreeU}`); added `computeFreeU()` function returning `Map<rackId, 0..1>`; added `applyOverlay()` to tint rack InstancedMeshes via `setColorAt()`; added `_resetInstanceColors()` helper; GUI dropdown added to Display folder with `onChange` calling `applyOverlay()`; `applyOverlay()` called after each `displayRacks()`/`displayServers()` call and in `flyTransition` callback |
+| `public_html/css/dc-shared.css` | Added `#dcOverlayLegend` styles (hidden by default, shown via `.visible` class); `.legend-swatch.full/half/empty` with red/amber/green colors |
+| `public_html/admin/dc.html` | Added `#dcOverlayLegend` div with "Free U Capacity" title and three swatch rows |
+
+**Tests:** New Vitest test in `tests/js/dc-overlay.test.js` verifying OVERLAY_SOURCES registry, computeFreeU() return type and value range, GUI dropdown presence, and CSS legend rules.
 
 ---
 

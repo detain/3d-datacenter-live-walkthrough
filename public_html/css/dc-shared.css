@@ -130,3 +130,16 @@ body.dc-has-inspector #dcWsToggle { top: 62px; }
 .dc-info-row { margin: 3px 0; color: #ccc; font-size: 13px; }
 .dc-info-links { margin-top: 6px; }
 .dc-info-links a { display: inline-block; margin-right: 10px; }
+
+/* --- Step 9.7: Capacity overlay legend --- */
+#dcOverlayLegend { position: fixed; bottom: 16px; right: 16px; z-index: 31;
+	display: none; padding: 10px 14px; background: rgba(20,20,28,0.88);
+	color: #fff; border-radius: 6px; font: 12px Arial, sans-serif;
+	box-shadow: 0 2px 8px rgba(0,0,0,0.4); }
+#dcOverlayLegend.visible { display: block; }
+#dcOverlayLegend .legend-title { font-weight: bold; margin-bottom: 6px; font-size: 13px; }
+#dcOverlayLegend .legend-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+#dcOverlayLegend .legend-swatch { width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0; }
+#dcOverlayLegend .legend-swatch.full { background: #ff0000; }
+#dcOverlayLegend .legend-swatch.half { background: #ffaa00; }
+#dcOverlayLegend .legend-swatch.empty { background: #00ff00; }
