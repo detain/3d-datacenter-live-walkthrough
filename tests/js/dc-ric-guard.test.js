@@ -105,4 +105,90 @@ describe('dc.js — _ric requestIdleCallback guard', () => {
         // We check the message to confirm it is specifically about requestIdleCallback.
         expect(() => fn.runInContext(sandbox)).toThrow(/requestIdleCallback/);
     });
+
+    // ---------------------------------------------------------------------------
+    // Queue behaviour: multiple calls before the first callback drains must all run
+    // ---------------------------------------------------------------------------
+    it('enqueues 3 callbacks in one tick and all 3 run', () => {
+        const _ricChannelSrc = extractLet('_ricChannel');
+        const _ricQueueSrc = extractLet('_ricQueue');
+        const _ricSrc = extractMultiLineConst('_ric');
+
+        const vm = require('node:vm');
+        const sandbox = {
+            console, Math, Date, Array, Object, Map, Set, Promise, MessageChannel,
+        };
+        vm.createContext(sandbox);
+        sandbox.order = [];
+
+        // Run everything in ONE script so _ricQueue and _ricChannel bindings are shared
+        const wrapped = `
+            (() => {
+                ${_ricChannelSrc}
+                ${_ricQueueSrc}
+                ${_ricSrc}
+
+                _ric(() => { order.push(1); });
+                _ric(() => { order.push(2); });
+                _ric(() => { order.push(3); });
+
+                // Drain the queue exactly as port1.onmessage would
+                const queued = _ricQueue;
+                _ricQueue = [];
+                for (const fn of queued) {
+                    try { fn({ didTimeout: false, timeRemaining: () => 0 }); }
+                    catch (e) { console.error('[dc] idle callback threw:', e); }
+                }
+
+                return _ricQueue.length; // return remaining queue length (should be 0)
+            })()
+        `;
+
+        const fn = new vm.Script(wrapped);
+        const remaining = fn.runInContext(sandbox);
+
+        expect(sandbox.order).toEqual([1, 2, 3]);
+        expect(remaining).toBe(0);
+    });
+
+    it('a throwing first callback does NOT prevent the second and third from running', () => {
+        const _ricChannelSrc = extractLet('_ricChannel');
+        const _ricQueueSrc = extractLet('_ricQueue');
+        const _ricSrc = extractMultiLineConst('_ric');
+
+        const vm = require('node:vm');
+        const sandbox = {
+            console, Math, Date, Array, Object, Map, Set, Promise, MessageChannel,
+        };
+        vm.createContext(sandbox);
+        sandbox.order = [];
+
+        const wrapped = `
+            (() => {
+                ${_ricChannelSrc}
+                ${_ricQueueSrc}
+                ${_ricSrc}
+
+                _ric(() => { throw new Error('first callback throws'); });
+                _ric(() => { order.push(2); });
+                _ric(() => { order.push(3); });
+
+                // Drain the queue exactly as port1.onmessage would
+                const queued = _ricQueue;
+                _ricQueue = [];
+                for (const fn of queued) {
+                    try { fn({ didTimeout: false, timeRemaining: () => 0 }); }
+                    catch (e) { console.error('[dc] idle callback threw:', e); }
+                }
+
+                return _ricQueue.length;
+            })()
+        `;
+
+        const fn = new vm.Script(wrapped);
+        fn.runInContext(sandbox);
+
+        // Second and third must have run even though the first threw
+        expect(sandbox.order).toEqual([2, 3]);
+    });
 });

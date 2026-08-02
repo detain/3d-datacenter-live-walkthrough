@@ -139,6 +139,15 @@ window.DCM.getWsState()           // { connected, authenticated, clientId, sessi
 window.DCM.getPresenceEnabled()  // Boolean presence system status
 ```
 
+### Bug fixes
+
+| ID | File | Issue | Fix |
+|----|------|-------|-----|
+| rIC guard | `dc.js` | `requestIdleCallback ?` threw a `ReferenceError` in browsers missing the global, crashing the entire DC module before `window.DC` was assigned | Replaced the bare ternary guard with `typeof requestIdleCallback === 'function'` — evaluates safely with no global required |
+| rIC queue | `dc.js` | The polyfill stored only one pending callback in `_ricChannel._cb`; a second call before the first drained silently overwrote the first, losing that deferred merge and its building's cables never appeared | Replaced the single slot with a `_ricQueue` array; `port1.onmessage` now drains all queued callbacks in a try/catch so a throwing callback cannot prevent subsequent ones from running |
+
+---
+
 ### Test Infrastructure (2026-08-02)
 
 The three.js test stub (`tests/js/__mocks__/three.js`) was updated so that stub methods compute correct mathematical values instead of silently returning `this`. Previously, no-op stubs allowed tests to pass even when the code under test produced mathematically wrong results — the assertions never caught the error because the mock never changed.
