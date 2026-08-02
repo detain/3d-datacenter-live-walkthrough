@@ -55,6 +55,8 @@ let _sessionBackup = null;
 const _RESTORE_KEY = 'dcSessionBackup';
 const _RESTORE_MAX_AGE_MS = 60000;
 let _pendingRestore = null;
+// Step 9.3: Deep link target (?location=, ?rack=, ?asset=) captured early in init()
+let _deepLinkTarget = null;
 // Animation loop callback storage (Fix: module-level declaration for setAnimationLoop)
 let _animationLoopCb = null;
 
@@ -244,6 +246,16 @@ function clearTrace() {
     _traceOverlay = null;
 }
 
+// Step 9.6: Trace cables connected to a given asset (called from info panel button)
+// Traces the first cable connection found for this asset
+function traceCableForAsset(assetId) {
+    const connections = _portsByAsset.get(assetId);
+    if (!connections || connections.length === 0) return;
+    const conn = connections[0];  // trace the first cable for this asset
+    const routeKey = conn.switchId + ':' + conn.portId;
+    traceCable(routeKey);
+}
+
 // Cache: poster spec string → CanvasTexture (Fix #11)
 const _posterTextureCache = new Map();
 
@@ -423,6 +435,12 @@ function computeFreeU() {
  * Uses instance color (setColorAt) so original materials are preserved.
  */
 function applyOverlay() {
+	// Toggle legend visibility based on overlay selection
+	const legend = document.getElementById('dcOverlayLegend');
+	const showLegend = options.overlay !== 'none' && objects.instanced.length > 0;
+	if (legend) {
+		legend.classList.toggle('visible', showLegend);
+	}
 	// Skip if no overlay selected or if instanced meshes not yet built
 	if (options.overlay === 'none' || objects.instanced.length === 0) {
 		// Clear any previously set instance colors by resetting to white (no tint)
@@ -988,7 +1006,93 @@ function _restoreCamera() {
     camera.rotation.y = Number.isFinite(yaw) ? yaw : 0;
 }
 
+// Read deep link parameters from URL (?location=, ?rack=, ?asset=).
+// All numeric params are coerced with Number() for safety.
+function _readDeepLink() {
+    const params = new URLSearchParams(location.search);
+    return {
+        location: params.has('location') ? Number(params.get('location')) || null : null,
+        rack: params.has('rack') ? Number(params.get('rack')) || null : null,
+        asset: params.has('asset') ? Number(params.get('asset')) || null : null,
+    };
+}
+
+// Apply deep link target after room is built.
+// For ?location=X: switch location if not already there.
+// For ?rack=X or ?asset=X: fly to that object.
+function _applyDeepLinkTarget() {
+    const target = _deepLinkTarget;
+    if (!target) return;
+
+    if (target.location !== null && target.location !== options.location) {
+        options.location = target.location;
+        switchLocation();
+        return;
+    }
+
+    if (target.rack !== null) {
+        const rackKey = 'rack_' + target.rack;
+        const loc = locations[options.location];
+        if (loc && loc.racks && loc.racks[rackKey]) {
+            const rack = loc.racks[rackKey];
+            flyToRackPosition(rack.x, rack.y);
+        }
+        return;
+    }
+
+    if (target.asset !== null) {
+        const loc = locations[options.location];
+        if (!loc || !loc.racks) return;
+        for (const rackKey of Object.keys(loc.racks)) {
+            const servers = loc.racks[rackKey].servers || {};
+            for (const serverId of Object.keys(servers)) {
+                if (Number(servers[serverId].id) === target.asset) {
+                    flyToServer(rackKey, serverId);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+// Fly camera to a rack position (without requiring a specific server).
+function flyToRackPosition(rackX, rackY) {
+    const pos = convertServerCoordinatesToPosition(rackX, rackY, 1);
+    flyTo.from.copy(camera.position);
+    flyTo.to.set(pos.x + 8, pos.y + 4, pos.z + 8);
+    flyTo.look.set(pos.x, pos.y, pos.z);
+    flyTo.t = 0;
+    flyTo.active = true;
+}
+
+// Copy current URL with appropriate deep link params to clipboard.
+function _copyDeepLink(assetId, rackKey) {
+    const params = new URLSearchParams();
+    params.set('location', String(Number(options.location)));
+    if (rackKey !== undefined && rackKey !== null) {
+        const rackNum = rackKey.replace('rack_', '');
+        params.set('rack', rackNum);
+    } else if (assetId !== undefined && assetId !== null) {
+        params.set('asset', String(assetId));
+    }
+    const url = new URL(location.href);
+    url.search = params.toString();
+    if (navigator.clipboard) {
+        navigator.clipboard.writeText(url.toString()).then(() => {
+            // Brief visual feedback could be added here
+        });
+    }
+}
+
 function loadDatacenter() {
+    // Deep link: read URL params early before any fetch so ?location= can affect what we load.
+    _deepLinkTarget = _readDeepLink();
+
+    // If deep link specifies a location, use it for the initial fetch
+    if (_deepLinkTarget.location !== null) {
+        options.location = _deepLinkTarget.location;
+    }
+
     // Tier 1: fetch a tiny index (location names + rack grid positions, no assets)
     const indexReq = fetch(dcUrl('/ajax/datacenter.php?tier=index'))
         .then((r) => { if (!r.ok) throw new Error('Network response was not ok'); return r.json(); })
@@ -1012,6 +1116,8 @@ function loadDatacenter() {
             _restoreCamera();
             const loading = document.getElementById('dcLoading');
             if (loading) loading.style.display = 'none';
+            // Step 9.3: apply deep link target (?location=, ?rack=, ?asset=) after room is built
+            _applyDeepLinkTarget();
         })
         .catch((error) => {
             console.error('There was a problem with the fetch operation:', error);
@@ -1530,6 +1636,7 @@ function getRackModels() {
 
 						//console.log("checking racks len "+Object.keys(models.racks).length+" against type len "+rackTypes.length);
 						displayRacks(modelIdx);
+						applyOverlay(); // Step 9.7: apply capacity overlay after racks are displayed
 					},
 					// The give-up path the async loaders have always had. loadGlbWithFallback() logs the
 					// failure and raises the banner itself, but nothing said WHICH type went missing:
@@ -1542,6 +1649,7 @@ function getRackModels() {
 			})(idx);
 		} else {
 			displayRacks(idx);
+			applyOverlay(); // Step 9.7: apply capacity overlay after cached racks are displayed
 		}
 	});
 	//console.log("Got to the end of the loading racks code block");
@@ -1589,6 +1697,7 @@ function getServerModels() {
 						//console.log(gltf);
 						//console.log("finished loading server " + currentModel);
 						displayServers(modelIdx);
+						applyOverlay(); // Step 9.7: apply capacity overlay after servers are displayed
 					},
 					// Same give-up path as the rack getter above, for the same reason: without it a
 					// failed server model left this building's servers of that type undrawn and unnamed.
@@ -1597,6 +1706,7 @@ function getServerModels() {
 			})(idxServer);
 		} else {
 			displayServers(idxServer);
+			applyOverlay(); // Step 9.7: apply capacity overlay after cached servers are displayed
 		}
 	});
 }
@@ -1967,7 +2077,7 @@ function displaySwitches(locId, dx, dz, sink) {
                         [ex, CABLE_OVERHEAD, rearAz],
                         [ex, ey, rearAz - 3.5],   // back a bit more behind the system
                         [ex, ey, rearAz],         // straight in to its back
-                    ], cableHex, off, seed);
+                    ], cableHex, off, seed, switchId + ':' + portId);
                 } else {
                     // different rack group: trunk across via the row ends, then into the server's BACK
                     const destEnds = groupEnds(destGroup);
@@ -1981,7 +2091,7 @@ function displaySwitches(locId, dx, dz, sink) {
                         [ex, CABLE_OVERHEAD, destEnds.rowZ],       // along the destination row to the asset's rack
                         [ex, ey, destEnds.rowZ - 3.5],             // back a bit more behind the system
                         [ex, ey, destEnds.rowZ],                   // straight in to its back
-                    ], cableHex, off, seed);
+                    ], cableHex, off, seed, switchId + ':' + portId);
                 }
             }
         }
@@ -3418,6 +3528,16 @@ function showInfo(hit) {
             ? '<a href="/admin/?choice=none.order_form&id=' + encodeURIComponent(a.order_id) +
               '" target="_blank" rel="noopener">View order #' + escapeHtml(String(a.order_id)) + ' &rarr;</a>'
             : '';
+        // Step 9.6: Trace button for assets with cable connections
+        const connections = _portsByAsset.get(a.id);
+        const hasConnections = connections && connections.length > 0;
+        const traceBtn = hasConnections
+            ? '<button class="dc-info-trace" onclick="DC.traceCableForAsset(' + a.id + ')">Trace Cable &rarr;</button>'
+            : '';
+        // Step 9.3: Copy deep link button — extracts rackKey from placements
+        const rackKey = (hit.mesh && hit.mesh.userData && hit.mesh.userData.placements)
+            ? hit.mesh.userData.placements[hit.instanceId].rackKey : null;
+        const copyBtn = '<button class="dc-info-copy" onclick="_copyDeepLink(' + a.id + ', \'' + (rackKey || '') + '\')">Copy Link &rarr;</button>';
         panel.innerHTML = closeBtn +
             '<div class="dc-info-title">' + escapeHtml(a.hostname || 'server') + '</div>' +
             '<div class="dc-info-row">' + statusDot + escapeHtml(a.status || 'unknown') + '</div>' +
@@ -3425,9 +3545,15 @@ function showInfo(hit) {
             '<div class="dc-info-row">MAC: ' + escapeHtml(a.mac || '—') + '</div>' +
             '<div class="dc-info-row">Hardware: ' + escapeHtml(hw) + '</div>' +
             '<div class="dc-info-row">Position: ' + escapeHtml(position) + '</div>' +
-            '<div class="dc-info-links">' + assetLink + (orderLink ? ' ' + orderLink : '') + '</div>';
+            '<div class="dc-info-links">' + assetLink + (orderLink ? ' ' + orderLink : '') + '</div>' +
+            (traceBtn ? '<div class="dc-info-trace-btn">' + traceBtn + '</div>' : '') +
+            '<div class="dc-info-copy-btn">' + copyBtn + '</div>';
     } else {
-        panel.innerHTML = closeBtn + '<div class="dc-info-title">Rack ' + escapeHtml(a.name || '') + '</div>';
+        // Step 9.3: Copy deep link button for racks — rackKey is directly on userData
+        const rackKey = (hit.mesh && hit.mesh.userData) ? hit.mesh.userData.rackKey : null;
+        const copyBtn = '<button class="dc-info-copy" onclick="_copyDeepLink(' + a.id + ', \'' + (rackKey || '') + '\')">Copy Link &rarr;</button>';
+        panel.innerHTML = closeBtn + '<div class="dc-info-title">Rack ' + escapeHtml(a.name || '') + '</div>' +
+            '<div class="dc-info-copy-btn">' + copyBtn + '</div>';
     }
     panel.style.display = 'block';
 }
@@ -4477,6 +4603,10 @@ window.DC = {
     // Step 9.5: Isolate render pass
     setIsolate: setIsolate,
     clearIsolate: clearIsolate,
+    // Step 9.6: Cable tracing
+    traceCable: traceCable,
+    clearTrace: clearTrace,
+    traceCableForAsset: traceCableForAsset,
     // --- multi-building LOD + walk-between handles (used by dc-multi.js; inert for dc.html) ---
     collideWorld: collideWorld,                 // walls + current racks + neighbours' active interiors
     get buildings() { return dcBuildings; },    // wall/door rects for every building (current + neighbours)

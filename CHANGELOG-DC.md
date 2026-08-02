@@ -61,6 +61,20 @@ Added `setIsolate(keepSet)` / `clearIsolate()` functionality for highlighting sp
 
 ---
 
+#### Step 9.6 — Cable tracing
+
+Added cable tracing functionality to visualize individual cable routes in the 3D scene. When a server asset with cable connections is clicked, a "Trace Cable" button appears in the info panel. Clicking it draws a bright cyan (`0x00ffff`) `LineBasicMaterial` overlay along the cable path from switch to asset.
+
+**Changes:**
+
+| File | Change |
+|------|--------|
+| `public_html/js/dc.js` | Added `_cableRoutes` Map (stores route points per `switchId:portId`); added `_portsByAsset` Map (reverse index `assetId → [{switchId, portId, port, sw}]`); added `buildPortsByAsset(locId)` to build the reverse index; modified `displaySwitches` to capture route points in `addCable`; added `traceCable(routeKey)` to draw the trace overlay; added `clearTrace()` to remove overlay; added `traceCableForAsset(assetId)` helper; modified `showInfo` to show trace button for connected assets; `displayDatacenter` calls `buildPortsByAsset` before `displaySwitches`; all new functions exported on `window.DC` |
+
+**Tests:** New Vitest test in `tests/js/dc-cable-trace.test.js`
+
+---
+
 ### Phase 8
 
 #### Step 8.3 — Reduce the cable triangle bill
