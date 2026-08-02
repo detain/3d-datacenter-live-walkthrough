@@ -13,6 +13,17 @@
  *   3. loadRackType()/loadServerType() resolved ONLY from the GLTFLoader onLoad callback, so a
  *      model that was skipped or that failed every variant never settled and loadBuildingModels()
  *      sat on its 12s Promise.race timeout before a neighbouring building could reach full detail.
+ *   4. models.racks/servers are written only on SUCCESS and loadBuildingModels() re-queues every type
+ *      still undefined, so a type whose GLB was missing re-issued all three variant requests AND
+ *      re-raised the "some 3D models failed to load" banner on every enterFull/exitFull LOD cycle.
+ *      _failedGlbs is the negative cache that stops it.
+ *   5. A throw inside the onLoad body — gltf.scene undefined on a GLB with no scenes (glTF makes
+ *      `scenes` optional), extractModelMeshes() finding nothing usable — was left to escape, and where
+ *      it landed depended on the loader. three's GLTFParser.parse() calls onLoad inside a chain ending
+ *      in `.catch(onError)`, so in the browser the throw was reported as if the FILE had failed and the
+ *      fallback walked on to the next variant of the same broken asset; against a loader that does not
+ *      catch (this harness) the loadRackType() promise rejected and nothing settled it. dc.js now
+ *      catches it at the source and gives up once.
  *
  * These are pure logic, so they are tested against the REAL source text rather than a
  * reimplementation: the functions are sliced out of dc.js and run with stubbed GLTFLoader /
@@ -52,18 +63,32 @@ function extractConst(name) {
     if (!m) throw new Error(`dc.js no longer declares const ${name}[] at top level — update this spec`);
     return m[0];
 }
+// One-line top-level const (the _failedGlbs Set). Kept separate from extractConst so a rename of either
+// still fails loudly rather than silently testing a harness-local stand-in for the real declaration.
+function extractLine(name) {
+    const m = SRC.match(new RegExp('^const ' + name + ' = .*;$', 'm'));
+    if (!m) throw new Error(`dc.js no longer declares const ${name} at top level — update this spec`);
+    return m[0];
+}
 
 // A loader stub shaped like GLTFLoader: url -> 'ok' (calls onLoad) or anything else (calls onError).
 // Records every url it was asked for, which is how "the empty placeholder fetches nothing" is proved.
-function makeHarness(urlOutcome = () => 'ok') {
+//
+// opts.gltf(url)  — the payload handed to onLoad. Default is a scene-bearing gltf; pass `() => ({})` for
+//                   the real "parses but has no scenes" shape, where dc.js's own `gltf.scene.traverse`
+//                   throws (glTF 2.0 makes `scenes` optional, so GLTFLoader resolves that file happily).
+// opts.extract    — stands in for extractModelMeshes(); throw from here for a GLB that has a scene but
+//                   nothing usable in it.
+function makeHarness(urlOutcome = () => 'ok', opts = {}) {
     const seen = [];
     const notices = [];
     const warns = [];
     const errors = [];
+    const gltfFor = opts.gltf || ((url) => ({ scene: { traverse() {}, _url: url } }));
     const loaderGltf = {
         load(url, onLoad, onProgress, onError) {
             seen.push(url);
-            if (urlOutcome(url) === 'ok') onLoad({ scene: { traverse() {}, _url: url } });
+            if (urlOutcome(url) === 'ok') onLoad(gltfFor(url));
             else onError(new Error('404 ' + url));
         },
     };
@@ -73,6 +98,7 @@ function makeHarness(urlOutcome = () => 'ok') {
         extractConst('rackTypes'),
         extractConst('serverTypes'),
         extractConst('GLB_VARIANTS'),
+        extractLine('_failedGlbs'),
         extractFn('glbVariantUrl'),
         extractFn('rackModelName'),
         extractFn('serverModelName'),
@@ -82,7 +108,7 @@ function makeHarness(urlOutcome = () => 'ok') {
     ].join('\n\n');
     const factory = new Function(
         'loaderGltf', 'notice', 'models', 'dcUrl', 'extractModelMeshes', 'console',
-        prelude + '\nreturn { rackTypes, serverTypes, GLB_VARIANTS, glbVariantUrl, rackModelName,'
+        prelude + '\nreturn { rackTypes, serverTypes, GLB_VARIANTS, _failedGlbs, glbVariantUrl, rackModelName,'
         + ' serverModelName, loadGlbWithFallback, loadRackType, loadServerType };'
     );
     const api = factory(
@@ -90,7 +116,7 @@ function makeHarness(urlOutcome = () => 'ok') {
         (t) => notices.push(t),
         models,
         (p) => p,
-        (model, scale) => ({ built: true, scale, url: model._url }),
+        opts.extract || ((model, scale) => ({ built: true, scale, url: model._url })),
         consoleStub
     );
     return { ...api, seen, notices, warns, errors, models };
@@ -265,7 +291,7 @@ describe('dc.js — loadRackType() settles on every path', () => {
     it('resolves when every GLB variant fails — without waiting out the 12s race guard', async () => {
         const h = makeHarness(() => 'fail');
         await expect(settlesQuickly(h.loadRackType(1))).resolves.toBe(true);
-        expect(h.models.racks[1]).toBeUndefined();          // nothing cached: a retry may still happen
+        expect(h.models.racks[1]).toBeUndefined();          // no MODEL cached; the failure is (see below)
         expect(h.errors.join('|')).toMatch(/All GLB variants failed/);
         expect(h.notices.join('|')).toMatch(/Some 3D models failed to load/);
     });
@@ -302,6 +328,180 @@ describe('dc.js — loadServerType() settles on every path', () => {
         await expect(settlesQuickly(h.loadServerType(1))).resolves.toBe(true);
         expect(h.models.servers[1]).toBeUndefined();
         expect(h.notices.join('|')).toMatch(/Some 3D models failed to load/);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// _failedGlbs — a definitively failed model is never re-requested and never re-banners (defect 4)
+//
+// The LOD cycle is what makes this user-visible: enterFull/exitFull calls loadBuildingModels() again
+// every time the player walks past a neighbouring building, and that re-queues every type still missing
+// from models.*. LOD_CYCLES below stands in for that walk.
+// ---------------------------------------------------------------------------
+const LOD_CYCLES = 6;
+
+describe('dc.js — _failedGlbs negative cache', () => {
+    it('re-requests nothing and re-warns nobody after a type has failed once', async () => {
+        const h = makeHarness(() => 'fail');
+        await expect(settlesQuickly(h.loadRackType(1))).resolves.toBe(true);
+        const afterFirst = { seen: h.seen.length, notices: h.notices.length };
+        expect(afterFirst.seen).toBe(h.GLB_VARIANTS.length);   // all three variants tried, once
+        expect(afterFirst.notices).toBe(1);                    // and the user told, once
+
+        for (let i = 0; i < LOD_CYCLES; i++) {
+            await expect(settlesQuickly(h.loadRackType(1))).resolves.toBe(true);
+        }
+        expect(h.seen.length).toBe(afterFirst.seen);           // unbounded before this cache: 3 per cycle
+        expect(h.notices.length).toBe(afterFirst.notices);     // and one banner per cycle
+    });
+
+    it('does the same for server types', async () => {
+        const h = makeHarness(() => 'fail');
+        await expect(settlesQuickly(h.loadServerType(1))).resolves.toBe(true);
+        expect(h.notices).toHaveLength(1);
+        for (let i = 0; i < LOD_CYCLES; i++) await settlesQuickly(h.loadServerType(1));
+        expect(h.seen).toHaveLength(h.GLB_VARIANTS.length);
+        expect(h.notices).toHaveLength(1);
+    });
+
+    it('still settles every repeat call — the cache must answer, not stall', async () => {
+        const h = makeHarness(() => 'fail');
+        await settlesQuickly(h.loadRackType(1));
+        await expect(settlesQuickly(h.loadRackType(1))).resolves.toBe(true);
+    });
+
+    it('short-circuits loadGlbWithFallback itself, onGiveUp and all', () => {
+        const h = makeHarness(() => 'fail');
+        h.loadGlbWithFallback('/images/3d/racks/', 'Rack', vi.fn(), vi.fn());
+        const onLoad = vi.fn(), onGiveUp = vi.fn();
+        h.seen.length = 0; h.notices.length = 0;
+        h.loadGlbWithFallback('/images/3d/racks/', 'Rack', onLoad, onGiveUp);
+        expect(h.seen).toEqual([]);
+        expect(onLoad).not.toHaveBeenCalled();
+        expect(onGiveUp).toHaveBeenCalledTimes(1);
+        expect(h.notices).toEqual([]);
+    });
+
+    it('is keyed per request, so a DIFFERENT broken model still gets its one warning', async () => {
+        const h = makeHarness(() => 'fail');
+        await settlesQuickly(h.loadRackType(1));
+        await settlesQuickly(h.loadRackType(2));
+        expect(h.notices).toHaveLength(2);
+        expect(h._failedGlbs.size).toBe(2);
+        // and neither of them is now retried
+        const seenAfter = h.seen.length;
+        await settlesQuickly(h.loadRackType(1));
+        await settlesQuickly(h.loadRackType(2));
+        expect(h.seen).toHaveLength(seenAfter);
+    });
+
+    it('keeps racks and servers apart even when both name the same file', () => {
+        const h = makeHarness(() => 'fail');
+        h.loadGlbWithFallback('/images/3d/racks/', 'Same', vi.fn(), vi.fn());
+        h.seen.length = 0;
+        h.loadGlbWithFallback('/images/3d/servers/gltf/exported-centered/', 'Same', vi.fn(), vi.fn());
+        expect(h.seen).toHaveLength(h.GLB_VARIANTS.length);   // different basePath -> not the cached key
+        expect(h._failedGlbs.size).toBe(2);
+    });
+
+    it('never caches a HEALTHY model — repeat LOD cycles past a good building are untouched', async () => {
+        await settlesQuickly(H.loadRackType(1));
+        expect(H._failedGlbs.size).toBe(0);
+        const seenAfterFirst = H.seen.length;
+        expect(seenAfterFirst).toBe(1);                       // first variant answered
+        for (let i = 0; i < LOD_CYCLES; i++) {
+            await expect(settlesQuickly(H.loadRackType(1))).resolves.toBe(true);
+        }
+        expect(H.seen).toHaveLength(seenAfterFirst);          // served from models.racks, as before
+        expect(H.models.racks[1]).toBeDefined();
+        expect(H.notices).toEqual([]);
+        expect(H.errors).toEqual([]);
+    });
+
+    it('never caches a SKIP — type 0 stays silent on its own, not because it was remembered', async () => {
+        for (let i = 0; i < LOD_CYCLES; i++) {
+            await expect(settlesQuickly(H.loadRackType(0))).resolves.toBe(true);
+            await expect(settlesQuickly(H.loadServerType(0))).resolves.toBe(true);
+        }
+        expect(H._failedGlbs.size).toBe(0);   // a placeholder is not a failure
+        expect(H.seen).toEqual([]);
+        expect(H.warns).toEqual([]);
+        expect(H.errors).toEqual([]);
+        expect(H.notices).toEqual([]);
+    });
+
+    it('never caches an out-of-range type either — it never reaches the loader', async () => {
+        await settlesQuickly(H.loadRackType(H.rackTypes.length));
+        expect(H._failedGlbs.size).toBe(0);
+        expect(H.notices).toEqual([]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// A throwing onLoad is caught where it happens (defect 5)
+// ---------------------------------------------------------------------------
+describe('dc.js — a throw inside the onLoad body', () => {
+    // The real shape: glTF 2.0 makes `scenes` optional, so a GLB carrying only an asset block parses
+    // clean and GLTFLoader resolves it with gltf.scene === undefined. dc.js then does
+    // `const model = gltf.scene; model.traverse(...)` -> TypeError.
+    const noScene = { gltf: () => ({}) };
+    // And the other one: a scene that yields no meshes, i.e. extractModelMeshes blowing up.
+    const badMeshes = { extract: () => { throw new Error('no meshes in model'); } };
+
+    it('settles loadRackType() for a GLB with no scene', async () => {
+        const h = makeHarness(() => 'ok', noScene);
+        await expect(settlesQuickly(h.loadRackType(1))).resolves.toBe(true);
+        expect(h.models.racks[1]).toBeUndefined();
+        expect(h.errors.join('|')).toMatch(/GLB loaded but could not be used/);
+        expect(h.notices.join('|')).toMatch(/Some 3D models failed to load/);
+    });
+
+    it('settles loadServerType() the same way', async () => {
+        const h = makeHarness(() => 'ok', noScene);
+        await expect(settlesQuickly(h.loadServerType(1))).resolves.toBe(true);
+        expect(h.models.servers[1]).toBeUndefined();
+        expect(h.notices).toHaveLength(1);
+    });
+
+    it('settles when extractModelMeshes() throws on a model with no usable meshes', async () => {
+        const h = makeHarness(() => 'ok', badMeshes);
+        await expect(settlesQuickly(h.loadRackType(1))).resolves.toBe(true);
+        await expect(settlesQuickly(h.loadServerType(1))).resolves.toBe(true);
+        expect(h.errors.join('|')).toMatch(/no meshes in model/);
+    });
+
+    it('does not escape loadGlbWithFallback to the caller', () => {
+        const h = makeHarness(() => 'ok', badMeshes);
+        expect(() => h.loadGlbWithFallback('/images/3d/racks/', 'Rack', () => { throw new Error('boom'); }))
+            .not.toThrow();
+    });
+
+    it('gives up on the spot rather than re-fetching the same asset as another variant', () => {
+        const h = makeHarness(() => 'ok', noScene);
+        const onGiveUp = vi.fn();
+        h.loadGlbWithFallback('/images/3d/racks/', 'Rack', (g) => g.scene.traverse(), onGiveUp);
+        expect(h.seen).toEqual(['/images/3d/racks/meshopt/Rack.glb']);   // one request, not three
+        expect(onGiveUp).toHaveBeenCalledTimes(1);
+    });
+
+    it('lands in the negative cache like any other definitive failure', async () => {
+        const h = makeHarness(() => 'ok', noScene);
+        await settlesQuickly(h.loadRackType(1));
+        const after = { seen: h.seen.length, notices: h.notices.length };
+        for (let i = 0; i < LOD_CYCLES; i++) {
+            await expect(settlesQuickly(h.loadRackType(1))).resolves.toBe(true);
+        }
+        expect(h.seen).toHaveLength(after.seen);
+        expect(h.notices).toHaveLength(after.notices);
+    });
+
+    it('leaves the healthy path alone — a good GLB still loads and caches identically', async () => {
+        await settlesQuickly(H.loadRackType(1));
+        expect(H.models.racks[1]).toEqual({
+            built: true, scale: 10, url: '/images/3d/racks/meshopt/' + H.rackTypes[1] + '.glb',
+        });
+        expect(H.errors).toEqual([]);
+        expect(H.notices).toEqual([]);
     });
 });
 

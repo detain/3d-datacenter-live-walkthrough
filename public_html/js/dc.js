@@ -964,34 +964,72 @@ function serverModelName(t) {
     return entry[0] || null;
 }
 
+// Model requests that are known not to produce a model: every variant failed, or the file arrived and
+// the code that turns it into meshes threw on it. Keyed by the REQUEST (basePath + name) rather than by
+// type index, because it is the asset that is broken — two type slots can name the same model, and both
+// loader pairs (getRackModels()/loadRackType() and their server twins) come through the same door.
+//
+// It exists because models.racks/servers are written only on SUCCESS while loadBuildingModels() re-queues
+// every type still undefined: without it a single missing GLB in a neighbouring building re-issued all
+// three variant requests AND re-raised the user-facing banner on every enterFull/exitFull LOD cycle, so
+// walking back and forth past that one building spammed the user and burned requests indefinitely.
+//
+// Transient failures (a moment offline, a 5xx blip) are remembered along with permanent ones on purpose:
+// three.js reports both through the same onError with nothing reliable to branch on, and losing one model
+// until the next page load is strictly better than an unbounded request + banner loop. Nothing clears
+// this: a location switch deliberately keeps the models.* cache it mirrors (same static files on the same
+// origin, so a 404 for one location is a 404 for the next), and the device-loss path reloads the page,
+// which builds a fresh Set. A reload is the retry.
+const _failedGlbs = new Set();
+
 function loadGlbWithFallback(basePath, relName, onLoad, onGiveUp) {
-    // onGiveUp fires on every path that will NOT produce a model — a missing name and the
-    // all-variants-failed branch — so a caller awaiting this load always gets an answer. Without it
-    // loadRackType()/loadServerType() resolved only from onLoad, and one skipped or 404'd model in a
-    // neighbouring building parked loadBuildingModels() on its full 12s Promise.race timeout before
-    // the building could swap to full detail. The timeout stays as a backstop, not as the normal path.
+    // onGiveUp fires on every path that will NOT produce a model — a missing name, the
+    // all-variants-failed branch, an onLoad that threw, and a request already known bad — so a caller
+    // awaiting this load always gets an answer. Without it loadRackType()/loadServerType() resolved only
+    // from onLoad, and one skipped or 404'd model in a neighbouring building parked loadBuildingModels()
+    // on its full 12s Promise.race timeout before the building could swap to full detail. The timeout
+    // stays as a backstop, not as the normal path.
     // The name guard below is a backstop too: rackModelName()/serverModelName() screen index 0 (the
     // empty-string placeholder) out before it gets here, and it must stay screened — unguarded it is
     // three doomed requests (<basePath>.glb, <basePath>meshopt/.glb, <basePath>webp-simplify/.glb)
     // landing in the failure branch, i.e. a user-facing "some 3D models failed to load" banner about a
-    // model nobody asked for.
+    // model nobody asked for. That skip is not a failure and must never reach _failedGlbs.
     if (!relName) {
         console.warn('[dc] Skipping GLB load with no model name for', basePath);
         if (onGiveUp) onGiveUp();
         return;
     }
+    const failKey = basePath + relName;
+    if (_failedGlbs.has(failKey)) {   // answered from the negative cache: no requests, no second banner
+        if (onGiveUp) onGiveUp();
+        return;
+    }
+    const giveUp = (what, detail) => {
+        console.error('[dc] ' + what, basePath, relName, detail);
+        _failedGlbs.add(failKey);
+        notice('Warning: Some 3D models failed to load — scene may be incomplete');
+        if (onGiveUp) onGiveUp();
+    };
     let i = 0;
     const tryNext = () => {
         const url = glbVariantUrl(basePath, relName, GLB_VARIANTS[i]);
         const isLast = i === GLB_VARIANTS.length - 1;
         i += 1;
-        loaderGltf.load(url, onLoad, undefined, isLast
-            ? (err) => {
-                console.error('[dc] All GLB variants failed for', basePath, relName, err);
-                notice('Warning: Some 3D models failed to load — scene may be incomplete');
-                if (onGiveUp) onGiveUp();
-            }
-            : tryNext);
+        loaderGltf.load(url, (gltf) => {
+            // The onLoad bodies build meshes out of the parsed GLB and that can throw — a GLB that parses
+            // but carries no scene (glTF makes `scenes` optional) leaves gltf.scene undefined and takes
+            // `model.traverse` down with a TypeError. Left uncaught this did not hang, but it did land
+            // somewhere misleading: GLTFParser.parse() calls onLoad inside a promise chain that ends in
+            // `.catch(onError)`, so the throw came back as if the FILE had failed and the fallback walked
+            // on to the next variant. Wrong twice over — the variants are re-encodings of the SAME asset,
+            // so the retry throws again two requests later, and an onLoad that threw PARTWAY through
+            // (getRackModels() caches the model, then builds and places its meshes) gets its whole body
+            // re-run, double-building whatever did land. Catching it here gives one give-up, logged as
+            // unusable rather than missing, without depending on that loader internal to settle the
+            // caller. Anything awaiting the load still gets its answer.
+            try { onLoad(gltf); }
+            catch (e) { giveUp('GLB loaded but could not be used for', e); }
+        }, undefined, isLast ? (err) => giveUp('All GLB variants failed for', err) : tryNext);
     };
     tryNext();
 }
