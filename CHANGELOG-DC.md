@@ -38,6 +38,20 @@ The `?renderer=webgpu-gl` mode was described as a "comparison" tool but its fram
 
 ---
 
+#### Step 7.6 — Make DC.bench() report comparable numbers on all three backends
+
+`DC.bench()` now returns additional fields (`ao`, `shadows`, `shadowMapSize`, `pixelScale`, `triangles`) that capture renderer state at measurement time, enabling meaningful cross-backend FPS comparisons. The idle reset mechanism now uses `noteUserInput()` (exposed on `window.DC`) instead of a raw frame counter, and a console warning is logged if the FPS ring buffer never fills during a run.
+
+**Changes:**
+
+| File | Change |
+|------|--------|
+| `public_html/js/dc.js` | Added `noteUserInput()` to `window.DC` for resetting idle skip; updated `bench()` to call it instead of directly setting `_tickSkippedFrames`; added `ao`, `shadows`, `shadowMapSize`, `pixelScale`, `triangles` to bench return object; added warning when FPS ring buffer never fills |
+| `docs/dc_renderer_modes.md` | Updated bench result format documentation with new fields and warning behavior |
+| `tests/js/dc-bench.test.js` | New test file verifying bench result fields, idle mechanism pattern, and FPS ring buffer warning |
+
+---
+
 #### Step 7.1 — Create a renderer-capability module
 
 A new `dc-caps.js` module centralises renderer capability detection. Instead of ad-hoc `renderer.backend` or `instanceof` checks scattered through `dc.js`, callers now use the normalised `describeRenderer(renderer)` function which returns a capability object with `isNode`, `backend`, `shadowTypeSettable`, `supportsTSL`, `supportsCompute`, `supportsOcclusionQuery`, and `supportsEffectComposer` booleans.
@@ -66,6 +80,25 @@ Re-enabled frustum culling (`frustumCulled = true`) for neighbour building insta
 | `public_html/js/dc-multi.js` | Player character model traverse sets `frustumCulled = true` on all meshes |
 
 **Tests:** New Vitest test in `tests/js/dc-frustum-culling.test.js`
+
+---
+
+#### Step 7.4 — Add ambient occlusion on the WebGPU path using TSL
+
+Added infrastructure for WebGPU TSL postprocessing with a 3-way render branch in `tick()`:
+
+- `caps.supportsEffectComposer`: use EffectComposer (standard postprocessing path)
+- `caps.supportsTSL && _postProcessing`: use WebGPU TSL path with GTAONode ambient occlusion
+- `else`: plain `renderer.render(scene, camera)`
+
+**Changes:**
+
+| File | Change |
+|------|--------|
+| `public_html/js/dc.js` | Added `_postProcessing` module variable (null until TSL pipeline is initialized); added `_setupWebgpuPostFX()` async function that dynamically imports `GTAONode` from `three/addons/tsl/display/GTAONode.js`; `init()` calls `_setupWebgpuPostFX()` when `caps.backend === 'WebGPURenderer'`; `tick()` now has a 3-way branch for render path selection |
+| `tests/js/dc-ao-webgpu.test.js` | New Vitest test verifying `_postProcessing` declaration, `_setupWebgpuPostFX()` existence, the 3-way branch pattern, and `caps.supportsTSL` detection |
+
+**Note:** Full GTAONode integration with the TSL `RenderPipeline` is a future enhancement. The current implementation sets up the infrastructure and 3-way branch; actual AO rendering via TSL requires additional `RenderPipeline` setup.
 
 ---
 

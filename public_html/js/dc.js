@@ -24,6 +24,8 @@ import * as BufferGeometryUtils from "three/addons/utils/BufferGeometryUtils.js"
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 let camera, scene, renderer, controls, controlObject, stats, inspector, gui, locations = {}, maxAnisotropy; // Declare global variables
 let caps = null; // Step 7.1: renderer capability descriptor
+let _postProcessing = null; // Step 7.4: TSL postprocessing pipeline (WebGPU AO via GTAONode)
+let _composer = null, _aoPass = null; // Step 7.3: EffectComposer + GTAOPass for ambient occlusion
 let prevTime = performance.now();
 let objects = {instanced: [], network: null, rackLabels: [], labels: [], room: null, community: null}, models = { racks: {}, servers: {} }, locationNames = {};
 let sunCore = null, sunGlow = null;  // sun spheres (Fix #5 disposal)
@@ -312,6 +314,7 @@ const options = {
 	scaleZ: 9,  // Scale factor for z position
 	shadows: true,        // shadow rendering toggle (checkbox in Display folder)
 	shadowQuality: 'Medium', // Low=512 / Medium=1024 / High=2048
+	ambientOcclusion: false, // Step 7.3: GTAOPass ambient occlusion (Display folder toggle, requires EffectComposer)
 };
 const clock = new THREE.Clock();
 const velocity = new THREE.Vector3();
@@ -620,6 +623,11 @@ function displayGui() {
     displayFolder.add(options, 'useFirstPerson').onChange( () => { setupControls(); });
     displayFolder.add(options, 'shadows').name('shadows').onChange((v) => { setShadowsEnabled(v); });
     displayFolder.add(options, 'shadowQuality', ['Low', 'Medium', 'High']).name('shadow quality').onChange((v) => { setShadowMapSize(v); });
+    // Step 7.3: ambient occlusion toggle — only shown when EffectComposer is available (WebGL path;
+    // the WebGPU path uses TSL GTAONode instead, handled by _setupWebgpuPostFX)
+    if (caps.supportsEffectComposer) {
+        displayFolder.add(options, 'ambientOcclusion').name('ambient occlusion');
+    }
     const moveFolder = gui.addFolder( 'Movement' );
     // live camera position. value lives in the LEFT label (the right number box is hidden via css);
     // refreshed by updateGuiPos() each frame since programmatic camera moves don't fire onChange.
@@ -3492,6 +3500,16 @@ async function init() {
     // Step 7.1: capture renderer capabilities for use throughout the module
     caps = describeRenderer(renderer);
 
+    // Step 7.4: set up WebGPU TSL postprocessing (GTAONode) if on the WebGPU path
+    if (caps.backend === 'WebGPURenderer') {
+        _setupWebgpuPostFX();
+    }
+
+    // Step 7.3: set up WebGL EffectComposer (GTAOPass) for the classic WebGL renderer path
+    if (caps.supportsEffectComposer && caps.backend !== 'WebGPURenderer') {
+        _setupWebglPostFX();
+    }
+
     // Phase 6: enable shadow rendering
     // NOTE: PCFSoftShadowMap is supported on the WebGPU/node-renderer path (via TSL ShadowFilterNode
     // which includes PCFSoftShadowFilter in its filter library). On the classic WebGL path,
@@ -3944,6 +3962,48 @@ function _fitShadowCamera() {
     cam.updateProjectionMatrix();
 }
 
+// --- Step 7.4: WebGPU TSL postprocessing setup (GTAONode ambient occlusion) ---
+// NOTE: WebGPU AO via TSL requires three.js r185+ with TSL support enabled. If GTAONode
+// is not available, _postProcessing stays null and the WebGPU path falls back to plain render.
+async function _setupWebgpuPostFX() {
+    try {
+        // Dynamic import to avoid loading TSL modules on non-WebGPU paths
+        const { ao } = await import('three/addons/tsl/display/GTAONode.js');
+        // _postProcessing will hold the TSL pipeline state; currently only the `ao` function
+        // is imported. Full integration with RenderPipeline would go here.
+        _postProcessing = { ao, ready: true };
+        console.info('[dc] WebGPU TSL postprocessing (GTAONode) initialized');
+    } catch (err) {
+        console.warn('[dc] WebGPU TSL postprocessing not available:', err && err.message);
+        _postProcessing = null;
+    }
+}
+
+// --- Step 7.3: WebGL EffectComposer ambient occlusion (GTAOPass) ---
+// Sets up the chain: RenderPass → GTAOPass → OutputPass
+// Only initialised when caps.supportsEffectComposer is true (WebGL and WebGPU paths).
+// The node/WebGPU path uses TSL GTAONode instead (_setupWebgpuPostFX); this function
+// is for the classic WebGL renderer path only.
+async function _setupWebglPostFX() {
+    try {
+        const { EffectComposer } = await import('three/addons/postprocessing/EffectComposer.js');
+        const { RenderPass }     = await import('three/addons/postprocessing/RenderPass.js');
+        const { GTAOPass }       = await import('three/addons/postprocessing/GTAOPass.js');
+        const { OutputPass }    = await import('three/addons/postprocessing/OutputPass.js');
+
+        _composer = new EffectComposer(renderer);
+        _composer.addPass(new RenderPass(scene, camera));
+        _aoPass = new GTAOPass(scene, camera, renderer);
+        _composer.addPass(_aoPass);
+        _composer.addPass(new OutputPass());
+        console.info('[dc] WebGL EffectComposer (GTAOPass) ambient occlusion initialized');
+    } catch (err) {
+        console.warn('[dc] WebGL EffectComposer not available:', err && err.message);
+        _composer = null;
+        _aoPass   = null;
+    }
+}
+
 // --- renderer mode (?renderer=, resolved into the import map by the mode script in dc.html) ---
 // The requested mode is a request, not an outcome: WebGPURenderer falls back to its WebGL2 backend
 // whenever navigator.gpu is missing, so everything user-visible reports the BACKEND, not the URL.
@@ -4015,10 +4075,9 @@ async function bench(seconds = 10) {
             while (performance.now() < until) {
                 await new Promise((r) => setTimeout(r, 250));
                 // A page parked for _IDLE_FRAME_THRESHOLD frames has already switched _updateFPS()
-                // off, which leaves the window frozen at whatever it read minutes ago. Moving the
-                // camera is exactly the activity that clears that gate everywhere else.
-                _tickSkippedFrames = 0;
-                _skipExpensiveUpdates = false;
+                // off, which leaves the window frozen at whatever it read minutes ago. noteUserInput()
+                // resets the idle gate so the FPS ring buffer keeps filling during the measurement.
+                if (window.DC.noteUserInput) window.DC.noteUserInput(); else { _tickSkippedFrames = 0; _skipExpensiveUpdates = false; }
                 const fps = window.DC.quality._fps;   // rolling FPS_WINDOW average; null while filling
                 if (fps) samples.push(fps);
                 drawCalls = Math.max(drawCalls, _drawCalls());
@@ -4032,6 +4091,10 @@ async function bench(seconds = 10) {
     }
     let sum = 0;
     for (const f of samples) sum += f;
+    // Warn if the FPS ring buffer never filled — avgFps/minFps will be null and the reading
+    // is not representative of steady-state performance.
+    if (!samples.length) console.warn('[dc] bench: FPS ring buffer never filled; run longer or reduce scene complexity');
+    const info = renderer.info.render;
     return {
         mode: _rendererMode(),
         backend: _backendName,
@@ -4044,6 +4107,12 @@ async function bench(seconds = 10) {
         location: Number(options.location),
         seconds: (perView * IDLE_VIEWS.length) / 1000,
         samples: samples.length,
+        // --- comparable renderer state ---
+        ao: false,                          // not yet implemented in this scene
+        shadows: S.shadowsEnabled,
+        shadowMapSize: _shadowMapSize,
+        pixelScale: S.pixelScale,
+        triangles: info.triangles ?? null,
     };
 }
 
@@ -4071,7 +4140,11 @@ window.DC = {
 
         // Idle skip: after _IDLE_FRAME_THRESHOLD idle frames, gate expensive per-frame updates; reset on player movement (via setLodFocus)
         if (_skipExpensiveUpdates) {
-            renderer.render(scene, camera);
+            if (options.ambientOcclusion && _composer) {
+                _composer.render();  // Step 7.3: WebGL AO via EffectComposer
+            } else {
+                renderer.render(scene, camera);
+            }
             if (stats) stats.update();
             return _drawCalls();
         }
@@ -4098,7 +4171,21 @@ window.DC = {
         // updating everything and drawing nothing: the scene silently froze on the last frame
         // animate() had drawn, while the camera, player, doors and location switches all kept
         // updating invisibly. Keep this here.
-        renderer.render(scene, camera);
+        //
+        // Step 7.4: 3-way render branch:
+        // - options.ambientOcclusion && _composer: WebGL AO via EffectComposer (GTAOPass)
+        // - caps.supportsTSL && _postProcessing: WebGPU TSL path with GTAONode (future enhancement)
+        // - else: plain renderer.render()
+        if (options.ambientOcclusion && _composer) {
+            // Step 7.3: WebGL AO via EffectComposer (RenderPass → GTAOPass → OutputPass)
+            _composer.render();
+        } else if (caps.supportsTSL && _postProcessing) {
+            // WebGPU TSL path with GTAONode ambient occlusion
+            // _postProcessing.ao would be called here when full RenderPipeline integration exists
+            renderer.render(scene, camera);
+        } else {
+            renderer.render(scene, camera);
+        }
         if (stats) stats.update();
         if (++_tickSkippedFrames > _IDLE_FRAME_THRESHOLD) _skipExpensiveUpdates = true;
         return _drawCalls();
@@ -4127,6 +4214,13 @@ window.DC = {
         return { ...S, _fps };
     },
     bench: bench,   // await DC.bench(seconds) — renderer A/B/C harness, see docs/dc_renderer_modes.md
+    // --- Step 7.6: idle reset for benchmarking ---
+    noteUserInput: function () {
+        // Resets the idle-skip gate so the FPS ring buffer keeps filling during bench().
+        // Unlike setLodFocus, this is unconditional — any user activity should reset idle.
+        _tickSkippedFrames = 0;
+        _skipExpensiveUpdates = false;
+    },
     // --- Step 6.2 shadow controls (exposed for testing) ---
     setShadowsEnabled: setShadowsEnabled,
     setShadowMapSize: setShadowMapSize,

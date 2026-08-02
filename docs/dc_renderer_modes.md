@@ -16,9 +16,11 @@ classic `WebGLRenderer`, exactly as it did before this work. Everything below is
 | `webgpu` | `three.webgpu.js` | `WebGPURenderer` | WebGPU if `navigator.gpu` yields an adapter, else the renderer's own WebGL 2 backend |
 | `webgpu-gl` | `three.webgpu.js` | `WebGPURenderer({forceWebGL:true})` | WebGL 2, forced |
 
-`webgpu-gl` exists to make the comparison honest. `webgl` → `webgpu-gl` isolates the cost of
-the node-renderer architecture (same GPU API, different three.js internals); `webgpu-gl` →
-`webgpu` isolates the WebGPU API itself (same internals, different GPU API).
+`webgpu-gl` is a **diagnostic tool**, not a production renderer or a fallback tier. It runs the
+node-renderer architecture with WebGL 2 forced as the GPU backend, regardless of whether a
+WebGPU adapter is available. Its only purpose is to make `webgl` → `webgpu-gl` isolate the cost
+of the node-renderer architecture (same GPU API, different three.js internals) and
+`webgpu-gl` → `webgpu` isolate the WebGPU API itself (same internals, different GPU API).
 
 ## How the mode is picked
 
@@ -124,7 +126,8 @@ why the numbers are so low):
 
 ```json
 { "mode": "webgl", "backend": "webgl", "avgFps": 4, "minFps": 2,
-  "drawCalls": 120, "dpr": 0.5, "location": 4, "seconds": 40, "samples": 69 }
+  "drawCalls": 120, "dpr": 0.5, "location": 4, "seconds": 40, "samples": 69,
+  "ao": false, "shadows": true, "shadowMapSize": 2048, "pixelScale": 0.8, "triangles": 52340 }
 ```
 
 Read the fields carefully:
@@ -137,10 +140,17 @@ Read the fields carefully:
   seen, not the worst single frame — a one-frame hitch is smeared across the window.
 - `avgFps` and `minFps` are `null` when the 60-frame window never filled (a slow enough
   renderer, or too short a `seconds`). `samples` tells you how many readings went in.
+  When this happens `bench()` logs a console warning.
 - `dpr` is the effective pixel ratio. `dc-multi.js` sets a 0.8 quality scale on load, and the
   auto-quality scaler drops it further under load — two runs at different `dpr` are not
   comparable, so check it before comparing FPS.
 - `drawCalls` is the worst (highest) per-frame count seen over the run.
+- `ao` is `false` — ambient occlusion is not yet implemented in this scene.
+- `shadows` is `true` when shadow rendering is active.
+- `shadowMapSize` is the shadow map resolution in pixels (typically 512, 1024, or 2048).
+- `pixelScale` is the quality scale multiplier applied to the renderer pixel ratio
+  (`S.pixelScale`, distinct from `dpr` which is the effective ratio after auto-quality).
+- `triangles` is the per-frame triangle count from `renderer.info.render.triangles`.
 
 ## Findings
 
