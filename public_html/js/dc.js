@@ -257,6 +257,9 @@ let _posCtrls = null, _guiPosLast = 0; // the x/y/z GUI controllers; their left 
 // panel gets. Pre-resolved so the classic renderer never waits on it (see init()).
 let _panelBackendReady = Promise.resolve();
 let _panelBackendSettled = () => {};
+// The error init() died of, or null. Settling the gate only means "init() stopped", not "a backend was
+// chosen", so loadDatacenter()'s continuation reads this to tell the two apart (see _failInit()).
+let _initError = null;
 let roomDoors = [];     // the main building's solid SWING doors (back + left), animated by updateRoomDoors
 let roomSideDoors = []; // their {side,c,half} descriptors -> the current building's extra collision door gaps
 let lodFocus = null;    // {x,z} the player's ground position (set by dc-multi); the LOD keys off this, not the orbit camera
@@ -711,6 +714,12 @@ function loadDatacenter() {
             return _panelBackendReady;
         })
         .then(() => {
+            // The gate settling means init() STOPPED, not that it got far enough to pick a backend:
+            // _failInit() settles it on the way out of a throw too. There is no camera and no renderer
+            // to build a panel or a room against in that case, and the failure has already been logged
+            // and shown, so stop here rather than throw a second, more confusing error out of
+            // displayGui(). Never set on the classic path unless init() itself threw.
+            if (_initError) return;
             displayGui();
             displayDatacenter();
             _restoreCamera();       // after spawnInside() placed the player at the room default
@@ -940,6 +949,25 @@ function notice(text, ms = 12000) {
     }
     _noticeEl.textContent = text;
     if (ms > 0) _noticeTimer = setTimeout(() => { _noticeTimer = null; notice(''); }, ms);
+}
+
+// init() IS the scene, so a throw anywhere inside it means there is nothing left to show. Two things
+// have to happen then no matter where it died. loadDatacenter()'s chain parks on _panelBackendReady —
+// armed at the top of init() in webgpu mode and settled ~300 lines later — so anything that throws in
+// between (await renderer.init(), loadFloor(), the Inspector's dynamic import) left that chain waiting
+// on a promise nobody would ever settle: "Loading datacenter…" stayed up for the life of the page, over
+// a dead scene, with nothing but the original error in the console to explain it. And the user has to
+// be told IN THE PAGE that the scene is not coming, which is what notice() is already for — it sits at
+// z-index 41, deliberately above the curtain, for exactly this kind of message.
+function _failInit(err) {
+    // Settle first. Everything below touches the DOM, and a throw down there must not cost the gate its
+    // settle — that would put us straight back in the permanent-curtain case this exists to end.
+    _initError = err || new Error('init() failed');
+    _panelBackendSettled();
+    console.error('[dc] init failed — the 3D scene is not running:', err);
+    notice('3D scene failed to start: ' + ((err && err.message) || err), 0);   // 0 -> stays up; not transient
+    const loading = document.getElementById('dcLoading');
+    if (loading) loading.textContent = 'The 3D scene failed to start — see the browser console.';
 }
 
 // Resolve a rack/server TYPE index to the model name to fetch, or null when there is nothing to
@@ -3971,6 +3999,14 @@ window.DC = {
 // Top-level await: init() has to await the node renderer's device acquisition before anything can
 // draw. window.DC is already assigned above, and the satellite modules poll for DC.renderer rather
 // than reading it eagerly, so the extra microtask/device wait is absorbed.
-await init();
+try {
+    await init();
+} catch (err) {
+    // Report the failure and release loadDatacenter()'s chain BEFORE the module dies with it; see
+    // _failInit(). Re-thrown untouched afterwards: the page is dead either way, nothing below can run
+    // without a renderer, and the original error stays exactly as loud as it was.
+    _failInit(err);
+    throw err;
+}
 _animationLoopCb = animate;
 renderer.setAnimationLoop(_guardLoop(animate));
