@@ -34,6 +34,19 @@ Expanded the assets SELECT in `public_html/ajax/datacenter.php` to include more 
 
 ---
 
+#### Step 9.2 — Rich in-scene info panel with status, IPv4, MAC, hardware
+
+Rewrote `showInfo()` in `dc.js` to display more asset information when a server is clicked. The info panel now shows: status (with a colored dot: green=active, red=off/canceled, yellow=warning), IPv4 address, MAC address, hardware make/model, position as U-start to U-end, plus asset and order links. A close button (×) dismisses the panel. All values are passed through `escapeHtml()` for XSS safety.
+
+| File | What Changed |
+|------|-------------|
+| `public_html/js/dc.js` | Rewrote `showInfo()` to display status dot, IPv4, MAC, hardware, position, links; added close button |
+| `public_html/css/dc-shared.css` | Added `.dc-info-close`, `.dc-status-dot`, `.status-active/off/warning`, `.dc-info-row`, `.dc-info-links` |
+
+**Tests:** New Vitest test in `tests/js/dc-info-panel.test.js` verifying escapeHtml coverage on all fields, status dot CSS classes, and expanded field presence.
+
+---
+
 ### Phase 8
 
 #### Step 8.3 — Reduce the cable triangle bill

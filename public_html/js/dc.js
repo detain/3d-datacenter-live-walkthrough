@@ -3176,12 +3176,39 @@ function showInfo(hit) {
     const panel = document.getElementById('dcInfo');
     if (!panel || !hit || !hit.asset) return;
     const a = hit.asset;
+    // Close button
+    const closeBtn = '<button class="dc-info-close" onclick="document.getElementById(\'dcInfo\').style.display=\'none\'" aria-label="Close">&times;</button>';
     if (hit.kind === 'server') {
-        panel.innerHTML = '<div class="dc-info-title">' + escapeHtml(a.hostname || 'server') + '</div>' +
-            '<a href="/admin/?choice=none.asset_form&id=' + encodeURIComponent(a.id) +
+        // Status dot: green=active, red=off/canceled, yellow=warning/other
+        let statusDot = '';
+        if (a.status) {
+            const sc = a.status === 'active' ? 'status-active'
+                : (a.status === 'off' || a.status === 'canceled' ? 'status-off' : 'status-warning');
+            statusDot = '<span class="dc-status-dot ' + sc + '" title="' + escapeHtml(a.status) + '"></span> ';
+        }
+        // Position: U-start to U-end
+        const uStart = a.start;
+        const uEnd = a.start + (a.size || 1) - 1;
+        const position = 'U' + uStart + ' to U' + uEnd;
+        // Hardware: make/model
+        const hw = [a.make, a.model].filter(Boolean).join(' / ') || '—';
+        // Links
+        const assetLink = '<a href="/admin/?choice=none.asset_form&id=' + encodeURIComponent(a.id) +
             '" target="_blank" rel="noopener">View asset #' + escapeHtml(String(a.id)) + ' &rarr;</a>';
+        const orderLink = a.order_id
+            ? '<a href="/admin/?choice=none.order_form&id=' + encodeURIComponent(a.order_id) +
+              '" target="_blank" rel="noopener">View order #' + escapeHtml(String(a.order_id)) + ' &rarr;</a>'
+            : '';
+        panel.innerHTML = closeBtn +
+            '<div class="dc-info-title">' + escapeHtml(a.hostname || 'server') + '</div>' +
+            '<div class="dc-info-row">' + statusDot + escapeHtml(a.status || 'unknown') + '</div>' +
+            '<div class="dc-info-row">IPv4: ' + escapeHtml(a.primary_ipv4 || '—') + '</div>' +
+            '<div class="dc-info-row">MAC: ' + escapeHtml(a.mac || '—') + '</div>' +
+            '<div class="dc-info-row">Hardware: ' + escapeHtml(hw) + '</div>' +
+            '<div class="dc-info-row">Position: ' + escapeHtml(position) + '</div>' +
+            '<div class="dc-info-links">' + assetLink + (orderLink ? ' ' + orderLink : '') + '</div>';
     } else {
-        panel.innerHTML = '<div class="dc-info-title">Rack ' + escapeHtml(a.name || '') + '</div>';
+        panel.innerHTML = closeBtn + '<div class="dc-info-title">Rack ' + escapeHtml(a.name || '') + '</div>';
     }
     panel.style.display = 'block';
 }
