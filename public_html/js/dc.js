@@ -3742,6 +3742,11 @@ function updateControls(time) {
 
 // Event handler for keydown
 function onKeyDown(event) {
+    // Don't capture keys when typing in an input, textarea, or contenteditable element
+    const target = event.target;
+    if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) {
+        return;
+    }
     switch (event.code) {
         case "ArrowUp":
         case "KeyW":
@@ -3763,9 +3768,10 @@ function onKeyDown(event) {
             if (options.canJump === true) velocity.y += 100; // ~2 ft hop (was 350 = a ~24 ft leap)
             options.canJump = false;
             break;
-        // IDEA-5: Number keys 1-9 jump to the first 9 locations
+        // IDEA-5: Number keys 1-9 jump to the first 9 locations (Alt+digit required to avoid accidental triggers)
         case "Digit1": case "Digit2": case "Digit3": case "Digit4": case "Digit5":
         case "Digit6": case "Digit7": case "Digit8": case "Digit9": {
+            if (!event.altKey) break;
             const idx = parseInt(event.code.replace("Digit", ""), 10) - 1;
             const locKeys = Object.keys(locationNames);
             if (locKeys[idx] !== undefined) {
