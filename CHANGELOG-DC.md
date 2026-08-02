@@ -145,6 +145,7 @@ window.DCM.getPresenceEnabled()  // Boolean presence system status
 |----|------|-------|-----|
 | rIC guard | `dc.js` | `requestIdleCallback ?` threw a `ReferenceError` in browsers missing the global, crashing the entire DC module before `window.DC` was assigned | Replaced the bare ternary guard with `typeof requestIdleCallback === 'function'` — evaluates safely with no global required |
 | rIC queue | `dc.js` | The polyfill stored only one pending callback in `_ricChannel._cb`; a second call before the first drained silently overwrote the first, losing that deferred merge and its building's cables never appeared | Replaced the single slot with a `_ricQueue` array; `port1.onmessage` now drains all queued callbacks in a try/catch so a throwing callback cannot prevent subsequent ones from running |
+| Label deprioritization | `dc.js` | `updateLabels()` set `dePrioritized = true` for labels beyond MAX_LABELS (200) in the distance-sorted order but never cleared it when those labels moved back into the nearest 200 — in a room with 3137 labels that meant every label died within seconds of walking, hidden even at point-blank range | Changed the loop to run over all labels and assign `dePrioritized = (i >= MAX_LABELS)` each frame, so the flag is set correctly in both directions |
 
 ---
 
