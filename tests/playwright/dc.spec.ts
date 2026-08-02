@@ -755,7 +755,15 @@ test.describe('Group 9: Renderer modes', () => {
 
     test(`[${label}] the switch button labels itself and survives #dcPlayer being hidden`, async ({ page }) => {
       await boot(page, url);
-      await page.waitForFunction(() => (window as any).DC && (window as any).DC.renderer, { timeout: 90000 });
+      // Settle, not construction. DC.renderer is truthy from `new WebGPURenderer(...)` onward, but the
+      // label this test is about is written by _setupRendererSwitch(), which dc.js only calls after
+      // `await renderer.init()` — a real device acquisition in webgpu mode. Gating on DC.renderer left
+      // the assertions below racing that await with their default 5s expect timeout, and headlessly the
+      // device sometimes lost: the button was still empty, and #dcRenderer:empty is display:none, so
+      // toBeVisible() read 'hidden'. waitForRendererSettled() waits for the label itself, which is the
+      // documented "the switch has been set up" signal (see the helper). Nothing is weakened — if dc.js
+      // never labels the button this now fails in the wait instead of the assertion.
+      await waitForRendererSettled(page);
 
       const btn = page.locator('#dcRenderer');
       // #dcRenderer:empty is display:none, so a visible button also proves dc.js labelled it.
