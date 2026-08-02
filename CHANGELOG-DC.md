@@ -83,6 +83,20 @@ Re-enabled frustum culling (`frustumCulled = true`) for neighbour building insta
 
 ---
 
+#### Step 7.3 — Add ambient occlusion on the WebGL path using GTAOPass
+
+The classic WebGL renderer path now supports ambient occlusion via three.js's `GTAOPass` run through an `EffectComposer` chain: `RenderPass → GTAOPass → OutputPass`. The feature is opt-in via a new **Display → ambient occlusion** toggle that only appears when `caps.supportsEffectComposer` is true (i.e., on the WebGL path; the WebGPU path uses TSL `GTAONode` via `_setupWebgpuPostFX()` instead).
+
+**Changes:**
+
+| File | Change |
+|------|--------|
+| `public_html/admin/dc.html` | Added `<link rel="modulepreload">` for `RenderPass.js`, `GTAOPass.js`, and `OutputPass.js` |
+| `public_html/js/dc.js` | Added `_composer` and `_aoPass` module variables; added `ambientOcclusion: false` to the `options` object; added `_setupWebglPostFX()` async function that dynamically imports `EffectComposer`, `RenderPass`, `GTAOPass`, and `OutputPass` and builds the composer chain; `init()` calls `_setupWebglPostFX()` after capability detection when not on the WebGPU path; `DC.tick()` now calls `_composer.render()` instead of `renderer.render()` when `options.ambientOcclusion && _composer`; the existing 3-way render branch comment updated to reflect the Step 7.3 AO path; added GUI toggle in the Display folder, guarded by `caps.supportsEffectComposer` |
+| `tests/js/dc-ao.test.js` | New Vitest test verifying GTAOPass availability, `supportsEffectComposer` correctness for WebGLRenderer, `ambientOcclusion` in options, and `_setupWebglPostFX` presence in source (only when GTAOPass is available) |
+
+---
+
 #### Step 7.4 — Add ambient occlusion on the WebGPU path using TSL
 
 Added infrastructure for WebGPU TSL postprocessing with a 3-way render branch in `tick()`:
