@@ -17,11 +17,13 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 // dc.js's own URL and drop the ?v=, so the adapter would go on being served from cache after an
 // edit that only bumped the <script> tags. dc.html modulepreloads the same URL.
 import { createPanel } from './dc-gui.js?v=p53';
+import { describeRenderer } from './dc-caps.js';
 import Stats from "three/addons/libs/stats.module.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import * as BufferGeometryUtils from "three/addons/utils/BufferGeometryUtils.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 let camera, scene, renderer, controls, controlObject, stats, inspector, gui, locations = {}, maxAnisotropy; // Declare global variables
+let caps = null; // Step 7.1: renderer capability descriptor
 let prevTime = performance.now();
 let objects = {instanced: [], network: null, rackLabels: [], labels: [], room: null, community: null}, models = { racks: {}, servers: {} }, locationNames = {};
 let sunCore = null, sunGlow = null;  // sun spheres (Fix #5 disposal)
@@ -1224,7 +1226,9 @@ function buildInstanced(model, placements, kind, sink) {
         inst.userData.modelBox = model.box;    // model-space bounds (highlight box size)
         container.add(inst);
         instList.push(inst);
-        inst.frustumCulled = false;  // Fix #8: instances spread wide -> loose bounding sphere
+        // Step 7.2: neighbour buildings get frustum culling enabled; current building keeps
+        // disabled (room-spanning bounding sphere makes culling pointless for its meshes)
+        inst.frustumCulled = !!sink;
         created.push(inst);
     }
     // Racks are the only collidable furniture. model.box unions EVERY sub-mesh -- including the
@@ -3485,6 +3489,9 @@ async function init() {
                                               : renderer.capabilities.getMaxAnisotropy();
     _setupRendererSwitch();
 
+    // Step 7.1: capture renderer capabilities for use throughout the module
+    caps = describeRenderer(renderer);
+
     // Phase 6: enable shadow rendering
     // NOTE: PCFSoftShadowMap is supported on the WebGPU/node-renderer path (via TSL ShadowFilterNode
     // which includes PCFSoftShadowFilter in its filter library). On the classic WebGL path,
@@ -3638,7 +3645,7 @@ async function init() {
     // Only the classic renderer surfaces context loss as canvas events. The node renderer's WebGL2
     // backend installs its OWN webglcontextlost listener (which preventDefaults and forwards to
     // onDeviceLost), so attaching these there would run both recovery paths against one loss.
-    if (renderer.isWebGLRenderer) {
+    if (!caps.isNode) {
         renderer.domElement.addEventListener('webglcontextlost', (e) => {
             e.preventDefault();
             _contextLost = true;
@@ -3944,6 +3951,8 @@ let _backendName = 'webgl';
 // Set from the renderer parameters in init(); read by dc-multi.js's "GPU Mode" row, which has no
 // other way to know what was asked for and must not guess.
 let _powerPreference = 'browser default';
+// webgpu-gl is a DIAGNOSTIC TOOL, not a fallback tier or production renderer. It forces the
+// node-renderer onto WebGL 2 so the architecture cost can be measured in isolation from the API.
 const _MODE_LABELS = { webgl: 'WebGL', webgpu: 'WebGPU', 'webgpu-gl': 'WebGPU/GL' };
 const _BACKEND_LABELS = { webgl: 'WebGL', webgpu: 'WebGPU', 'webgl2-fallback': 'WebGPU (GL)' };
 
@@ -3953,8 +3962,9 @@ function _rendererMode() {
 }
 
 function _setupRendererSwitch() {
-    // classic WebGLRenderer has no .backend at all
-    _backendName = renderer.backend ? (renderer.backend.isWebGPUBackend ? 'webgpu' : 'webgl2-fallback') : 'webgl';
+    // Use caps.isNode to determine the backend family, then renderer.backend.isWebGPUBackend
+    // to distinguish 'webgpu' from 'webgl2-fallback' within the node renderer's two backends.
+    _backendName = !caps.isNode ? 'webgl' : (renderer.backend.isWebGPUBackend ? 'webgpu' : 'webgl2-fallback');
     const btn = document.getElementById('dcRenderer');
     if (!btn) return;
     const next = _rendererMode() === 'webgl' ? 'webgpu' : 'webgl';

@@ -22,6 +22,37 @@ Two browser tabs with the same session (same user) can now see each other in Dat
 
 ---
 
+### Phase 7
+
+#### Step 7.5 — Clarify webgpu-gl is a diagnostic tool, not a fallback tier
+
+The `?renderer=webgpu-gl` mode was described as a "comparison" tool but its framing implied it was a fallback path. It is not — it is a **diagnostic tool** that forces the node-renderer onto WebGL 2 so the architecture cost can be measured in isolation from the GPU API. It should never be presented to users as a recommended option or a fallback when WebGPU is unavailable.
+
+**Changes:**
+
+| File | Change |
+|------|--------|
+| `docs/dc_renderer_modes.md` | Updated the `webgpu-gl` description to explicitly state it is a diagnostic tool; the table now notes it is not a fallback tier |
+| `public_html/js/dc.js` | Added comment above `_MODE_LABELS` explaining `webgpu-gl` is for debugging only |
+| `public_html/js/dc-renderer-mode.js` | Added `IMPORTANT` note in `parseRendererMode()` JSDoc that `webgpu-gl` is a diagnostic tool, not a fallback tier |
+
+---
+
+#### Step 7.2 — Restore frustum culling for neighbours and player
+
+Re-enabled frustum culling (`frustumCulled = true`) for neighbour building instanced meshes and the player character. The current building's meshes keep `frustumCulled = false` because their room-spanning bounding spheres make culling ineffective.
+
+**Changes:**
+
+| File | Change |
+|------|--------|
+| `public_html/js/dc.js` | `buildInstanced()` now sets `frustumCulled = !!sink` — true for neighbour buildings (sink is passed), false for current building (sink is undefined) |
+| `public_html/js/dc-multi.js` | Player character model traverse sets `frustumCulled = true` on all meshes |
+
+**Tests:** New Vitest test in `tests/js/dc-frustum-culling.test.js`
+
+---
+
 ### Phase 6
 
 #### Step 6.1 — Enable shadow rendering with PCFSoftShadowMap

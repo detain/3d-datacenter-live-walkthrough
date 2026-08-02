@@ -319,7 +319,7 @@ async function loadCharacter(ch) {
   }
   hud("");
   const root = gltf.scene;
-  root.traverse(o => { if (o.isMesh) { o.castShadow = true; o.frustumCulled = false; } });
+  root.traverse(o => { if (o.isMesh) { o.castShadow = true; o.frustumCulled = true; } }); // Step 7.2: player benefits from frustum culling
 
   // scale so the model's height matches the player's configured height in scene units
   const box = new THREE.Box3().setFromObject(root);
