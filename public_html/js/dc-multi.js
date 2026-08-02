@@ -721,8 +721,11 @@ function setMode(mode) {
 function toggleMode() { setMode(S.mode === "first" ? "third" : "first"); }
 
 // Mouse wheel = camera dolly (see CAM_* constants). Scroll down = zoom out, scroll up = zoom in.
+// F-18: scope preventDefault to canvas only — do not break lil-gui, .parameters, .dc-chat-frame, #dcSearchResults
 function onWheel(e) {
-  if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+  if (e.target && /^(INPUT|TEXTAREA)$/.test(e.target.tagName)) return;
+  const canvas = document.querySelector('canvas');
+  if (e.target !== canvas && document.pointerLockElement !== canvas) return;
   e.preventDefault();
   const out = e.deltaY > 0;
   if (S.mode === "first") {
