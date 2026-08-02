@@ -96,18 +96,38 @@ function makeDom() {
 
 // The datacenter payload loadDatacenter() merges. Keyed at location 4 like the Playwright fixture —
 // nothing here reads it, but mergeLocations() is stubbed and the shape should still be honest.
-const PAYLOAD = { locations: { 4: { name: 'Test DC', region: 'Test', racks: {} } } };
+const PAYLOAD = { locations: { 4: { _full: true, name: 'Test DC', region: 'Test', racks: {} } } };
 
 function makeHarness(opts = {}) {
     const dom = makeDom();
     const calls = { displayGui: 0, displayDatacenter: 0, restoreCamera: 0, merged: [] };
     const errors = [];
     const timers = { set: [], cleared: [] };
-    let resolveFetch;
-    const fetchGate = new Promise((r) => { resolveFetch = r; });
-    const response = {
-        ok: opts.fetchOk !== false,
-        json: () => Promise.resolve(PAYLOAD),
+    let resolveFetchIndex;
+    const fetchIndexGate = new Promise((r) => { resolveFetchIndex = r; });
+
+    let resolveFetchLocation;
+    const fetchLocationGate = new Promise((r) => { resolveFetchLocation = r; });
+
+    // F-29 / two-tier fetch: each fetch call needs its own Response object that can be consumed
+    // independently. The single `response` object is now a factory that creates a fresh response.
+    const responseFactory = {
+        create: () => ({
+            ok: opts.fetchOk !== false,
+            json: () => Promise.resolve(PAYLOAD),
+        }),
+    };
+
+    // URL-aware fetch stub that routes to the appropriate gate
+    const fetchStub = (url) => {
+        if (url.includes('tier=index')) {
+            return fetchIndexGate.then(() => responseFactory.create());
+        }
+        if (url.includes('location=')) {
+            return fetchLocationGate.then(() => responseFactory.create());
+        }
+        // Fallback for unexpected URLs
+        return Promise.reject(new Error('Unexpected fetch URL: ' + url));
     };
     const prelude = [
         extractLet('_panelBackendReady'),
@@ -118,6 +138,7 @@ function makeHarness(opts = {}) {
         extractFn('notice'),
         extractFn('_failInit'),
         extractFn('loadDatacenter'),
+        'const options = { location: 4 };',
     ].join('\n\n');
     const factory = new Function(
         'fetch', 'dcUrl', 'mergeLocations', '_restoreLocation', 'displayGui', 'displayDatacenter',
@@ -134,7 +155,7 @@ function makeHarness(opts = {}) {
         };`
     );
     const api = factory(
-        () => fetchGate.then(() => response),
+        fetchStub,
         (p) => p,
         (data) => calls.merged.push(data),
         () => {},
@@ -149,7 +170,7 @@ function makeHarness(opts = {}) {
         (fn, ms) => { timers.set.push(ms); return { fn, ms }; },
         (t) => { timers.cleared.push(t); }
     );
-    return { ...api, dom, calls, errors, timers, resolveFetch };
+    return { ...api, dom, calls, errors, timers, resolveFetchIndex, resolveFetchLocation };
 }
 
 // Let every already-queued microtask run. loadDatacenter()'s chain is four `.then()`s deep, so a
@@ -207,10 +228,15 @@ describe('dc.js — loadDatacenter() waits on the gate', () => {
     it('does not build the panel until the gate settles', async () => {
         H.arm(NODE_THREE);
         H.loadDatacenter();
-        H.resolveFetch();
+        H.resolveFetchIndex();
         await flush();
-        expect(H.calls.merged.length).toBe(1);      // the payload landed…
-        expect(H.calls.displayGui).toBe(0);         // …but the panel is still waiting on the backend
+        expect(H.calls.merged.length).toBe(1);      // the index payload landed…
+        expect(H.calls.displayGui).toBe(0);         // …but the panel is still waiting on the location fetch + backend
+        H.resolveFetchLocation();
+        await flush();
+        // location fetch resolved, mergeLocations(true) called, but still waiting on gate
+        expect(H.calls.merged.length).toBe(2);
+        expect(H.calls.displayGui).toBe(0);
         H.settle();
         await flush();
         expect(H.calls.displayGui).toBe(1);
@@ -219,10 +245,18 @@ describe('dc.js — loadDatacenter() waits on the gate', () => {
     it('builds the panel, the room and the camera and lifts the curtain on the happy path', async () => {
         H.arm(NODE_THREE);
         H.loadDatacenter();
-        H.resolveFetch();
-        H.settle();
+        H.resolveFetchIndex();
         await flush();
-        expect(H.calls.displayGui).toBe(1);
+        // index fetch resolved, mergeLocations(false) called, location fetch started (pending)
+        expect(H.calls.merged.length).toBe(1);
+        H.resolveFetchLocation();
+        // location fetch completes, mergeLocations(true) called, but displayGui waits on _panelBackendReady
+        await flush();
+        expect(H.calls.merged.length).toBe(2);
+        expect(H.calls.displayGui).toBe(0);  // still waiting on _panelBackendReady
+        H.settle();                           // resolve _panelBackendReady
+        await flush();
+        expect(H.calls.displayGui).toBe(1);  // now displayGui is called
         expect(H.calls.displayDatacenter).toBe(1);
         expect(H.calls.restoreCamera).toBe(1);
         expect(H.dom.byId.dcLoading.style.display).toBe('none');
@@ -231,7 +265,10 @@ describe('dc.js — loadDatacenter() waits on the gate', () => {
     it('runs straight through on the classic build, where the gate is already resolved', async () => {
         H.arm(CLASSIC_THREE);
         H.loadDatacenter();
-        H.resolveFetch();
+        H.resolveFetchIndex();
+        await flush();
+        expect(H.calls.merged.length).toBe(1);
+        H.resolveFetchLocation();
         await flush();
         expect(H.calls.displayGui).toBe(1);
         expect(H.dom.byId.dcLoading.style.display).toBe('none');
@@ -240,12 +277,15 @@ describe('dc.js — loadDatacenter() waits on the gate', () => {
     it('does NOT build a panel for a scene that failed to start', async () => {
         H.arm(NODE_THREE);
         H.loadDatacenter();
-        H.resolveFetch();
+        H.resolveFetchIndex();
         await flush();
+        // Index fetch resolved, mergeLocations(false) called
+        // Location fetch is still pending
         H._failInit(new Error('renderer.init() exploded'));
         await flush();
         // A gate that settled because init() DIED is not a backend decision: there is no camera to
         // build controllers against, and displayGui() would only throw a second, more confusing error.
+        // With two-tier fetch, the location fetch is still pending, so displayGui is never called.
         expect(H.calls.displayGui).toBe(0);
         expect(H.calls.displayDatacenter).toBe(0);
     });
@@ -254,7 +294,8 @@ describe('dc.js — loadDatacenter() waits on the gate', () => {
         const F = makeHarness({ fetchOk: false });
         F.arm(CLASSIC_THREE);
         F.loadDatacenter();
-        F.resolveFetch();
+        // First fetch fails (ok: false), triggering the catch handler
+        F.resolveFetchIndex();
         await flush();
         expect(F.calls.displayGui).toBe(0);
         expect(F.errors.join(' ')).toContain('problem with the fetch operation');
@@ -381,14 +422,19 @@ describe('dc.js — top-level bootstrap', () => {
 describe('dc.js — a webgpu init() that throws mid-way', () => {
     it('explains itself instead of leaving a permanent loading curtain', async () => {
         H.arm(NODE_THREE);            // init() top: gate armed
-        H.loadDatacenter();           // init() next line: the fetch goes out
-        H.resolveFetch();             // payload lands; the chain parks on the gate
+        H.loadDatacenter();           // init() next line: both fetches go out
+        // Index fetch resolves, location fetch is still pending (waiting on fetchLocationGate)
+        // The chain parks on the location fetch AND _panelBackendReady
+        H.resolveFetchIndex();
         await flush();
+        // Index fetch completed, location fetch pending, chain is waiting
         expect(H.dom.byId.dcLoading.textContent).toContain('Loading datacenter');
-        H._failInit(new Error('renderer.init() exploded'));   // init() throws before it can settle
+        // Simulate init() throwing before it can settle — _failInit breaks the logjam
+        // and sets the error message directly (F-29 fix for stranded loading curtain)
+        H._failInit(new Error('renderer.init() exploded'));
         await flush();
         // The user is told, in the page, twice over — and nothing tried to build a panel.
-        expect(H.dom.byId.dcLoading.textContent).toContain('failed to start');
+        expect(H.dom.byId.dcLoading.textContent).toContain('The 3D scene failed to start');
         expect(H.noticeEl().textContent).toContain('renderer.init() exploded');
         expect(H.calls.displayGui).toBe(0);
         expect(H.errors.join(' ')).toContain('init failed');
