@@ -117,7 +117,7 @@ const _ric = typeof requestIdleCallback === 'function'
                 const queued = _ricQueue;
                 _ricQueue = [];
                 for (const fn of queued) {
-                    try { fn({ didTimeout: false, timeRemaining: () => 0 }); }
+                    try { fn({ didTimeout: false, timeRemaining: () => 0 /* intentionally stubbed — the polyfill has no deadline source */ }); }
                     catch (e) { console.error('[dc] idle callback threw:', e); }
                 }
             };
