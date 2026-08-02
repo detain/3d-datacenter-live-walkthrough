@@ -68,3 +68,44 @@
 #dcWsToggle:hover { background: rgba(40,40,58,0.92); color: #fff; }
 #dcWsToggle.off { color: #888; border-color: rgba(255,255,255,0.05); }
 #dcWsToggle.off:hover { background: rgba(30,30,48,0.88); }
+
+/* --- Renderer switch (unique to dc.html inline block, F-21) ---
+   Deliberately NOT inside #dcPlayer: dc-multi.js hides that whole row
+   (`pl.style.display = "none"`) as soon as it moves the player controls into the gui's
+   "Player" folder, which took this button with it and left the renderer unswitchable.
+   Parked in the left column under the Stats panel (80x48 at 0,0) and left of #dcSearch
+   (x >= 170) — the right edge belongs to the lil-gui panel, which can run the full
+   viewport height. Empty until dc.js labels it, so a renderer that never comes up shows
+   no orphan box. */
+#dcRenderer { position: fixed; top: 56px; left: 10px; z-index: 32;
+	padding: 7px 11px; border: 1px solid #888; border-radius: 5px; cursor: pointer; white-space: nowrap;
+	background: rgba(255,255,255,0.93); font: 13px Arial, sans-serif; color: #222;
+	opacity: 0.4; transition: opacity 0.22s ease; }
+#dcRenderer:hover { opacity: 1; background: #ffe9a8; }
+#dcRenderer:empty { display: none; }
+
+/* Same three rules for the webgpu-mode panel, which is the three.js Inspector's Parameters
+   tab instead of lil-gui (public_html/js/dc-gui.js drives both). Keyed on .parameters, the
+   class the Inspector puts on that tab's list: the tab is "builtin", so its content is moved
+   into the mini-panel that drops out of #profiler-toggle rather than staying in
+   #profiler-panel, and it moves again if the tab is detached. Nothing on the default page
+   carries the class, so none of this can reach it. The Inspector injects its stylesheet into
+   <head> at runtime — i.e. after this block — so these are written to outrank it on
+   specificity, including the grid template the List injects inline per instance. */
+.parameters .dc-val { color: #ffd23a; font-weight: bold; }
+/* .list-container is on the same element as .parameters purely to outweigh the grid template
+   the List injects as [data-list-id="…"] .list-item-row — that scores the same as a
+   two-class selector and is emitted later in the document, so it wins any tie. */
+.list-container.parameters > .list-header,
+.list-container.parameters .list-item-row { grid-template-columns: 1.4fr 1fr; }
+.parameters .param-control input[type="number"] { display: none; }
+/* The Inspector's #profiler-toggle is position:fixed top:15/right:15 at z-index 1001 and lands
+   on the top-right control row (all z-index 32), which makes both unclickable. dc.js adds
+   .dc-has-inspector to <body> only when the real Inspector attached, so the default page is
+   untouched; the toggle measures 38px tall from y=15, so 62px clears it. The settings
+   mini-panel below the toggle still covers that corner while it is open — but so does the
+   lil-gui panel today, at the same width and the same z-index, so that part is parity rather
+   than a regression. */
+body.dc-has-inspector #dcPlayer,
+body.dc-has-inspector #dcPresence,
+body.dc-has-inspector #dcWsToggle { top: 62px; }
