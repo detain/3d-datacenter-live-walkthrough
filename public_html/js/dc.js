@@ -3608,15 +3608,22 @@ async function init() {
             // to take focus back first, then proceed either way.
             try { document.body.focus(); } catch (e) { /* body may not be focusable; harmless */ }
             try {
-                // lock() returns a Promise in newer PointerLockControls, undefined in older ones.
-                const lockResult = controls.lock();
-                if (lockResult && typeof lockResult.catch === 'function') {
-                    lockResult.catch(function (err) {
-                        console.warn('[dc] pointer lock rejected:', err && err.message);
-                    });
-                }
+                // Request raw pointer input without acceleration via unadjustedMovement.
+                // Falls back to PointerLockControls.lock() if the browser rejects the option.
+                renderer.domElement.requestPointerLock({ unadjustedMovement: true });
             } catch (err) {
-                console.warn('[dc] pointer lock failed:', err && err.message);
+                console.warn('[dc] pointer lock with unadjustedMovement rejected, falling back:', err && err.message);
+                try {
+                    // lock() returns a Promise in newer PointerLockControls, undefined in older ones.
+                    const lockResult = controls.lock();
+                    if (lockResult && typeof lockResult.catch === 'function') {
+                        lockResult.catch(function (err) {
+                            console.warn('[dc] pointer lock rejected:', err && err.message);
+                        });
+                    }
+                } catch (err) {
+                    console.warn('[dc] pointer lock failed:', err && err.message);
+                }
             }
         });
     }
