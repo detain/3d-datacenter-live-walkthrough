@@ -61,6 +61,25 @@ Shadow rendering can now be toggled and configured via the lil-gui settings pane
 
 ---
 
+#### Step 6.3 — Re-enable the qualityscaler's shadow tier
+
+The quality scaler's shadow map tier (gated off in Phase 2 step 2.2) is re-enabled with an oscillation guard.
+
+**Changes in `dc.js`:**
+
+| What | How |
+|------|-----|
+| `UPGRADE_LOCKOUT_MS` constant | `30000` — 30-second lockout prevents shadow-map upgrade after a downgrade |
+| `_lastDowngradeAt` variable | Tracks timestamp of last quality downgrade |
+| `_reduceQuality()` order | Shadow map halving moved to **Step 1** (before pixelScale reduction) |
+| `_upgradeQuality()` order | Shadow map doubling moved to **last step** (after pixelScale and lodBias) |
+| Lockout guard | `_upgradeQuality()` checks `Date.now() - _lastDowngradeAt < UPGRADE_LOCKOUT_MS` before shadow map upgrade and returns early if still locked out |
+| `S.shadowsEnabled` guard | Retained around shadow map steps in both functions |
+
+**Tests:** New Vitest test in `tests/js/dc-quality-scaler-shadow.test.js`
+
+---
+
 ### Bot Presence System (NEW FEATURE)
 
 When a real user joins DataCenter 3D, a simulated bot avatar is spawned that wanders around the datacenter. When the last real user leaves, the bot is cleaned up.
