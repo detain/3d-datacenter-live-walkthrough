@@ -154,6 +154,10 @@ function makeHarness(urlOutcome = () => 'ok', opts = {}) {
         extractFn('loadBuildingModels'),
         extractFn('locationLoaded'),
         extractFn('enterFull'),
+        extractFn('_readDeepLink'),
+        // OVERLAY_SOURCES is a large multi-line object; override applyOverlay with a no-op instead of
+        // extracting it, since unit tests do not exercise the overlay system (it requires Three.js/DOM).
+        'function applyOverlay() {}',
     ].join('\n\n');
     const factory = new Function(
         'loaderGltf', 'notice', 'models', 'dcUrl', 'extractModelMeshes', 'console',
@@ -161,7 +165,7 @@ function makeHarness(urlOutcome = () => 'ok', opts = {}) {
         'buildBuildingFull', 'buildNeighborInterior', 'scene',
         prelude + '\nreturn { rackTypes, serverTypes, GLB_VARIANTS, _failedGlbs, _inflightGlbs, glbVariantUrl,'
         + ' rackModelName, serverModelName, loadGlbWithFallback, getRackModels, getServerModels,'
-        + ' loadRackType, loadServerType, loadBuildingModels, locationLoaded, enterFull };'
+        + ' loadRackType, loadServerType, loadBuildingModels, locationLoaded, enterFull, _readDeepLink };'
     );
     const api = factory(
         loaderGltf,
