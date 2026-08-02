@@ -27,6 +27,10 @@ export const LIL_GUI = '/lib/lil-gui/dist/lil-gui.esm.js';
  * navigator.gpu is missing. Anything unrecognised — absent, empty, misspelled, wrong case — is
  * 'webgl', because the default page is everyone's page and an unknown value must not break it.
  *
+ * IMPORTANT: 'webgpu-gl' is a DIAGNOSTIC TOOL, not a fallback tier or production renderer. It
+ * forces the node-renderer onto WebGL 2 so the architecture cost can be measured in isolation from
+ * the API. It should never be presented to users as a recommended option.
+ *
  * @param {string} [search] - location.search, with or without the leading '?'.
  * @returns {{mode: string, buildFile: string, extraImports: Object<string,string>}}
  */
