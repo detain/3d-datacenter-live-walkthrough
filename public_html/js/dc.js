@@ -1008,8 +1008,11 @@ function _restoreCamera() {
 
 // Read deep link parameters from URL (?location=, ?rack=, ?asset=).
 // All numeric params are coerced with Number() for safety.
+// Guard against missing location (e.g., in test environments without browser globals).
 function _readDeepLink() {
-    const params = new URLSearchParams(location.search);
+    let search = '';
+    try { search = location.search; } catch (e) { /* location not available */ }
+    const params = new URLSearchParams(search);
     return {
         location: params.has('location') ? Number(params.get('location')) || null : null,
         rack: params.has('rack') ? Number(params.get('rack')) || null : null,

@@ -135,8 +135,10 @@ function makeHarness(opts = {}) {
         extractLet('_initError'),
         extractLet('_noticeEl'),
         extractLet('_noticeTimer'),
+        extractLet('_deepLinkTarget'),
         extractFn('notice'),
         extractFn('_failInit'),
+        extractFn('_readDeepLink'),
         extractFn('loadDatacenter'),
         'const options = { location: 4 };',
     ].join('\n\n');
