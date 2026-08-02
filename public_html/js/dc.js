@@ -1550,7 +1550,7 @@ const CABLE_OVERHEAD = 22; // y height of the overhead cable tray (above the rac
 const CABLE_END = 5;       // how far beyond a rack group's end racks the cables turn out
 const CABLE_SPREAD = 1.1;  // per-cable offset so bundled cables sit beside each other, not on one line
 const CABLE_RADIUS = 0.05;  // cable thickness in world units (true scale ~0.03; a touch thicker so it reads)
-const CABLE_RADIAL = 8;     // tube cross-section sides (8 = more circular at close range)
+const CABLE_RADIAL = 5;     // tube cross-section sides (5 = reduced triangle count, still readable)
 // Cable colours: random-ish per cable for now (could key off link speed later). Blue-dominant
 // with blue + orange accents, like a real patch field.
 const CABLE_COLORS = [ // 60% yellow, 20% blue, 20% orange
@@ -1630,7 +1630,7 @@ function displaySwitches(locId, dx, dz, sink) {
     // IDEA-4: Cable geometry LOD — reduce tubular segments when camera is far (overview mode)
     const camY = camera ? camera.position.y : 0;
     const farFromCables = camY > 25;
-    const maxTubular = farFromCables ? 40 : 220;
+    const maxTubular = farFromCables ? 24 : 96;
 
     const cacheKey = (sink ? locId + ':n' : locId) + ':' + maxTubular;  // cache main and neighbour cable geometry separately (LOD-aware)
     const racks = (locations[locId] || {}).racks; if (!racks) return;
@@ -1667,7 +1667,7 @@ function displaySwitches(locId, dx, dz, sink) {
         let len = 0;
         for (let i = 1; i < vecs.length; i++) len += vecs[i - 1].distanceTo(vecs[i]);
         const curve = new THREE.CatmullRomCurve3(cableCurvePoints(vecs, makeRng(seed || 1)));
-        const tubular = Math.min(maxTubular, Math.max(10, Math.round(len / 2.2)));
+        const tubular = Math.min(maxTubular, Math.max(10, Math.round(len / 4)));
         const geo = new THREE.TubeGeometry(curve, tubular, CABLE_RADIUS, CABLE_RADIAL, false);
         const count = geo.attributes.position.count;
         const colors = new Float32Array(count * 3);

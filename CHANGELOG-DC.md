@@ -22,7 +22,21 @@ Two browser tabs with the same session (same user) can now see each other in Dat
 
 ---
 
-### Phase 7
+### Phase 8
+
+#### Step 8.3 — Reduce the cable triangle bill
+
+Lowered cable geometry LOD to reduce draw call triangle count without visible quality loss at typical viewing distances.
+
+**Changes:**
+
+| File | Change |
+|------|--------|
+| `public_html/js/dc.js` | `CABLE_RADIAL`: 8 → 5 (fewer tube cross-section sides); `maxTubular`: 40/220 → 24/96 (lower LOD cap); tubular divisor: `len/2.2` → `len/4` (longer segments = fewer triangles) |
+
+**Tests:** New Vitest test in `tests/js/dc-cable-geometry.test.js`
+
+---
 
 #### Step 7.5 — Clarify webgpu-gl is a diagnostic tool, not a fallback tier
 
