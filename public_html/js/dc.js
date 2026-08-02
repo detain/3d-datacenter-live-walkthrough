@@ -3435,6 +3435,7 @@ function setupControls() {
 
 // ---- Phase 7: interaction (look-highlight, click-to-info, search + fly-to) ----
 const raycaster = new THREE.Raycaster();
+raycaster.firstHitOnly = true; // Step 8.1: BVH accelerated raycasting — stop at first hit
 const _centerNdc = new THREE.Vector2(0, 0);   // screen centre = "what you're looking at"
 const _hoverMatrix = new THREE.Matrix4();
 const _hoverPos = new THREE.Vector3();

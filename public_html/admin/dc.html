@@ -18,7 +18,8 @@
 			var imports = {
 				'three': three,
 				'three/addons/': '/lib/three/examples/jsm/',
-				'lil-gui': '/lib/lil-gui/dist/lil-gui.esm.js'
+				'lil-gui': '/lib/lil-gui/dist/lil-gui.esm.js',
+				'three-mesh-bvh': '/node_modules/three-mesh-bvh/build/index.umd.cjs'
 			};
 			// Deliberately not mapped in webgl mode: an accidental webgpu-only import
 			// should fail loudly there rather than half-work.
@@ -28,6 +29,7 @@
 			}
 			document.write('<script type="importmap">' + JSON.stringify({ imports: imports }) + '<\x2Fscript>');
 			document.write('<link rel="modulepreload" href="' + three + '">');
+			document.write('<link rel="modulepreload" href="/node_modules/three-mesh-bvh/build/index.umd.cjs">');
 		})();
 	</script>
 	<!-- DC: Three.js scene via importmap (standalone static fallback) -->

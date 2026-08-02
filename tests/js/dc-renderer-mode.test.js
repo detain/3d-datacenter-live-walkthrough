@@ -179,11 +179,11 @@ describe('rendererImports() — the whole map', () => {
     }
   });
 
-  it('has exactly three entries in webgl mode and five in the webgpu modes', () => {
+  it('has exactly four entries in webgl mode and six in the webgpu modes', () => {
     expect(Object.keys(rendererImports('')).sort())
-      .toEqual(['lil-gui', 'three', 'three/addons/']);
+      .toEqual(['lil-gui', 'three', 'three-mesh-bvh', 'three/addons/']);
     expect(Object.keys(rendererImports('?renderer=webgpu')).sort())
-      .toEqual(['lil-gui', 'three', 'three/addons/', 'three/tsl', 'three/webgpu']);
+      .toEqual(['lil-gui', 'three', 'three-mesh-bvh', 'three/addons/', 'three/tsl', 'three/webgpu']);
   });
 });
 
@@ -237,7 +237,7 @@ describe('dc.html mode script — agrees with dc-renderer-mode.js', () => {
     it(`${label} → preloads the build it just mapped`, () => {
       const out = runInline(search);
       const { buildFile } = parseRendererMode(search);
-      expect(out.preloads).toHaveLength(1);
+      expect(out.preloads).toHaveLength(2); // three.js + three-mesh-bvh
       expect(out.preloads[0]).toContain('href="' + buildFile + '"');
       expect(out.imports.three).toBe(buildFile);
     });
@@ -254,7 +254,7 @@ describe('dc.html mode script — agrees with dc-renderer-mode.js', () => {
 
   it('writes the import map before the preload, so the map is in place either way', () => {
     const out = runInline('?renderer=webgpu');
-    expect(out.writes).toHaveLength(2);
+    expect(out.writes).toHaveLength(3); // importmap + two modulepreloads (three.js + three-mesh-bvh)
     expect(out.writes[0]).toContain('importmap');
     expect(out.writes[1]).toContain('modulepreload');
   });

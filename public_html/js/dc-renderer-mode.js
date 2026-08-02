@@ -19,6 +19,7 @@
 export const THREE_BASE = '/lib/three/build/';
 export const ADDONS_BASE = '/lib/three/examples/jsm/';
 export const LIL_GUI = '/lib/lil-gui/dist/lil-gui.esm.js';
+export const THREE_MESH_BVH = '/node_modules/three-mesh-bvh/build/index.umd.cjs';
 
 /**
  * Resolve a location.search into the renderer mode and the three.js build it needs.
@@ -60,5 +61,6 @@ export function rendererImports(search) {
         'three': buildFile,
         'three/addons/': ADDONS_BASE,
         'lil-gui': LIL_GUI,
+        'three-mesh-bvh': THREE_MESH_BVH,
     }, extraImports);
 }

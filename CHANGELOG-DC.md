@@ -119,6 +119,24 @@ Added a capacity overlay system that tints rack InstancedMeshes with a red→amb
 
 ### Phase 8
 
+#### Step 8.1 — Accelerate picking with three-mesh-bvh
+
+Added `three-mesh-bvh` BVH acceleration for raycasting in the datacenter 3D scene. This provides significant speedup for complex model picking by using a bounding volume hierarchy instead of naive ray intersection on every triangle.
+
+**Changes:**
+
+| File | Change |
+|------|--------|
+| `package.json` | Added `three-mesh-bvh: latest` to dependencies |
+| `public_html/admin/dc.html` | Added `three-mesh-bvh` to import map; added modulepreload for the UMD bundle |
+| `public_html/js/dc-renderer-mode.js` | Exported `THREE_MESH_BVH` constant; added to `rendererImports()` |
+| `public_html/js/dc.js` | Imported `computeBoundsTree`/`disposeBoundsTree` from three-mesh-bvh and patched `BufferGeometry.prototype`; called `geometry.computeBoundsTree()` in `extractModelMeshes()` for every loaded mesh; set `raycaster.firstHitOnly = true` |
+| `tests/js/dc-bvh.test.js` | New test verifying three-mesh-bvh in package.json, BufferGeometry.prototype patching, raycaster.firstHitOnly, and import map entries |
+
+**Tests:** New Vitest test in `tests/js/dc-bvh.test.js` (11 assertions across 6 test suites)
+
+---
+
 #### Step 8.2 — Register KTX2Loader for compressed texture support
 
 Added `KTX2Loader` registration on the shared `GLTFLoader` instance (`loaderGltf`) to enable GPU-native transcoding of UASTC/ETC1S-compressed textures. The loader is configured with the Basis Universal transcoder path and `detectSupport(renderer)` is called to probe hardware capabilities.
