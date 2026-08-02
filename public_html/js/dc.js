@@ -98,8 +98,11 @@ function _guardLoop(cb) {
     };
 }
 
-// --- requestIdleCallback polyfill (MAJOR-8: fix broken fallback) ---
-const _ric = requestIdleCallback
+// `typeof`, not a bare identifier reference: reading an UNDECLARED global throws a
+// ReferenceError rather than yielding undefined, and this line is at module top level,
+// so on a browser without requestIdleCallback the whole module died here — window.DC
+// was never assigned and every satellite module timed out waiting for it.
+const _ric = typeof requestIdleCallback === 'function'
     ? (cb, opts) => requestIdleCallback(cb, opts)
     : (cb) => {
         if (!_ricChannel) {
