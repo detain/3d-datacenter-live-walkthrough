@@ -22,6 +22,18 @@ Two browser tabs with the same session (same user) can now see each other in Dat
 
 ---
 
+### Phase 9
+
+#### Step 9.1 — Send the fields we already have
+
+Expanded the assets SELECT in `public_html/ajax/datacenter.php` to include more fields: `status`, `primary_ipv4`, `mac`, `make`, `model`, `order_id`. When building the JSON response, these fields are included but omitted if empty/null. Also added `rack_size` as `u` field to the racks query response.
+
+| File | What Changed |
+|------|-------------|
+| `public_html/ajax/datacenter.php` | Added 6 columns to assets SELECT; added conditional field inclusion in assets loop; added `rack_size` to racks SELECT and `u` to racks JSON |
+
+---
+
 ### Phase 8
 
 #### Step 8.3 — Reduce the cable triangle bill
@@ -35,6 +47,19 @@ Lowered cable geometry LOD to reduce draw call triangle count without visible qu
 | `public_html/js/dc.js` | `CABLE_RADIAL`: 8 → 5 (fewer tube cross-section sides); `maxTubular`: 40/220 → 24/96 (lower LOD cap); tubular divisor: `len/2.2` → `len/4` (longer segments = fewer triangles) |
 
 **Tests:** New Vitest test in `tests/js/dc-cable-geometry.test.js`
+
+---
+
+#### Step 8.4 — Add a performance regression guard to CI
+
+A Playwright E2E test (`tests/playwright/dc.spec.ts` Group 10) now runs `DC.bench(10)` and asserts `drawCalls < 400` and `triangles < 2000000` to catch render-cost regressions before they reach production. The test runs in CI without `continue-on-error` so any regression **blocks the PR**.
+
+**Changes:**
+
+| File | Change |
+|------|--------|
+| `tests/playwright/dc.spec.ts` | Added `describe('Performance regression', ...)` with `DC.bench(10)` assertions and performance annotations |
+| `.github/workflows/tests.yml` | Added dedicated step for performance regression test (no `continue-on-error`) |
 
 ---
 
