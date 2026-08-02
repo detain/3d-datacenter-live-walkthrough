@@ -60,6 +60,19 @@ Added support for `?location=`, `?rack=`, and `?asset=` URL parameters to deep-l
 
 ---
 
+#### Step 9.4 — Make the page discoverable
+
+Added "DataCenter 3D" link to the admin navigation menu and "View in 3D" link on the asset detail page. The nav menu now includes a direct link to the 3D datacenter viewer (`/admin/dc.php`). The asset detail page (`asset_form`) includes a "View in 3D" button that deep-links into the 3D scene at the asset's location.
+
+**Changes:**
+
+| File | Change |
+|------|--------|
+| `include/menu.functions.inc.php` | Added "DataCenter 3D" menu link under Datacenter section, linking to `/admin/dc.php` |
+| `include/servers/admin/asset_form.php` | Added "View in 3D" link button linking to `/admin/dc.php?location={datacenter}&asset={assetId}` |
+
+---
+
 #### Step 9.5 — The "isolate" render pass
 
 Added `setIsolate(keepSet)` / `clearIsolate()` functionality for highlighting specific objects by dimming everything else. The isolate mechanism works with a `Set` of object identifiers (mesh `id` values). Calling `setIsolate(keepSet)` dims all transparent meshes NOT in the keepSet to 0.3 opacity while preserving original opacity values. `clearIsolate()` restores all meshes to their original opacity and clears the state. The isolate state is automatically cleared on `clearScene()` and when the Escape key is pressed.
