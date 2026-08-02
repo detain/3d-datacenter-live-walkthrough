@@ -62,6 +62,9 @@ let _animationLoopCb = null;
 let _viewportPending = null;
 // MINOR-7: requestIdleCallback polyfill - reuse a single MessageChannel instead of creating one per call
 let _ricChannel = null;
+
+// Step 9.5: Isolate render pass — dims all meshes except those in the keepSet
+const _isolateOriginalOpacities = new Map();  // meshId -> number (original opacity)
 function scheduleViewportUpdate(data) {
     if (_viewportPending) {
         clearTimeout(_viewportPending);
@@ -190,6 +193,57 @@ const _cableGeometryCache = new Map();
 const _cableCacheOrder = new Set();  // O(1) add/has/delete; insertion order maintained for LRU
 const MAX_CABLE_CACHE = 8;  // MAJOR-9: increased from 3 to 8
 
+// Step 9.6: Cable tracing — route points per switchId:portId key
+const _cableRoutes = new Map();
+
+// Step 9.6: Reverse index assetId → [{switchId, portId, port, sw}]
+const _portsByAsset = new Map();
+
+// Step 9.6: Currently active trace overlay line
+let _traceOverlay = null;
+
+// Step 9.6: Build _portsByAsset from location data (call once per location)
+function buildPortsByAsset(locId) {
+    _portsByAsset.clear();
+    const loc = locations[locId];
+    if (!loc || !loc.racks) return;
+    for (const rackKey of Object.keys(loc.racks)) {
+        const rack = loc.racks[rackKey];
+        if (!rack.switches) continue;
+        for (const switchId of Object.keys(rack.switches)) {
+            const switchData = rack.switches[switchId];
+            for (const portId of Object.keys(switchData.ports)) {
+                const portData = switchData.ports[portId];
+                if (!portData.asset) continue;
+                const entry = { switchId, portId, port: portData.port, sw: switchData };
+                if (!_portsByAsset.has(portData.asset)) _portsByAsset.set(portData.asset, []);
+                _portsByAsset.get(portData.asset).push(entry);
+            }
+        }
+    }
+}
+
+// Step 9.6: Draw a bright LineBasicMaterial overlay along the cable route
+function traceCable(routeKey) {
+    clearTrace();
+    const pts = _cableRoutes.get(routeKey);
+    if (!pts || pts.length < 2) return;
+    const geometry = new THREE.BufferGeometry().setFromPoints(pts.map(p => new THREE.Vector3(p[0], p[1], p[2])));
+    const material = new THREE.LineBasicMaterial({ color: 0x00ffff, linewidth: 2 });
+    _traceOverlay = new THREE.Line(geometry, material);
+    _traceOverlay.renderOrder = 1000;
+    scene.add(_traceOverlay);
+}
+
+// Step 9.6: Remove the trace overlay
+function clearTrace() {
+    if (!_traceOverlay) return;
+    scene.remove(_traceOverlay);
+    _traceOverlay.geometry.dispose();
+    _traceOverlay.material.dispose();
+    _traceOverlay = null;
+}
+
 // Cache: poster spec string → CanvasTexture (Fix #11)
 const _posterTextureCache = new Map();
 
@@ -315,12 +369,122 @@ const options = {
 	shadows: true,        // shadow rendering toggle (checkbox in Display folder)
 	shadowQuality: 'Medium', // Low=512 / Medium=1024 / High=2048
 	ambientOcclusion: false, // Step 7.3: GTAOPass ambient occlusion (Display folder toggle, requires EffectComposer)
+	overlay: 'none', // Step 9.7: capacity overlay source ('none' | 'freeU')
 };
 const clock = new THREE.Clock();
 const velocity = new THREE.Vector3();
 const direction = new THREE.Vector3();
 const vertex = new THREE.Vector3();
 const color = new THREE.Color();
+
+// Step 9.7: Overlay system — tint rack InstancedMeshes by capacity
+// OVERLAY_SOURCES: registry of available overlay computations
+// Each entry maps an overlay name to either null (passthrough) or a function that returns
+// a Map<rackId, 0..1> where 0 = full (red), 0.5 = half (amber), 1 = empty (green)
+const OVERLAY_SOURCES = {
+	none: null,
+	freeU: computeFreeU,
+};
+
+/**
+ * computeFreeU — for each rack in the current location, compute free U slots / total capacity.
+ * @returns {Map<string, number>} rackId -> freeU ratio (0 = no free slots, 1 = completely empty)
+ */
+function computeFreeU() {
+	const loc = locations[options.location];
+	if (!loc || !loc.racks) return new Map();
+	const result = new Map();
+	for (const rackId of Object.keys(loc.racks)) {
+		const rack = loc.racks[rackId];
+		const totalU = rack.u || 42; // default 42U if not specified
+		let occupiedU = 0;
+		// Sum up all server U slots
+		if (rack.servers) {
+			for (const serverId of Object.keys(rack.servers)) {
+				const server = rack.servers[serverId];
+				occupiedU += server.size || 1;
+			}
+		}
+		// Switches also take U space
+		if (rack.switches) {
+			for (const switchId of Object.keys(rack.switches)) {
+				const sw = rack.switches[switchId];
+				occupiedU += sw.size || 1;
+			}
+		}
+		const freeU = Math.max(0, totalU - occupiedU);
+		result.set(rackId, freeU / totalU);
+	}
+	return result;
+}
+
+/**
+ * applyOverlay — tint rack InstancedMeshes based on the selected overlay source.
+ * Uses instance color (setColorAt) so original materials are preserved.
+ */
+function applyOverlay() {
+	// Skip if no overlay selected or if instanced meshes not yet built
+	if (options.overlay === 'none' || objects.instanced.length === 0) {
+		// Clear any previously set instance colors by resetting to white (no tint)
+		_resetInstanceColors();
+		return;
+	}
+	const sourceFn = OVERLAY_SOURCES[options.overlay];
+	if (!sourceFn) return;
+	const overlayData = sourceFn();
+	if (!(overlayData instanceof Map)) return;
+	// Collect all rack InstancedMeshes
+	const rackMeshes = objects.instanced.filter((m) => m.userData.kind === 'rack');
+	for (const inst of rackMeshes) {
+		// Ensure instance color is enabled on this mesh
+		if (!inst.instanceColor) {
+			inst.instanceColor = new THREE.InstancedBufferAttribute(
+				new Float32Array(inst.count * 3), 3
+			);
+		}
+		const assetData = inst.userData.assetData; // array of rack objects, index = instanceId
+		for (let i = 0; i < inst.count; i++) {
+			const rack = assetData[i];
+			const rackId = rack.id || String(i);
+			const freeU = overlayData.has(rackId) ? overlayData.get(rackId) : 0.5;
+			// Map freeU (0..1) to red -> amber -> green
+			// 0 = full (red), 0.5 = half (amber), 1 = empty (green)
+			let r, g, b;
+			if (freeU < 0.5) {
+				// Red to amber: interpolate between (1, 0, 0) and (1, 0.67, 0)
+				const t = freeU * 2; // 0..1 for 0..0.5
+				r = 1;
+				g = 0.67 * t;
+				b = 0;
+			} else {
+				// Amber to green: interpolate between (1, 0.67, 0) and (0, 1, 0)
+				const t = (freeU - 0.5) * 2; // 0..1 for 0.5..1
+				r = 1 - t;
+				g = 0.67 + 0.33 * t;
+				b = 0;
+			}
+			inst.setColorAt(i, new THREE.Color(r, g, b));
+		}
+		inst.instanceMatrix.needsUpdate = true;
+		if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+	}
+}
+
+/**
+ * _resetInstanceColors — reset all rack instance colors to white (neutral/no tint).
+ */
+function _resetInstanceColors() {
+	const rackMeshes = objects.instanced.filter((m) => m.userData.kind === 'rack');
+	for (const inst of rackMeshes) {
+		if (!inst.instanceColor) continue;
+		const white = new THREE.Color(1, 1, 1);
+		for (let i = 0; i < inst.count; i++) {
+			inst.setColorAt(i, white);
+		}
+		if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+	}
+}
+
 //const loaderDae = new ColladaLoader();
 const loaderGltf = new GLTFLoader();
 loaderGltf.setMeshoptDecoder(MeshoptDecoder); // decode EXT_meshopt_compression GLBs
@@ -547,6 +711,7 @@ function displayDatacenter() {
     buildRoom();
     getRackModels();
     getServerModels();
+    buildPortsByAsset(options.location);  // Step 9.6: build reverse index before drawing cables
     displaySwitches();
     buildCommunity(); // the other datacenters as exterior shells around this one
     spawnInside();    // place the player within the walls on load / location change
@@ -589,6 +754,52 @@ function setShadowMapSize(quality) {
     }
 }
 
+// Step 9.5: Isolate render pass — dims all meshes except those whose id is in keepSet
+function setIsolate(keepSet) {
+    // Traverse the scene and dim/un-dim meshes based on whether their id is in keepSet
+    scene.traverse((obj) => {
+        if (!obj.isMesh || !obj.material) return;
+        // Skip meshes that don't have an id (e.g. helper objects, labels)
+        if (obj.id === undefined) return;
+        const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+        for (const m of mats) {
+            if (!m.transparent) continue;  // only touch transparent materials
+            const isIsolated = keepSet.has(obj.id);
+            if (isIsolated) {
+                // Restore original opacity if we have it stored
+                if (_isolateOriginalOpacities.has(obj.id)) {
+                    m.opacity = _isolateOriginalOpacities.get(obj.id);
+                } else {
+                    m.opacity = 1.0;
+                }
+            } else {
+                // Dim this mesh: store original opacity first time
+                if (!_isolateOriginalOpacities.has(obj.id)) {
+                    _isolateOriginalOpacities.set(obj.id, m.opacity);
+                }
+                m.opacity = 0.3;
+            }
+        }
+    });
+}
+
+// Step 9.5: Clear isolate — restore all meshes to their original opacity
+function clearIsolate() {
+    if (_isolateOriginalOpacities.size === 0) return;  // nothing to clear
+    scene.traverse((obj) => {
+        if (!obj.isMesh || !obj.material) return;
+        if (obj.id === undefined) return;
+        const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+        for (const m of mats) {
+            if (!m.transparent) continue;
+            if (_isolateOriginalOpacities.has(obj.id)) {
+                m.opacity = _isolateOriginalOpacities.get(obj.id);
+            }
+        }
+    });
+    _isolateOriginalOpacities.clear();
+}
+
 // Refresh the x/y/z controllers' labels with the live camera position (throttled; programmatic camera
 // moves don't fire onChange). Deliberately not the Inspector's own .listen() label loop — that one is
 // per-frame and cannot be cancelled.
@@ -628,6 +839,8 @@ function displayGui() {
     if (caps.supportsEffectComposer) {
         displayFolder.add(options, 'ambientOcclusion').name('ambient occlusion');
     }
+    // Step 9.7: capacity overlay dropdown — tint racks by free U slot ratio (red=full, amber=half, green=empty)
+    displayFolder.add(options, 'overlay', { 'None': 'none', 'Free U': 'freeU' }).name('capacity overlay').onChange(() => { applyOverlay(); });
     const moveFolder = gui.addFolder( 'Movement' );
     // live camera position. value lives in the LEFT label (the right number box is hidden via css);
     // refreshed by updateGuiPos() each frame since programmatic camera moves don't fire onChange.
@@ -822,6 +1035,8 @@ function clearScene() {
     // Reset idle skip state (Bug #2: clearScene must not leave stale skip mode from a previous scene)
     _tickSkippedFrames = 0;
     _skipExpensiveUpdates = false;
+    // Step 9.5: Clear isolate render pass state
+    clearIsolate();
     // NOTE: do NOT detachKeyHandlers() here. attachKeyHandlers() is already idempotent (guarded by
     // keyHandlersAttached), so a rebuild could never stack duplicate listeners — detaching only opened a
     // window where WASD was dead until something re-attached, which is worse than the problem it "fixed".
@@ -1653,7 +1868,7 @@ function displaySwitches(locId, dx, dz, sink) {
     }
 
     const tubes = [];
-    const addCable = (pts, hex, off, seed) => {
+    const addCable = (pts, hex, off, seed, routeKey) => {
         const vecs = [];
         for (let k = 0; k < pts.length; k++) {
             const p = pts[k];
@@ -1664,6 +1879,10 @@ function displaySwitches(locId, dx, dz, sink) {
             if (vecs.length === 0 || vecs[vecs.length - 1].distanceToSquared(v) > 1e-6) vecs.push(v);
         }
         if (vecs.length < 2) return;
+        // Step 9.6: store cable route for tracing (store points with dx/dz+off already applied)
+        if (routeKey && !_cableRoutes.has(routeKey)) {
+            _cableRoutes.set(routeKey, vecs.map(v => [v.x, v.y, v.z]));
+        }
         let len = 0;
         for (let i = 1; i < vecs.length; i++) len += vecs[i - 1].distanceTo(vecs[i]);
         const curve = new THREE.CatmullRomCurve3(cableCurvePoints(vecs, makeRng(seed || 1)));
@@ -3935,6 +4154,10 @@ function onKeyDown(event) {
             }
             break;
         }
+        // Step 9.5: Escape clears isolate render pass
+        case "Escape":
+            clearIsolate();
+            break;
     }
 }
 
@@ -4251,6 +4474,9 @@ window.DC = {
     // --- Step 6.2 shadow controls (exposed for testing) ---
     setShadowsEnabled: setShadowsEnabled,
     setShadowMapSize: setShadowMapSize,
+    // Step 9.5: Isolate render pass
+    setIsolate: setIsolate,
+    clearIsolate: clearIsolate,
     // --- multi-building LOD + walk-between handles (used by dc-multi.js; inert for dc.html) ---
     collideWorld: collideWorld,                 // walls + current racks + neighbours' active interiors
     get buildings() { return dcBuildings; },    // wall/door rects for every building (current + neighbours)

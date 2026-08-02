@@ -47,6 +47,20 @@ Rewrote `showInfo()` in `dc.js` to display more asset information when a server 
 
 ---
 
+#### Step 9.5 — The "isolate" render pass
+
+Added `setIsolate(keepSet)` / `clearIsolate()` functionality for highlighting specific objects by dimming everything else. The isolate mechanism works with a `Set` of object identifiers (mesh `id` values). Calling `setIsolate(keepSet)` dims all transparent meshes NOT in the keepSet to 0.3 opacity while preserving original opacity values. `clearIsolate()` restores all meshes to their original opacity and clears the state. The isolate state is automatically cleared on `clearScene()` and when the Escape key is pressed.
+
+**Changes:**
+
+| File | Change |
+|------|--------|
+| `public_html/js/dc.js` | Added `_isolateOriginalOpacities` Map; added `setIsolate(keepSet)` and `clearIsolate()` functions; `onKeyDown` Escape case calls `clearIsolate()`; `clearScene()` calls `clearIsolate()`; both functions exported on `window.DC` |
+
+**Tests:** New Vitest test in `tests/js/dc-isolate.test.js`
+
+---
+
 ### Phase 8
 
 #### Step 8.3 — Reduce the cable triangle bill
