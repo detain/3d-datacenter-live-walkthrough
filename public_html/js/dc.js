@@ -141,7 +141,8 @@ const UPGRADE_COOLDOWN = 3000;   // ms between upgrades (debounce)
 const S = {
     pixelScale: 1.0,    // renderer pixel ratio multiplier (1.0 = full, 0.75 = 75%, etc.)
     shadowMapSize: 2048, // shadow map resolution (reduced on quality downgrade)
-    lodBias: 0,         // LOD bias offset added to S.lodBias; >0 makes LOD more aggressive (culls sooner)
+    lodBias: 0,         // LOD bias offset; >0 makes LOD switch to low-detail sooner (active Tier 3)
+    shadowsEnabled: false, // Phase 6: shadow map quality tier
 };
 let _shadowMapSize = 2048; // internal shadow map size state (applied when shadows are active)
 
@@ -439,8 +440,8 @@ function _reduceQuality() {
         return;
     }
 
-    // Step 2: halve the shadow map size
-    if (_shadowMapSize >= 1024) {
+    // Step 2: halve the shadow map size — Phase 6
+    if (S.shadowsEnabled && _shadowMapSize >= 1024) {
         _shadowMapSize = Math.max(512, _shadowMapSize / 2);
         S.shadowMapSize = _shadowMapSize;
         // Re-configure the active shadow lights with the new map size
@@ -462,8 +463,8 @@ function _upgradeQuality() {
         return;
     }
 
-    // Reverse Step 2: double the shadow map size
-    if (_shadowMapSize <= 1024) {
+    // Reverse Step 2: double the shadow map size — Phase 6
+    if (S.shadowsEnabled && _shadowMapSize <= 1024) {
         _shadowMapSize = Math.min(2048, _shadowMapSize * 2);
         S.shadowMapSize = _shadowMapSize;
         _applyShadowMapSize();
@@ -499,18 +500,22 @@ function _applyShadowMapSize() {
 }
 
 function _notifyQualityChange(setting, value) {
-    const notification = document.createElement('div');
-    notification.style.cssText =
-        'position:fixed;bottom:20px;right:20px;background:#ff9800;color:#000;' +
-        'padding:8px 16px;border-radius:4px;font-family:sans-serif;font-size:12px;' +
-        'z-index:99999;opacity:0;transition:opacity 0.3s;';
-    notification.textContent = `\u26a0\ufe0f Auto-reduced quality: ${setting} \u2192 ${typeof value === 'number' ? value.toFixed(2) : value}`;
-    document.body.appendChild(notification);
-    requestAnimationFrame(() => { notification.style.opacity = '1'; });
-    setTimeout(() => {
-        notification.style.opacity = '0';
-        setTimeout(() => notification.remove(), 300);
-    }, 4000);
+    console.info(`[dc] quality ${setting} \u2192 ${typeof value === 'number' ? value.toFixed(2) : value}`);
+    // Only DOM toast for pixelScale at the floor (value > 0.5 means not yet at minimum 0.5)
+    if (setting === 'pixelScale' && value > 0.5) {
+        const notification = document.createElement('div');
+        notification.style.cssText =
+            'position:fixed;bottom:20px;right:20px;background:#ff9800;color:#000;' +
+            'padding:8px 16px;border-radius:4px;font-family:sans-serif;font-size:12px;' +
+            'z-index:99999;opacity:0;transition:opacity 0.3s;';
+        notification.textContent = `\u26a0\ufe0f Auto-reduced quality: ${setting} \u2192 ${typeof value === 'number' ? value.toFixed(2) : value}`;
+        document.body.appendChild(notification);
+        requestAnimationFrame(() => { notification.style.opacity = '1'; });
+        setTimeout(() => {
+            notification.style.opacity = '0';
+            setTimeout(() => notification.remove(), 300);
+        }, 4000);
+    }
 }
 
 function displayDatacenter() {
@@ -2700,8 +2705,10 @@ function updateLOD() {
 	const fx = lodFocus ? lodFocus.x : camera.position.x, fz = lodFocus ? lodFocus.z : camera.position.z;
 	let fullCount = 0;
 	for (const b of lodBuildings) { b._dist = distToRect(fx, fz, b); if (b.full) fullCount++; }
-	const exitThresh = LOD_EXIT_PAD * _lodDistanceMult;
-	const enterThresh = LOD_ENTER_PAD * _lodDistanceMult;
+	const biasDiv = 1 + (S.lodBias || 0);
+    // Tier 3: lodBias makes LOD switch sooner (higher bias = lower detail at same distance)
+    const exitThresh = (LOD_EXIT_PAD * _lodDistanceMult) / biasDiv;
+    const enterThresh = (LOD_ENTER_PAD * _lodDistanceMult) / biasDiv;
 	for (const b of lodBuildings) { if (b.full && b._dist > exitThresh) { exitFull(b); fullCount--; } }
 	if (fullCount < LOD_MAX_FULL) {
 		const near = lodBuildings.filter((b) => !b.full && !b.loading && b._dist < enterThresh).sort((a, c) => a._dist - c._dist);
