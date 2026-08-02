@@ -13,13 +13,9 @@
  *
  * We load the real, unmodified source into a `vm` sandbox with a minimal fake
  * `window`/`document`, so these assertions exercise the shipped code as-is.
- *
- * Run: node --test tests/js/
  */
 'use strict';
 
-const test = require('node:test');
-const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -65,33 +61,33 @@ function loadWsTerminal(overrides) {
 
 test('exposes WsTerminal constructor on window', () => {
     const { WsTerminal } = loadWsTerminal();
-    assert.strictEqual(typeof WsTerminal, 'function');
+    expect(typeof WsTerminal).toBe('function');
 });
 
 test('constructor copies url/session/host and defaults command to empty string', () => {
     const { WsTerminal } = loadWsTerminal();
     const t = new WsTerminal({ url: 'wss://h:7272', session: 'sess-1', host: 42 });
-    assert.strictEqual(t.url, 'wss://h:7272');
-    assert.strictEqual(t.session, 'sess-1');
-    assert.strictEqual(t.host, 42);
-    assert.strictEqual(t.command, '');
+    expect(t.url).toBe('wss://h:7272');
+    expect(t.session).toBe('sess-1');
+    expect(t.host).toBe(42);
+    expect(t.command).toBe('');
 });
 
 test('scope normalizes: only "shell" stays shell, everything else is command', () => {
     const { WsTerminal } = loadWsTerminal();
-    assert.strictEqual(new WsTerminal({ scope: 'shell' }).scope, 'shell');
-    assert.strictEqual(new WsTerminal({ scope: 'command' }).scope, 'command');
-    assert.strictEqual(new WsTerminal({ scope: 'bogus' }).scope, 'command');
-    assert.strictEqual(new WsTerminal({}).scope, 'command');       // default
-    assert.strictEqual(new WsTerminal({ scope: 'SHELL' }).scope, 'command'); // case-sensitive
+    expect(new WsTerminal({ scope: 'shell' }).scope).toBe('shell');
+    expect(new WsTerminal({ scope: 'command' }).scope).toBe('command');
+    expect(new WsTerminal({ scope: 'bogus' }).scope).toBe('command');
+    expect(new WsTerminal({}).scope).toBe('command');       // default
+    expect(new WsTerminal({ scope: 'SHELL' }).scope).toBe('command'); // case-sensitive
 });
 
 test('constructor sets the documented reconnect limits', () => {
     const { WsTerminal } = loadWsTerminal();
     const t = new WsTerminal({});
-    assert.strictEqual(t.maxReconnectDelayMs, 30000);
-    assert.strictEqual(t.maxReconnectAttempts, 8);
-    assert.strictEqual(t.reconnectAttempt, 0);
+    expect(t.maxReconnectDelayMs).toBe(30000);
+    expect(t.maxReconnectAttempts).toBe(8);
+    expect(t.reconnectAttempt).toBe(0);
 });
 
 test('scheduleReconnect produces capped exponential backoff and increments the attempt', () => {
@@ -107,8 +103,8 @@ test('scheduleReconnect produces capped exponential backoff and increments the a
     for (let i = 0; i < 8; i++) {
         t.scheduleReconnect();
     }
-    assert.deepStrictEqual(captured, expected);
-    assert.strictEqual(t.reconnectAttempt, 8);
+    expect(captured).toEqual(expected);
+    expect(t.reconnectAttempt).toBe(8);
 });
 
 test('scheduleReconnect gives up once maxReconnectAttempts is reached (no further timers)', () => {
@@ -118,7 +114,7 @@ test('scheduleReconnect gives up once maxReconnectAttempts is reached (no furthe
     const t = new WsTerminal({});
     t.reconnectAttempt = t.maxReconnectAttempts; // already exhausted
     t.scheduleReconnect();
-    assert.strictEqual(captured.length, 0); // gave up: scheduled nothing
+    expect(captured.length).toBe(0); // gave up: scheduled nothing
 });
 
 test('scheduleReconnect is a no-op after user/remote close', () => {
@@ -131,8 +127,8 @@ test('scheduleReconnect is a no-op after user/remote close', () => {
     t.closedByUser = false;
     t.closedByRemote = true;
     t.scheduleReconnect();
-    assert.strictEqual(captured.length, 0);
-    assert.strictEqual(t.reconnectAttempt, 0); // untouched
+    expect(captured.length).toBe(0);
+    expect(t.reconnectAttempt).toBe(0); // untouched
 });
 
 test('send() only writes when the socket is OPEN', () => {
@@ -142,10 +138,10 @@ test('send() only writes when the socket is OPEN', () => {
     // Not open yet -> dropped.
     t.ws = { readyState: 0, send: (s) => sent.push(s) };
     t.send({ v: 1, op: 'pty.data' });
-    assert.strictEqual(sent.length, 0);
+    expect(sent.length).toBe(0);
     // OPEN (matches window.WebSocket.OPEN === 1) -> serialized and sent.
     t.ws = { readyState: 1, send: (s) => sent.push(s) };
     t.send({ v: 1, op: 'pty.data' });
-    assert.strictEqual(sent.length, 1);
-    assert.deepStrictEqual(JSON.parse(sent[0]), { v: 1, op: 'pty.data' });
+    expect(sent.length).toBe(1);
+    expect(JSON.parse(sent[0])).toEqual({ v: 1, op: 'pty.data' });
 });

@@ -12,13 +12,9 @@
  *
  * We load the real, unmodified source into a `vm` sandbox with a minimal fake
  * `window`/`document`, so these assertions exercise the shipped code as-is.
- *
- * Run: node --test tests/js/ws_vmstat.test.js
  */
 'use strict';
 
-const test = require('node:test');
-const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -83,17 +79,17 @@ function feedChunks(chunks) {
 
 test('exposes WsVmstat constructor on window', () => {
     const { WsVmstat } = loadWsVmstat();
-    assert.strictEqual(typeof WsVmstat, 'function');
+    expect(typeof WsVmstat).toBe('function');
 });
 
 test('constructor copies url/session/host and defaults command to "vmstat 1"', () => {
     const { WsVmstat } = loadWsVmstat();
     const v = new WsVmstat({ url: 'wss://h:7272', session: 'sess-1', host: 42 });
-    assert.strictEqual(v.url, 'wss://h:7272');
-    assert.strictEqual(v.session, 'sess-1');
-    assert.strictEqual(v.host, 42);
-    assert.strictEqual(v.command, 'vmstat 1');
-    assert.strictEqual(new WsVmstat({ command: 'vmstat 2' }).command, 'vmstat 2');
+    expect(v.url).toBe('wss://h:7272');
+    expect(v.session).toBe('sess-1');
+    expect(v.host).toBe(42);
+    expect(v.command).toBe('vmstat 1');
+    expect(new WsVmstat({ command: 'vmstat 2' }).command).toBe('vmstat 2');
 });
 
 /* ------------------------------------------------------------------ */
@@ -102,16 +98,16 @@ test('constructor copies url/session/host and defaults command to "vmstat 1"', (
 
 test('parses only the 3 real data lines, both vmstat headers excluded', () => {
     const { captured, buffer } = feedChunks([VMSTAT_SAMPLE]);
-    assert.strictEqual(captured.length, 3, 'exactly 3 numeric data lines charted');
-    assert.strictEqual(buffer, '', 'trailing newline -> no partial line left buffered');
+    expect(captured.length).toBe(3);
+    expect(buffer).toBe('');
     // First data row decoded into the documented 17 vmstat fields.
-    assert.deepStrictEqual(captured[0], {
+    expect(captured[0]).toEqual({
         r: '1', b: '0', swpd: '0', free: '1234567', buff: '89012', cache: '345678',
         si: '0', so: '0', bi: '5', bo: '10', in: '100', cs: '200',
         us: '3', sy: '1', id: '95', wa: '1', st: '0'
     });
-    assert.strictEqual(captured[1].r, '2');
-    assert.strictEqual(captured[2].free, '1233000');
+    expect(captured[1].r).toBe('2');
+    expect(captured[2].free).toBe('1233000');
 });
 
 test('malformed / short / non-numeric-header lines are excluded gracefully', () => {
@@ -124,8 +120,8 @@ test('malformed / short / non-numeric-header lines are excluded gracefully', () 
         '   \n' +                                 // whitespace only
         ' 3  0      0 1000000  89012 345678    0    0     1     2  100  200  3  1 95  1  0\n' // 1 valid
     ]);
-    assert.strictEqual(captured.length, 1, 'only the single valid 17-col row survives');
-    assert.strictEqual(captured[0].r, '3');
+    expect(captured.length).toBe(1);
+    expect(captured[0].r).toBe('3');
 });
 
 /* ------------------------------------------------------------------ */
@@ -135,22 +131,19 @@ test('malformed / short / non-numeric-header lines are excluded gracefully', () 
 test('line-buffering yields identical parsed lines regardless of chunk splits', () => {
     // Golden: the whole sample delivered in one chunk.
     const golden = feedChunks([VMSTAT_SAMPLE]).captured;
-    assert.strictEqual(golden.length, 3);
+    expect(golden.length).toBe(3);
 
     // Every possible single split point (mid-line, mid-word, on newlines).
     for (let i = 1; i < VMSTAT_SAMPLE.length; i++) {
         const a = VMSTAT_SAMPLE.slice(0, i);
         const b = VMSTAT_SAMPLE.slice(i);
         const { captured } = feedChunks([a, b]);
-        assert.deepStrictEqual(
-            captured, golden,
-            'split at offset ' + i + ' must produce the same parsed line set'
-        );
+        expect(captured).toEqual(golden);
     }
 
     // A pathological byte-at-a-time delivery must also be identical.
     const oneByteAtATime = VMSTAT_SAMPLE.split('');
-    assert.deepStrictEqual(feedChunks(oneByteAtATime).captured, golden);
+    expect(feedChunks(oneByteAtATime).captured).toEqual(golden);
 
     // Random multi-way splits.
     for (let trial = 0; trial < 25; trial++) {
@@ -161,7 +154,7 @@ test('line-buffering yields identical parsed lines regardless of chunk splits', 
             chunks.push(rest.slice(0, n));
             rest = rest.slice(n);
         }
-        assert.deepStrictEqual(feedChunks(chunks).captured, golden);
+        expect(feedChunks(chunks).captured).toEqual(golden);
     }
 });
 
@@ -171,11 +164,11 @@ test('a trailing partial line is held back until its newline arrives', () => {
     const v = new WsVmstat({});
     // Feed a complete data line WITHOUT its terminating newline.
     v.onStdout(' 1  0      0 1234567  89012 345678    0    0     5    10  100  200  3  1 95  1  0');
-    assert.strictEqual(captured.length, 0, 'no newline yet -> nothing parsed');
-    assert.notStrictEqual(v.lineBuffer, '', 'partial line retained in buffer');
+    expect(captured.length).toBe(0);
+    expect(v.lineBuffer).not.toBe('');
     v.onStdout('\n'); // completing newline arrives in a later event
-    assert.strictEqual(captured.length, 1, 'line flushed once newline seen');
-    assert.strictEqual(v.lineBuffer, '');
+    expect(captured.length).toBe(1);
+    expect(v.lineBuffer).toBe('');
 });
 
 /* ------------------------------------------------------------------ */
@@ -188,9 +181,9 @@ test('exec() assigns a fresh unique run_id each call', () => {
     v.ws = { readyState: 1, send: () => {} };
     v.exec();
     const first = v.runId;
-    assert.ok(first, 'run_id set');
+    expect(first).toBeTruthy();
     v.exec();
-    assert.notStrictEqual(v.runId, first, 'second exec must not reuse the run_id');
+    expect(v.runId).not.toBe(first);
 });
 
 test('onExit schedules a restart that issues a NEW run_id, not the dead one', () => {
@@ -203,12 +196,12 @@ test('onExit schedules a restart that issues a NEW run_id, not the dead one', ()
     const dead = v.runId;
 
     v.onExit();
-    assert.strictEqual(v.runId, null, 'run_id cleared on exit (collision guard)');
-    assert.strictEqual(typeof scheduled, 'function', 'a restart timer was armed');
+    expect(v.runId).toBe(null);
+    expect(typeof scheduled).toBe('function');
 
     scheduled(); // fire the restart
-    assert.ok(v.runId, 'restart issued a new run_id');
-    assert.notStrictEqual(v.runId, dead, 'restart must NOT reuse the exited run_id');
+    expect(v.runId).toBeTruthy();
+    expect(v.runId).not.toBe(dead);
 });
 
 test('onExit restart is guarded against overlap (no second timer while one is pending)', () => {
@@ -220,7 +213,7 @@ test('onExit restart is guarded against overlap (no second timer while one is pe
     v.runId = 'live';
     v.onExit();
     v.onExit(); // second exit while restartTimer still pending
-    assert.strictEqual(count, 1, 'overlap guard prevents a duplicate restart timer');
+    expect(count).toBe(1);
 });
 
 test('onExit does nothing once stopped (teardown)', () => {
@@ -231,5 +224,5 @@ test('onExit does nothing once stopped (teardown)', () => {
     v.stopped = true;
     v.runId = 'live';
     v.onExit();
-    assert.strictEqual(count, 0, 'stopped client never reschedules');
+    expect(count).toBe(0);
 });
