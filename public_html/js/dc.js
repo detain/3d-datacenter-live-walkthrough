@@ -102,20 +102,27 @@ function _guardLoop(cb) {
 // ReferenceError rather than yielding undefined, and this line is at module top level,
 // so on a browser without requestIdleCallback the whole module died here — window.DC
 // was never assigned and every satellite module timed out waiting for it.
+let _ricQueue = [];
 const _ric = typeof requestIdleCallback === 'function'
     ? (cb, opts) => requestIdleCallback(cb, opts)
     : (cb) => {
+        // A QUEUE, not a single slot. The previous version stored one pending callback
+        // on the channel and a second call before the first drained overwrote it
+        // silently — the deferred cable merge legitimately fires for the current
+        // building and a neighbour in the same tick, so one of the two merges was
+        // simply lost and that building's cables never appeared.
         if (!_ricChannel) {
             _ricChannel = new MessageChannel();
-            _ricChannel.port1.onmessage = (e) => {
-                if (_ricChannel._cb) {
-                    const cb = _ricChannel._cb;
-                    _ricChannel._cb = null;
-                    cb({ didTimeout: false });
+            _ricChannel.port1.onmessage = () => {
+                const queued = _ricQueue;
+                _ricQueue = [];
+                for (const fn of queued) {
+                    try { fn({ didTimeout: false, timeRemaining: () => 0 }); }
+                    catch (e) { console.error('[dc] idle callback threw:', e); }
                 }
             };
         }
-        _ricChannel._cb = cb;
+        _ricQueue.push(cb);
         _ricChannel.port2.postMessage(null);
     };
 
