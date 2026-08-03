@@ -22,6 +22,41 @@ Two browser tabs with the same session (same user) can now see each other in Dat
 
 ---
 
+### Where each `dc_improve_plan.md` step is recorded
+
+Phases 5–9 are written up under their own step headings below. Phases 0, 1 and 4 landed before that convention and are recorded by **finding ID** instead — this table is the bridge.
+
+| Step | Recorded under |
+|------|----------------|
+| 0.1 Fix the three.js test stub | *Test Infrastructure (2026-08-02)* |
+| 0.2 Rewrite the dc-core tests | *Test Infrastructure → `dc-core.test.js` rewrite* |
+| 0.3 Delete re-implementation tests | *Test Infrastructure → `dc-fixes.test.js`* |
+| 0.4 Bring orphaned ws test files into the suite | *Test Infrastructure* (last paragraph) |
+| 1.1 requestIdleCallback crash | *Bug fixes* → `rIC guard` |
+| 1.2 Idle-callback polyfill queue | *Bug fixes* → `rIC queue` |
+| 1.3 Labels disappearing forever | *Bug fixes* → `Label deprioritization` |
+| 1.4 Click-to-inspect / look-highlight | *Bug fixes* → `F-02` |
+| 1.5 Cables stuck at low detail | *Bug fixes* → `F-09` |
+| 1.6 Number keys doing two things | *Bug fixes* → `F-08` |
+| 1.7 Wheel hijacking the page | *Bug fixes* → `F-18` |
+| 1.8 Unadjusted pointer-lock movement | *Bug fixes* → `F-39` |
+| 2.1 – 2.4 | *Phase 2 — Dead code* |
+| 3.1 – 3.8 | *Phase 3 — Boot path and payload* |
+| 4.1 Collapse the two render loops | *Bug fixes* → `F-16` |
+| 4.2 One owner for pixel ratio | *Bug fixes* → `F-10` |
+| 4.3 Idle-skip on real idleness | *Bug fixes* → `F-17` |
+| 4.4 Character-switch memory leak | *Bug fixes* → `F-14` |
+| 4.5 trySpawn destroying cached door assets | *Bug fixes* → `F-15` |
+| 5.1 – 5.2 | *Phase 5 — Dependency upgrades* |
+| 6.1 – 6.3 | *Phase 6* (first section) |
+| 6.4 – 6.5 | *Phase 6* (second section, further down) |
+| 7.1 – 7.6 | *Phase 7* |
+| 8.0 | *Phase 8 → Step 8.0* — **not done**, see that entry |
+| 8.1 – 8.4 | *Phase 8* |
+| 9.1 – 9.7 | *Phase 9* |
+
+---
+
 ### Phase 9
 
 #### Step 9.1 — Send the fields we already have
@@ -119,6 +154,22 @@ Added a capacity overlay system that tints rack InstancedMeshes with a red→amb
 
 ### Phase 8
 
+#### Step 8.0 — Record the draw-call baseline — **NOT DONE**
+
+This step was the gate for the rest of Phase 8: load the page, run `await DC.bench(10)` in an aisle and again beside a full-detail neighbour, and write `drawCalls` / `triangles` / `avgFps` / `minFps` into `docs/dc_renderer_modes.md` under a "Baseline measurements" heading. It requires a real browser and GPU, so it could not be performed from the build box and **no baseline was ever recorded**.
+
+Consequences, recorded here so they are not forgotten:
+
+| Step | Why the missing baseline matters |
+|------|----------------------------------|
+| 8.3 (cable triangle bill) | The plan made this step **conditional** — "if draw calls are already under ~100, skip Step 8.3 entirely". The work was done without the measurement that was supposed to authorise it. |
+| 8.4 (CI regression guard) | The `drawCalls < 400` / `triangles < 2000000` thresholds are estimates, not measurements. They may be far too loose to catch a real regression, or tight enough to fail spuriously. |
+| 8.1 (BVH picking) | The speed-up is real but unquantified on this scene. |
+
+**To close this out:** open `/admin/dc.php` in a browser, run the two `DC.bench(10)` calls, record the numbers in `docs/dc_renderer_modes.md`, then re-derive the Step 8.4 thresholds from them.
+
+---
+
 #### Step 8.1 — Accelerate picking with three-mesh-bvh
 
 Added `three-mesh-bvh` BVH acceleration for raycasting in the datacenter 3D scene. This provides significant speedup for complex model picking by using a bounding volume hierarchy instead of naive ray intersection on every triangle.
@@ -178,6 +229,8 @@ A Playwright E2E test (`tests/playwright/dc.spec.ts` Group 10) now runs `DC.benc
 | `.github/workflows/tests.yml` | Added dedicated step for performance regression test (no `continue-on-error`) |
 
 ---
+
+### Phase 7
 
 #### Step 7.5 — Clarify webgpu-gl is a diagnostic tool, not a fallback tier
 
@@ -326,6 +379,187 @@ The quality scaler's shadow map tier (gated off in Phase 2 step 2.2) is re-enabl
 | `S.shadowsEnabled` guard | Retained around shadow map steps in both functions |
 
 **Tests:** New Vitest test in `tests/js/dc-quality-scaler-shadow.test.js`
+
+---
+
+### Phase 5 — Dependency upgrades
+
+#### Step 5.1 — Upgrade three.js 0.184.0 → 0.185.1
+
+three.js was moved to r185 (`0.185.1` specifically — `0.185.0` was published six days before the r185 tag and is not the release build). The r185 breaking-change list was audited against this scene beforehand and only one item touched us: `FirstPersonControls` was rewritten and its default `dampingFactor` changed from `0` to `0.1`, which would have introduced camera lag. `controls.dampingFactor = 1` is now set explicitly in `setupControls()` to preserve the instant-response camera feel.
+
+Verified as **not** affecting this scene: the WebGPU premultiplied-alpha rework (we set an opaque `scene.background` and never pass `alpha:true`), the removal of `DRACOLoader.decoderPath` (we call the `setDecoderPath()` method), the removal of `InstancedMesh.previousInstanceMatrix` (zero references), the `Object3D.updateWorldMatrix()` change (zero `matrixAutoUpdate` use in any dc file), and the Inspector `extensions.json` removal (zero references). `PointerLockControls`, `RoomEnvironment`, `stats.module.js`, `MeshoptDecoder`, ColorManagement, tone mapping and `outputColorSpace` were all unchanged in r185.
+
+| File | Change |
+|------|--------|
+| `package.json` | `three` `0.184.0` → `0.185.1` (the `"three": "^0.109.0"` line inside the non-standard `suggests` block is inert and was deliberately left alone) |
+| `yarn.lock` | Regenerated by `yarn install` |
+| `public_html/js/dc.js` | `controls.dampingFactor = 1` in `setupControls()`, with a comment recording why |
+
+> Note: this commit also carried the Phase 6 shadow enablement (`renderer.shadowMap.enabled`, the `_sunLight` directional light with `bias`/`normalBias`/shadow-camera setup, and the Step 6.5 caster policy). Those changes are described under Phase 6 below.
+
+---
+
+#### Step 5.2 — Upgrade lil-gui 0.19.2 → 0.21.0
+
+lil-gui was upgraded and the CSS class selectors it renamed were updated at every site that targeted them.
+
+| File | Change |
+|------|--------|
+| `package.json` | `lil-gui` `0.19.2` → `0.21.0` |
+| `yarn.lock` | Regenerated by `yarn install` |
+| `public_html/css/dc.css` | `.lil-gui.root` → `.lil-gui.lil-root` |
+| `public_html/css/dc-shared.css` | `.lil-gui .controller.number .widget input` → `.lil-gui .lil-controller.lil-number .lil-widget input` |
+
+0.21.0 prefixed its internal class names (`controller` → `lil-controller`, `widget` → `lil-widget`, `root` → `lil-root`, `number` → `lil-number`). Verified no un-prefixed selector survives anywhere in `public_html/css/`, `public_html/js/`, `dc.html` or `tests/`.
+
+---
+
+### Phase 3 — Boot path and payload
+
+The scene's boot cost was dominated by two things: every character downloaded its entire Mixamo animation manifest, and the datacenter endpoint returned a 1.5 MB inventory blob for every location before a single frame drew. Phase 3 attacks both.
+
+#### Step 3.1 — Only fetch animation clips the player can actually trigger
+
+`loadCharacter()` in `dc-multi.js` requested every clip in a character's manifest entry — up to 3346 clips for some characters — when only 25 are reachable. A `PLAYABLE_LABELS` set (the four locomotion states `chooseAnimation()` selects between, plus every gesture bound to a key) now filters the manifest before a single request is issued. A `console.warn` fires if a character has clips but none carry a playable label, so a manifest regression is visible rather than silent.
+
+| File | Change |
+|------|--------|
+| `public_html/js/dc-multi.js` | Added `PLAYABLE_LABELS` (idle/walk/run/jump + `GESTURE_ORDER`); `loadCharacter()` filters `ch.animations` against it and logs the reduction; exposed internal `S` state for the unit test |
+| `tests/js/dc-multi-animation-filter.test.js` | New — 270 lines covering the filter |
+
+---
+
+#### Step 3.2 — Cap animation clip downloads at four concurrent requests
+
+Even after filtering, ~25 clip fetches were fired in a single tick, competing with the rack/server GLB loads and the inventory JSON on a page whose whole problem is boot time. A `loadClipsPooled()` worker pool bounds this to four requests in flight. The pool preserves the existing mid-load character-switch guard (a late clip must not attach to a different character's mixer) and settles on failure so one bad clip cannot stall the queue.
+
+| File | Change |
+|------|--------|
+| `public_html/js/dc-multi.js` | Added `loadClipsPooled(clips, cacheBuster, myMixer, limit = 4)`; `loadCharacter()` now delegates to it |
+| `tests/js/dc-multi-animation-filter.test.js` | +79 lines covering concurrency bounds |
+
+---
+
+#### Step 3.3 — Make the Mixamo manifest small
+
+The downloader now applies the same playable-label filter when it writes the viewer manifest, so the manifest itself no longer lists thousands of unreachable clips. `VIEWER_PLAYABLE_LABELS` in the Python mirrors `PLAYABLE_LABELS` in `dc-multi.js` — the two must be kept in sync.
+
+| File | Change |
+|------|--------|
+| `scripts/mixamo_downloader/mixamo_downloader.py` | Added `VIEWER_PLAYABLE_LABELS`; filters `ch["animations"]` when emitting the manifest |
+| `scripts/mixamo_downloader/README.md` | Documented the filter |
+
+---
+
+#### Step 3.4 — Let the browser cache the manifest
+
+The site-wide "application/json expires immediately" rule forced a revalidation round-trip for `manifest.json` on every page load, for a file that only changes when the asset downloader runs. Because `dc-multi.js` appends `?m=<generated_at>` to every asset URL it derives from the manifest, a regenerated manifest changes those URLs anyway — so the manifest is safe to cache.
+
+| File | Change |
+|------|--------|
+| `public_html/.htaccess` | `<LocationMatch "^/images/3d/mixamo/manifest\.json$">` sets `Cache-Control: public, max-age=3600, stale-while-revalidate=86400` and unsets `Expires` |
+
+---
+
+#### Step 3.5 — Add a tiny index tier to the datacenter endpoint
+
+`/ajax/datacenter.php` gained `?tier=index`, which returns only what the community layout needs — location name, region, and `{x, y}` per rack — and drops racks' servers, switches and switchports entirely.
+
+| Tier | Contents | Size |
+|------|----------|------|
+| `full` (default) | locations with racks, servers, switches, switchports | 1.5 MB / 254 KB gzipped |
+| `index` (`?tier=index`) | location name, region, `{x, y}` per rack | ~7 KB |
+
+| File | Change |
+|------|--------|
+| `public_html/ajax/datacenter.php` | Added the `$tier` branch; documented both tiers and all query parameters in the file header |
+
+---
+
+#### Step 3.6 — Make the client use the two-tier fetch
+
+Boot was a single fetch of every location in full. It is now: **tier 1** `?tier=index` for the whole map, then **tier 2** `?location=<id>` for the building the player actually stands in. `mergeLocations()` gained an `isFull` argument and a per-location `_full` flag so an index-tier skeleton can never overwrite a location already held in full detail — and `hasFullData()` now tests `_full` rather than inferring completeness from a non-empty racks map.
+
+This step also closes **F-29**: a failed inventory fetch used to only `console.error`. It now raises a `notice()` toast and rewrites the `#dcLoading` overlay text, so the user sees the failure instead of an empty room.
+
+| File | Change |
+|------|--------|
+| `public_html/js/dc.js` | Two-tier fetch chain in `loadDatacenter()`; `mergeLocations(data, isFull)` with `_full` guard; `hasFullData()` reads `_full`; user-visible fetch-failure path |
+| `tests/js/dc-model-guards.test.js` | Harness updated for the two-tier pattern |
+
+---
+
+#### Step 3.7 — Add an ETag to the datacenter endpoint
+
+`Cache-Control: private, max-age=60` meant every reload after a minute re-transferred the whole payload even though rack inventory changes rarely. A `dc_emit_json()` helper now hashes the fully-built body, sends it as an `ETag`, and answers a matching `If-None-Match` with `304` and no body. Both the index-tier and full-tier exits go through it.
+
+| File | Change |
+|------|--------|
+| `public_html/ajax/datacenter.php` | Added `dc_emit_json(array $payload): void`; both `echo json_encode(...); exit;` sites replaced with `dc_emit_json($return)` |
+
+---
+
+#### Step 3.8 — Document the assets query index migration
+
+The assets query runs as `type: ALL` — a full scan of ~12,500 rows with `Using temporary; Using filesort`, measured at 91 ms. The existing `rack` index cannot serve it because the WHERE clause casts a `char(2)` column (`cast(unit_start as decimal) > 0`), and a cast is not sargable. The migration is **documented, not applied** — a human must run the DDL, and the `my` database is a three-node writable cluster, so replication to all nodes needs confirming.
+
+| File | Change |
+|------|--------|
+| `docs/dc_db_index.sql` | New — `ALTER TABLE assets ADD INDEX dc_rack_unit (rack, unit_start);` with the EXPLAIN evidence, the apply command, and the cluster caveat |
+| `public_html/ajax/datacenter.php` | Comment pointing at the migration file |
+
+**The real fix, deliberately deferred:** `assets.unit_start` and `assets.unit_end` are `char(2)`. Migrating them to `smallint` removes both casts and makes the predicate sargable. That touches every consumer of those columns, so it needs its own scoped work.
+
+---
+
+### Phase 2 — Dead code
+
+#### Step 2.1 — Delete unused module identifiers
+
+Removed module-level identifiers that were written but never read: `VIEW_OPTS` and `_viewProxy` (left over from a GUI 'View' dropdown that replaced the `#dcViews` button bar and was itself later replaced), `racksShown`, `showServers`, and `S.shadowMapEnabled`. The `_viewProxy.view = name` write in `setView()` went with them.
+
+| File | Change |
+|------|--------|
+| `public_html/js/dc.js` | −5 lines: `VIEW_OPTS`, `_viewProxy`, `racksShown`, `showServers`, `S.shadowMapEnabled` |
+| `tests/js/dc-core.test.js` | −4 lines: assertions on the removed identifiers |
+
+---
+
+#### Step 2.2 — Make the auto quality scaler honest
+
+The quality scaler claimed three tiers but only one did anything. Two problems were fixed:
+
+- **The LOD tier was inert.** `S.lodBias` was documented as "LOD bias offset added to `S.lodBias`" — it was never actually consumed by `updateLOD()`. It is now a real tier that makes LOD switch to low detail sooner.
+- **The shadow tier acted on shadows that were switched off.** `_reduceQuality()`/`_upgradeQuality()` resized a shadow map for a renderer with `shadowMap.enabled = false`, so the tier burned its budget doing nothing. Both are now gated behind a new `S.shadowsEnabled` flag, which Phase 6 turns on and Step 6.3 re-enables the tier against.
+
+`_notifyQualityChange()` also stopped spamming a DOM toast for every tier change. It now always logs to `console.info` and only raises the toast for `pixelScale` while it is still above its 0.5 floor.
+
+| File | Change |
+|------|--------|
+| `public_html/js/dc.js` | `S.shadowsEnabled` added and gated into both quality functions; `S.lodBias` made real in `updateLOD()`; `_notifyQualityChange()` rewritten |
+| `tests/js/dc-quality-scaler.test.js` | New — 131 lines |
+
+---
+
+#### Step 2.3 — Delete dead CSS selectors from dc.css
+
+`dc.css` carried 49 lines of three.js-example boilerplate styling elements this page has never contained.
+
+| File | Change |
+|------|--------|
+| `public_html/css/dc.css` | −49 lines, +6 |
+
+---
+
+#### Step 2.4 — De-duplicate the inline CSS in dc.html
+
+101 lines of inline `<style>` in `dc.html` duplicated or competed with the shared stylesheet. They were moved into `dc-shared.css`, leaving markup as the single source of truth for structure and CSS for presentation.
+
+| File | Change |
+|------|--------|
+| `public_html/admin/dc.html` | −101 lines of inline `<style>` |
+| `public_html/css/dc-shared.css` | +41 lines (the deduplicated survivors) |
 
 ---
 
