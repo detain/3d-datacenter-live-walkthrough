@@ -816,14 +816,38 @@ function _applyShadowMapSize() {
     // Walk the scene and update any shadow-casting lights' shadow map size.
     // Called when _shadowMapSize changes due to auto-quality scaling, and from setShadowMapSize().
     if (!scene) return;
+
+    // The two renderers reallocate a resized shadow map through OPPOSITE mechanisms, and doing it
+    // the WebGL way on the node renderer turns the entire scene black:
+    //
+    //   WebGL  - WebGLShadowMap allocates only `if (shadow.map === null)` and never calls setSize,
+    //            so dropping the map IS how a new size takes effect.
+    //   Node   - ShadowNode.renderShadow() already calls shadowMap.setSize() on every shadow pass,
+    //            so writing mapSize is by itself enough. Dropping it is worse than redundant:
+    //            ShadowNode keeps its OWN reference (this.shadowMap) and the compiled TSL graph
+    //            captured that render target's depth texture at build time, so `shadow.map = null`
+    //            orphans the node's copy instead of clearing it. Disposing then destroys a
+    //            GPUTexture the node graph still samples, and WebGPU — unlike WebGL — treats a
+    //            destroyed texture in a draw as a validation error rather than quietly rebinding:
+    //              "In a draw command ... Texture with 'ShadowDepthTexture' label has been destroyed"
+    //            Every draw that samples a shadow then fails, i.e. the scene goes black the moment
+    //            the quality scaler first halves the shadow map — typically on entering a building,
+    //            where the interior build costs enough frames to trip the scaler.
+    //
+    // The test is isWebGPURenderer, NOT _backendName: ?renderer=webgpu-gl is a WebGPURenderer on a
+    // WebGL2 backend, so it reports a WebGL backend while still running the node path. The question
+    // that matters is "is this the node renderer", which is the flag that answers it.
+    const nodePath = !!(renderer && renderer.isWebGPURenderer);
+
     scene.traverse((obj) => {
         if (!(obj.isDirectionalLight || obj.isSpotLight) || !obj.shadow) return;
         // mapSize is set whether or not a map has been allocated yet. Requiring obj.shadow.map
         // meant a size chosen before the first shadow render was silently discarded, and three.js
         // then allocated at whatever mapSize still held.
         obj.shadow.mapSize.set(_shadowMapSize, _shadowMapSize);
-        if (obj.shadow.map) {
-            // An allocated map is fixed-size — it has to be dropped for the new size to take.
+        if (!nodePath && obj.shadow.map) {
+            // WebGL only: an allocated map is fixed-size — it has to be dropped for the new size
+            // to take. On the node path three.js resizes it in place; see above.
             obj.shadow.map.dispose();
             obj.shadow.map = null;
         }
@@ -4449,7 +4473,15 @@ async function init() {
     loadFloor();
     // Perf readout. The node renderer gets the three.js Inspector instead of Stats: its Performance
     // tab reads real GPU frame times off timestamp queries, where Stats only samples rAF cadence.
-    if (isNode) {
+    //
+    // Those timestamp queries are not free, and neither is the panel that draws them — this is real
+    // per-frame work, every frame, and it is the single biggest structural difference between webgl
+    // mode (Stats, which samples rAF and nothing else) and the node path. That makes it the first
+    // thing to switch off when the node renderer feels slow, so ?inspector=0 does exactly that and
+    // falls through to Stats + lil-gui below. Both are mapped in every renderer mode, so the
+    // fallback is the same code the default page already runs.
+    const wantInspector = new URLSearchParams(location.search).get('inspector') !== '0';
+    if (isNode && wantInspector) {
         try {
             // Dynamic import on purpose: the Inspector's Viewer tab statically imports "three/tsl",
             // which dc.html deliberately leaves out of the webgl import map. A static import here

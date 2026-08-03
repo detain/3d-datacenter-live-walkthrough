@@ -1342,3 +1342,121 @@ test.describe('Group 14: Auto-quality drops ambient occlusion first', () => {
     expect(out).toEqual({ a: false, afterOff: false, b: true, afterOn: true });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Group 15: a shadow-map resize must not orphan the map on the node renderer
+//
+// Reported from a real WebGPU session: walking into a building turned the whole scene black, with
+//   "In a draw command, kind: Draw, caused by: Texture with 'ShadowDepthTexture' label has been
+//    destroyed"
+// arriving one line after "[dc] quality down shadowMap -> 1024". The interior build costs enough
+// frames to trip the auto-quality scaler, whose first shadow tier halves the map, and
+// _applyShadowMapSize() dropped the map the way WebGLShadowMap requires:
+//     shadow.map.dispose(); shadow.map = null;
+// The node renderer reallocates through the OPPOSITE mechanism. ShadowNode keeps its own reference
+// (this.shadowMap, ShadowNode.js:584) and its compiled TSL graph captured that render target's
+// depth texture at build time, so nulling the light's copy ORPHANS it rather than clearing it:
+// three.js never reallocates, and every draw keeps sampling a destroyed GPUTexture. WebGPU treats
+// that as a validation error where WebGL quietly rebinds, which is why only one backend went black.
+//
+// What CI can and cannot show here. The default project resolves ?renderer=webgpu to the WebGL2
+// fallback backend, which does not enforce destroyed-texture use: measured mean luminance was
+// 147.77 before and after either way, so asserting on a black frame would be asserting on nothing.
+// What IS observable on the fallback is the orphaning itself -- and the orphaning is the defect.
+// The last test reproduces the old two lines inline and pins the backend-dependent outcome, so
+// these assertions cannot pass vacuously on a renderer that never had the bug.
+// ---------------------------------------------------------------------------
+const SHADOW_MODES = [
+  { label: 'node (ShadowNode)', url: '/admin/dc.html?renderer=webgpu', node: true },
+  { label: 'webgl (WebGLShadowMap)', url: '/admin/dc.html', node: false },
+] as const;
+
+for (const m of SHADOW_MODES) {
+  test.describe(`Group 15: shadow map resize — ${m.label}`, () => {
+    // Serial with one page, for the same reason Group 13 is: booting this scene under SwiftShader
+    // costs the better part of a minute. The last test deliberately leaves the light's shadow map
+    // orphaned on the node path, so it must stay last and the page must not outlive the block.
+    test.describe.configure({ mode: 'serial', timeout: 240000 });
+
+    let page: any;
+    test.beforeAll(async ({ browser }) => {
+      test.setTimeout(240000);
+      page = await browser.newPage();
+      await bootHermetic(page, m.url);
+      await waitForSceneLoaded(page);
+      await pinScene(page);
+    });
+    test.afterAll(async () => { await page?.close(); });
+
+    test('this page really is the renderer the case is about', async () => {
+      // isWebGPURenderer, not backendName: ?renderer=webgpu-gl and the CI fallback both report a
+      // WebGL backend while running the node path, and the node path is what the fix branches on.
+      const isNode = await page.evaluate(() => !!(window as any).DC.renderer.isWebGPURenderer);
+      expect(isNode).toBe(m.node);
+    });
+
+    test('after a resize the light still owns a live map, at the new size', async () => {
+      const out = await page.evaluate(async () => {
+        const DC: any = (window as any).DC;
+        const y = () => new Promise((r) => setTimeout(r, 0));
+        const lights: any[] = [];
+        DC.scene.traverse((o: any) => {
+          if ((o.isDirectionalLight || o.isSpotLight) && o.shadow) lights.push(o);
+        });
+        const L = lights[0];
+        DC.setShadowMapSize(2048);
+        for (let i = 0; i < 8; i++) { DC.tick(); await y(); }
+        const beforeRef = L.shadow.map;
+        const before = { mapped: !!L.shadow.map, w: L.shadow.map ? L.shadow.map.width : null };
+        DC.setShadowMapSize(1024);
+        for (let i = 0; i < 8; i++) { DC.tick(); await y(); }
+        DC.tick();
+        const info = DC.renderer.info.render;
+        return {
+          lights: lights.length,
+          before,
+          after: { mapped: !!L.shadow.map, w: L.shadow.map ? L.shadow.map.width : null },
+          sameObject: L.shadow.map === beforeRef,
+          mapSize: L.shadow.mapSize.width,
+          // DC.tick()'s return value is unreliable here: dc-presence.js wraps tick and does not
+          // pass the original's value back. Read the renderer's own counter instead.
+          drawCalls: info.drawCalls !== undefined ? info.drawCalls : info.calls,
+        };
+      });
+      expect(out.lights).toBeGreaterThan(0);
+      expect(out.before).toEqual({ mapped: true, w: 2048 });
+      // The invariant that broke: after a resize the light must still own a live render target,
+      // and it must be at the size that was asked for.
+      expect(out.after).toEqual({ mapped: true, w: 1024 });
+      expect(out.mapSize).toBe(1024);
+      // Whether it is the SAME object is the mechanism, and it differs by backend. ShadowNode's
+      // renderShadow() calls shadowMap.setSize() every pass, so the node path resizes in place and
+      // object identity survives -- which is precisely why the map must not be nulled out from
+      // under it. WebGLShadowMap allocates a fresh WebGLRenderTarget instead.
+      expect(out.sameObject).toBe(m.node);
+      // And the scene is still drawing, rather than silently rendering nothing.
+      expect(out.drawCalls).toBeGreaterThan(0);
+    });
+
+    test('dispose-and-null is what orphaned it, and only on the node path', async () => {
+      const out = await page.evaluate(async () => {
+        const DC: any = (window as any).DC;
+        const y = () => new Promise((r) => setTimeout(r, 0));
+        let L: any = null;
+        DC.scene.traverse((o: any) => {
+          if (!L && (o.isDirectionalLight || o.isSpotLight) && o.shadow) L = o;
+        });
+        // Exactly the two lines _applyShadowMapSize() used to run for every backend.
+        if (L.shadow.map) { L.shadow.map.dispose(); L.shadow.map = null; }
+        for (let i = 0; i < 10; i++) { DC.tick(); await y(); }
+        return { recovered: L.shadow.map !== null };
+      });
+      // WebGLShadowMap allocates `if (shadow.map === null)`, so there nulling IS the supported
+      // mechanism and the map comes straight back. ShadowNode never reallocates, which is what
+      // left the node path sampling a destroyed texture for the rest of the session. This is also
+      // what stops the test above from being vacuous: the two backends disagree, so the assertions
+      // are pinned to a real difference rather than to something both paths satisfy anyway.
+      expect(out.recovered).toBe(!m.node);
+    });
+  });
+}

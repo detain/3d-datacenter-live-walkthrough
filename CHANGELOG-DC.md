@@ -217,6 +217,54 @@ New Playwright **Group 11** (community layout, 4 tests) and **Group 12** (info p
 
 ---
 
+### Field fix — the WebGPU scene went black on entering a building
+
+Reported from a live WebGPU session, not from a test: flying above the buildings was fine, clicking
+into one turned the whole scene black and it never came back. The console said
+
+```
+[dc] quality ↓ shadowMap → 1024.00
+Uncaptured WebGPU error: In a draw command, kind: Draw, caused by:
+  Texture with 'ShadowDepthTexture' label has been destroyed
+```
+
+The interior build costs enough frames to trip the auto-quality scaler, whose second tier halves the
+shadow map. `_applyShadowMapSize()` then dropped the map the way `WebGLShadowMap` requires —
+`shadow.map.dispose(); shadow.map = null;` — which is the **opposite** of what the node renderer
+needs. `ShadowNode` keeps its own reference (`this.shadowMap`) and its compiled TSL graph captured
+that render target's depth texture at build time, so nulling the light's copy *orphans* the node's
+rather than clearing it: three.js never reallocates, and every draw goes on sampling a destroyed
+`GPUTexture`. WebGPU rejects that; WebGL quietly rebinds, which is why only one backend broke.
+
+The branch is on `renderer.isWebGPURenderer`, not on a backend name — `?renderer=webgpu-gl` reports a
+WebGL backend while running the node path, so a backend-string test would have missed it.
+
+**What CI can prove, and what it cannot.** The default project resolves `?renderer=webgpu` to the
+WebGL2 fallback, which does not enforce destroyed-texture use: mean luminance measured 147.77 before
+and after, either way. Asserting on a black frame would have asserted on nothing. What *is*
+observable on the fallback is the orphaning, and the orphaning is the defect — so both new test
+layers assert that, and pin the two backends to **opposite** outcomes so neither can pass vacuously:
+
+| | after a resize | after a manual `dispose(); map = null` |
+|---|---|---|
+| WebGL | new target allocated, `2048 → 1024` | recovers — this is the supported mechanism |
+| Node | **same object**, resized in place | never recovers |
+
+Both layers were confirmed red against the unfixed code before being kept: the unit test on the node
+branch, and Group 15 with `mapped: false, w: null` — the orphan signature exactly.
+
+Also here, from reading the same log: **`?inspector=0`**. In node mode the perf readout is the
+three.js Inspector, and `Inspector.js` sets `renderer.backend.trackTimestamp = true` — so every frame
+pays timestamp writes in every render pass, two GPU→CPU readbacks, an extra `requestAnimationFrame`,
+and a DOM update per open tab. Most of that is main-thread work, whose signature is not a low frame
+rate but *input lag at a healthy frame rate*. The flag falls back to `Stats` + lil-gui, both mapped
+in every renderer mode.
+
+**Suites:** unit 1191 → **1192 passing**; E2E 79 → **85 passing** (Group 15, both renderers).
+Docs: `docs/dc_renderer_modes.md` gains *Resizing the shadow map* and *The Inspector is not free*.
+
+---
+
 ### Remediation — Tier 3: finish what was left unfinished
 
 Eleven items that were shipped incomplete, shipped as a stub behind an impossible condition, or documented as done and never written. Plan: `dc_remediation_plan.md` §R3.

@@ -74,11 +74,21 @@ function setShadowsHarness({ light = makeLight(), meshes = [] } = {}) {
 	return { fn, S, options, renderer, light, fitCalls };
 }
 
-function setSizeHarness({ light = makeLight() } = {}) {
+// `nodePath` picks which renderer the sandbox is standing in for. It matters because the two
+// reallocate a resized shadow map through OPPOSITE mechanisms, and _applyShadowMapSize branches on
+// it: WebGLShadowMap allocates only `if (shadow.map === null)`, so there the map must be dropped,
+// while ShadowNode.renderShadow() calls shadowMap.setSize() itself every pass and keeps its own
+// reference to that render target — so dropping it there orphans the node's copy rather than
+// clearing it, and the compiled graph goes on sampling a destroyed GPUTexture forever.
+function setSizeHarness({ light = makeLight(), nodePath = false } = {}) {
 	const S = { shadowMapSize: 2048 };
 	const options = { shadowQuality: 'High' };
 	const state = { _shadowMapSize: 2048 };
 	const scene = makeScene(light);
+	// Only the one flag _applyShadowMapSize reads. isWebGPURenderer — not a backend name — is what
+	// the production code tests, because ?renderer=webgpu-gl reports a WebGL backend while still
+	// running the node path.
+	const renderer = { isWebGPURenderer: nodePath };
 	// _shadowMapSize is a module-scope `let` that both functions read/write, so the two have to
 	// share one binding — declare it inside the sandbox rather than injecting a copy.
 	const src = [
@@ -92,8 +102,8 @@ function setSizeHarness({ light = makeLight() } = {}) {
 		'return { setShadowMapSize, getSize: () => _shadowMapSize };',
 	].join('\n');
 	// eslint-disable-next-line no-new-func
-	const api = new Function('scene', 'S', 'options', src)(scene, S, options);
-	return { setShadowMapSize: api.setShadowMapSize, getSize: api.getSize, S, options, light, state };
+	const api = new Function('scene', 'S', 'options', 'renderer', src)(scene, S, options, renderer);
+	return { setShadowMapSize: api.setShadowMapSize, getSize: api.getSize, S, options, light, state, renderer };
 }
 
 // ---------------------------------------------------------------------------
@@ -216,13 +226,34 @@ describe('setShadowMapSize()', () => {
 		expect(h.getSize()).toBe(2048);
 	});
 
-	it('drops the allocated map so the new size can take effect', () => {
-		// An allocated shadow map is fixed-size; changing mapSize alone does nothing.
-		const h = setSizeHarness();
+	it('drops the allocated map on the WebGL path so the new size can take effect', () => {
+		// A WebGLRenderTarget is fixed-size and WebGLShadowMap reallocates only when it finds
+		// shadow.map === null, so on that path changing mapSize alone does nothing.
+		const h = setSizeHarness({ nodePath: false });
 		const map = h.light.shadow.map;
 		h.setShadowMapSize('Low');
 		expect(map.disposed).toBe(1);
 		expect(h.light.shadow.map).toBeNull();
+	});
+
+	it('leaves the map alone on the node path, where dropping it is what broke WebGPU', () => {
+		// Reported from a real WebGPU session: entering a building tripped the quality scaler's
+		// shadow tier and the whole scene went black with
+		//   "In a draw command ... Texture with 'ShadowDepthTexture' label has been destroyed".
+		// ShadowNode keeps its own reference to this render target and its compiled TSL graph
+		// captured the depth texture, so disposing here destroys a GPUTexture the graph still
+		// samples, and nulling orphans the node's copy instead of clearing it — three.js never
+		// reallocates, so the scene never recovers. Writing mapSize is enough on that path:
+		// ShadowNode.renderShadow() calls shadowMap.setSize() on every shadow pass.
+		const h = setSizeHarness({ nodePath: true });
+		const map = h.light.shadow.map;
+		h.setShadowMapSize('Low');
+		expect(map.disposed).toBe(0);              // never destroyed under the node's feet
+		expect(h.light.shadow.map).toBe(map);      // and still owned by the light
+		// The size still has to be recorded, or the resize three.js performs would be a no-op.
+		expect(h.light.shadow.mapSize.x).toBe(512);
+		expect(h.light.shadow.mapSize.y).toBe(512);
+		expect(h.getSize()).toBe(512);
 	});
 
 	it('sets mapSize even when no map has been allocated yet', () => {

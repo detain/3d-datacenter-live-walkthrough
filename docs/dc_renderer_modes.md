@@ -134,7 +134,8 @@ and what to watch, not as figures to quote.
 |---|---|---|
 | Ambient occlusion | **Highest.** A full screen-resolution pass over depth and normals, plus a denoise | First tier the auto-quality scaler drops. On the node path it also forces the scene through an MRT, so the geometry pass writes two attachments instead of one |
 | Shadows | One extra depth pass over every caster, per frame | `applyShadowPolicy(root, 'cable')` keeps cable bundles out of it — a 3 cm bundle casts nothing readable and would cost a shadow-map draw per merged run. See `docs/dc_shadows.md` |
-| Shadow map size | Quadratic in the dimension: 2048 is 16× the fill of 512 | Second tier dropped. Changing it reallocates the map, hence the 30 s oscillation lockout |
+| Shadow map size | Quadratic in the dimension: 2048 is 16× the fill of 512 | Second tier dropped. Changing it reallocates the map, hence the 30 s oscillation lockout. The two renderers reallocate through opposite mechanisms — see *Resizing the shadow map* below |
+| The three.js Inspector | **Per frame, node path only:** GPU timestamp writes in every render pass, two GPU→CPU readbacks, an extra `requestAnimationFrame`, and a DOM update per open tab | Switch it off with `?inspector=0`. See *The Inspector is not free* below |
 | Pixel scale | Quadratic in the multiplier | Third tier. `dc-multi.js` already starts at 0.8 |
 | LOD bias | Cheap to change, large effect on neighbour buildings | Last tier |
 | Neighbour buildings | Two extra shells plus block proxies — the draw-call rise from 108 to 168 in the CI fixture | Not a regression; see *Baseline measurements* |
@@ -157,6 +158,57 @@ only to someone who asked for it, and a manual toggle clears the flag so the use
 all need that: without it the scaler rewrites the thing being measured mid-measurement, and on any
 machine below `FPS_TARGET` — which includes every headless CI runner — AO is switched off within a
 second of being switched on and can never be observed at all.
+
+### Resizing the shadow map
+
+The scaler's second tier halves `shadowMapSize`, and the two renderers reallocate through opposite
+mechanisms. Getting this backwards is not a cosmetic difference — it turns the whole scene black:
+
+| | how a new size takes effect | what `_applyShadowMapSize()` does |
+|---|---|---|
+| WebGL | `WebGLShadowMap` allocates a fresh `WebGLRenderTarget` **only** when it finds `shadow.map === null`, and never calls `setSize()` | dispose the map and null it |
+| Node (`webgpu`, `webgpu-gl`) | `ShadowNode.renderShadow()` calls `shadowMap.setSize()` on **every** shadow pass | write `shadow.mapSize` and nothing else |
+
+`ShadowNode` keeps its own reference to that render target (`this.shadowMap`) and its compiled TSL
+graph captured the depth texture at build time, so on the node path `shadow.map = null` **orphans**
+the node's copy rather than clearing it. three.js never reallocates, and every draw goes on sampling
+a `dispose()`d `GPUTexture`. WebGPU rejects that where WebGL quietly rebinds:
+
+```
+In a draw command, kind: Draw, caused by: Texture with 'ShadowDepthTexture' label has been destroyed
+```
+
+Reported in the field as: walking into a building turned the scene black and it never came back —
+the interior build costs enough frames to trip the scaler, and the very first shadow downgrade
+orphaned the map for the rest of the session.
+
+The branch is on `renderer.isWebGPURenderer`, **not** on a backend name: `?renderer=webgpu-gl` is a
+`WebGPURenderer` on a WebGL2 backend, so it reports a WebGL backend while running the node path.
+
+Covered by `tests/js/dc-shadow-gui.test.js` (both branches) and Group 15 of
+`tests/playwright/dc.spec.ts` (both renderers, live). Note what the E2E layer can and cannot show:
+CI resolves `?renderer=webgpu` to the WebGL2 fallback, which does **not** enforce destroyed-texture
+use — mean luminance measured 147.77 before and after either way — so Group 15 asserts the orphaning
+itself rather than a black frame, and pins the two backends to opposite outcomes so neither case can
+pass vacuously.
+
+### The Inspector is not free
+
+In node mode the perf readout is the three.js Inspector rather than `Stats`, and `Inspector.js` sets
+`renderer.backend.trackTimestamp = true`. That buys real GPU frame times, and costs, every frame:
+
+- timestamp writes injected into **every** render pass,
+- two GPU→CPU readbacks (`resolveTimestampsAsync` for `COMPUTE` and `RENDER`),
+- an extra `requestAnimationFrame` of its own, competing with the render loop's,
+- a DOM update per open tab (Profiler, Memory, Performance, Timeline, …).
+
+Most of that lands on the **main thread**, which is why its signature is not a low frame rate but
+*input latency at a healthy frame rate*: rAF keeps hitting 60 fps while pointer events queue behind
+the Inspector's work, so the camera lags the mouse.
+
+`?inspector=0` switches it off and falls back to `Stats` + lil-gui, both of which are mapped in every
+renderer mode. It is the first thing to try when the node path feels sluggish, and the cleanest A/B
+for deciding whether a slowdown is ours or the Inspector's.
 
 ## Payload cost
 
