@@ -1,71 +1,63 @@
 /**
- * tests/js/dc-caps.test.js — Step 7.1 renderer-capability module
+ * tests/js/dc-caps.test.js — Step 7.1 renderer-capability module (repaired by R2.4)
  *
- * Verifies:
- * (a) describeRenderer is exported as a named export
- * (b) the returned object has all required fields (isNode, backend, shadowTypeSettable,
- *     supportsTSL, supportsCompute, supportsOcclusionQuery, supportsEffectComposer)
- * (c) isNode is true when renderer.info.type === 'offscreen'
- * (d) isNode is false for a classic WebGLRenderer
- * (e) backend string is correctly derived for WebGL1, WebGL2, and WebGPU renderers
- * (f) shadowTypeSettable, supportsEffectComposer are true for both WebGL and WebGPU
- * (g) supportsTSL and supportsCompute are true only for WebGPURenderer
+ * These tests import the real dc-caps.js and call describeRenderer() with fixtures shaped like
+ * the renderers three.js ACTUALLY ships. That distinction is the whole point of this file's
+ * rewrite: the previous version's fixtures were reverse-engineered from the implementation, so
+ * `info: { type: 'offscreen' }` and `_tslm: true` described properties on no real renderer, and
+ * every assertion passed while the module returned isNode:false for a WebGPURenderer in a
+ * browser. Fixtures that only exist to satisfy the code under test cannot detect that the code
+ * is wrong.
+ *
+ * The discriminators asserted here were verified against node_modules/three on 2026-08-03:
+ *   src/renderers/webgpu/WebGPURenderer.js:95   this.isWebGPURenderer = true
+ *   src/renderers/webgpu/WebGPUBackend.js:88    this.isWebGPUBackend = true
+ *   src/renderers/common/Renderer.js:113        this.backend = backend
+ *   src/renderers/WebGLRenderer.js              has NO .backend at all
+ * The contract test at the bottom re-checks those against the installed package, so an upgrade
+ * that renames one fails here rather than silently in a browser.
  *
  * Run: yarn test:js
  */
 
 import { describe, it, expect } from 'vitest';
-import { describeRenderer } from '../../public_html/js/dc-caps.js';
+import { describeRenderer, backendLabel } from '../../public_html/js/dc-caps.js';
 
 const fs = require('node:fs');
 const path = require('node:path');
 
 const DC_CAPS_JS = path.resolve(__dirname, '../../public_html/js/dc-caps.js');
 const DC_CAPS_SOURCE = fs.readFileSync(DC_CAPS_JS, 'utf8');
+const THREE_SRC = path.resolve(__dirname, '../../node_modules/three/src');
 
 // ---------------------------------------------------------------------------
-// Mock renderers
+// Fixtures — modelled on what each real renderer exposes, nothing more.
 // ---------------------------------------------------------------------------
 
-/**
- * Creates a mock WebGLRenderer-like object.
- * @param {object} opts
- * @param {boolean} [opts.isNode=false] - if true, sets info.type = 'offscreen'
- * @param {string} [opts.contextType='webgl2'] - 'webgl1' | 'webgl2'
- * @param {boolean} [opts.hasBackend=false] - if true, adds backend object
- * @param {boolean} [opts.isWebGPUBackend=false] - if true, backend.isWebGPUBackend = true
- */
-function mockWebGLRenderer({ isNode = false, contextType = 'webgl2', hasBackend = false, isWebGPUBackend = false } = {}) {
-	const ctx = contextType === 'webgl1'
-		? /** @type {WebGLRenderingContext} */ ({ constructor: { name: 'WebGLRenderingContext' } })
-		: /** @type {WebGL2RenderingContext} */ ({ constructor: { name: 'WebGL2RenderingContext' } });
+/** Classic THREE.WebGLRenderer: an isWebGLRenderer marker, a shadowMap, and NO .backend. */
+function classicWebGL() {
+	return { isWebGLRenderer: true, shadowMap: { enabled: false, type: 0 } };
+}
 
-	const backend = hasBackend
-		? { isWebGPUBackend: isWebGPUBackend }
-		: undefined;
-
+/** THREE.WebGPURenderer that got a real WebGPU device. */
+function nodeWebGPU() {
 	return {
-		constructor: { name: 'WebGLRenderer' },
-		info: { type: isNode ? 'offscreen' : 'resource' },
-		getContext: () => ctx,
-		shadowMap: {},  // presence of shadowMap means shadowTypeSettable = true
-		backend,
+		isWebGPURenderer: true,
+		backend: { isWebGPUBackend: true },
+		shadowMap: { enabled: false },
 	};
 }
 
 /**
- * Creates a mock WebGPURenderer-like object.
- * @param {object} opts
- * @param {boolean} [opts.isNode=false] - if true, sets info.type = 'offscreen'
+ * THREE.WebGPURenderer that fell back to its WebGL2 backend — what ?renderer=webgpu produces on
+ * any machine without navigator.gpu, and what ?renderer=webgpu-gl forces. Renderer.js:791
+ * reassigns this.backend on fallback, so isWebGPUBackend is simply absent.
  */
-function mockWebGPURenderer({ isNode = false } = {}) {
+function nodeWebGL2Fallback() {
 	return {
-		constructor: { name: 'WebGPURenderer' },
-		info: { type: isNode ? 'offscreen' : 'resource' },
-		shadowMap: {},
-		_tslm: true,  // WebGPU renderer has this when TSL is supported
-		compute: () => {},  // presence of compute means supportsCompute = true
-		getContext: () => ({}),
+		isWebGPURenderer: true,
+		backend: { isWebGLBackend: true },
+		shadowMap: { enabled: false },
 	};
 }
 
@@ -76,29 +68,42 @@ describe('dc-caps.js — Step 7.1 renderer capability detection', () => {
 
 	describe('module structure', () => {
 
-		it('(a) describeRenderer is exported as a named export', () => {
+		it('exports describeRenderer and backendLabel', () => {
 			expect(typeof describeRenderer).toBe('function');
+			expect(typeof backendLabel).toBe('function');
 		});
 
-		it('dc-caps.js source contains the export statement', () => {
-			expect(DC_CAPS_SOURCE).toMatch(/export\s+function\s+describeRenderer/);
+		it('has no import-time side effects — the module imports nothing', () => {
+			// It used to `import * as THREE from 'three'` without using THREE, which pulled the
+			// whole engine into every Vitest run for nothing. The module must stay pure so it can
+			// be tested without a WebGL context.
+			expect(DC_CAPS_SOURCE).not.toMatch(/^\s*import\s/m);
+		});
+
+		it('references no fabricated three.js properties', () => {
+			// Guarding a contract that must not silently drift back: both of these were invented,
+			// and both silently pinned a capability to false. A source assertion is the right tool
+			// here — the point is that neither may reappear as executable code. Comments are
+			// stripped first: the file's header deliberately NAMES both properties to explain why
+			// they are gone, and that documentation must not trip its own guard.
+			const code = DC_CAPS_SOURCE
+				.replace(/\/\*[\s\S]*?\*\//g, '')
+				.replace(/\/\/[^\n]*/g, '');
+			expect(code).not.toMatch(/_tslm/);
+			expect(code).not.toMatch(/offscreen/);
 		});
 
 	});
 
 	describe('returned object shape', () => {
 
-		const mockRenderer = mockWebGLRenderer();
-		const caps = describeRenderer(mockRenderer);
+		const caps = describeRenderer(classicWebGL());
 
-		it('(b) returns an object with all required fields', () => {
-			expect(caps).toHaveProperty('isNode');
-			expect(caps).toHaveProperty('backend');
-			expect(caps).toHaveProperty('shadowTypeSettable');
-			expect(caps).toHaveProperty('supportsTSL');
-			expect(caps).toHaveProperty('supportsCompute');
-			expect(caps).toHaveProperty('supportsOcclusionQuery');
-			expect(caps).toHaveProperty('supportsEffectComposer');
+		it('returns an object with all required fields', () => {
+			for (const key of ['isNode', 'backend', 'shadowTypeSettable', 'supportsTSL',
+				'supportsCompute', 'supportsOcclusionQuery', 'supportsEffectComposer']) {
+				expect(caps).toHaveProperty(key);
+			}
 		});
 
 		it('all returned values are booleans except backend (string)', () => {
@@ -115,114 +120,161 @@ describe('dc-caps.js — Step 7.1 renderer capability detection', () => {
 
 	describe('isNode detection', () => {
 
-		it('(c) isNode is true when renderer.info.type === "offscreen"', () => {
-			const nodeRenderer = mockWebGLRenderer({ isNode: true });
-			const caps = describeRenderer(nodeRenderer);
-			expect(caps.isNode).toBe(true);
+		it('is false for a classic WebGLRenderer', () => {
+			expect(describeRenderer(classicWebGL()).isNode).toBe(false);
 		});
 
-		it('(d) isNode is false for a classic (non-node) WebGLRenderer', () => {
-			const classicRenderer = mockWebGLRenderer({ isNode: false });
-			const caps = describeRenderer(classicRenderer);
-			expect(caps.isNode).toBe(false);
+		it('is true for a WebGPURenderer on the WebGPU backend', () => {
+			expect(describeRenderer(nodeWebGPU()).isNode).toBe(true);
 		});
 
-	});
-
-	describe('backend string derivation', () => {
-
-		it('(e) backend is "WebGL1Renderer" when context is WebGLRenderingContext', () => {
-			const renderer = mockWebGLRenderer({ contextType: 'webgl1' });
-			const caps = describeRenderer(renderer);
-			expect(caps.backend).toBe('WebGL1Renderer');
+		it('is true for a WebGPURenderer that fell back to WebGL2', () => {
+			// The node renderer is still the node renderer after a backend fallback — this is the
+			// case ?renderer=webgpu hits on a machine with no navigator.gpu, and calling it
+			// "classic WebGL" is what broke DC.backendName and the context-loss wiring.
+			expect(describeRenderer(nodeWebGL2Fallback()).isNode).toBe(true);
 		});
 
-		it('(e) backend is "WebGL2Renderer" when context is WebGL2RenderingContext', () => {
-			const renderer = mockWebGLRenderer({ contextType: 'webgl2' });
-			const caps = describeRenderer(renderer);
-			expect(caps.backend).toBe('WebGL2Renderer');
-		});
-
-		it('(e) backend is "WebGPURenderer" for a WebGPU renderer', () => {
-			const renderer = mockWebGPURenderer();
-			const caps = describeRenderer(renderer);
-			expect(caps.backend).toBe('WebGPURenderer');
+		it('is true from .backend alone, even without the isWebGPURenderer marker', () => {
+			// Structural fallback: the pre-Phase-7 code discriminated on .backend and worked.
+			expect(describeRenderer({ backend: { isWebGPUBackend: true } }).isNode).toBe(true);
 		});
 
 	});
 
-	describe('shadow type settable', () => {
+	describe('backend string — the three values dc-renderer-mode.js specifies', () => {
 
-		it('(f) shadowTypeSettable is true when renderer.shadowMap exists', () => {
-			const renderer = mockWebGLRenderer();
-			const caps = describeRenderer(renderer);
-			expect(caps.shadowTypeSettable).toBe(true);
+		it('classic WebGLRenderer  → "webgl"', () => {
+			expect(describeRenderer(classicWebGL()).backend).toBe('webgl');
+		});
+
+		it('WebGPURenderer + WebGPUBackend → "webgpu"', () => {
+			expect(describeRenderer(nodeWebGPU()).backend).toBe('webgpu');
+		});
+
+		it('WebGPURenderer + WebGL2 backend → "webgl2-fallback"', () => {
+			expect(describeRenderer(nodeWebGL2Fallback()).backend).toBe('webgl2-fallback');
+		});
+
+		it('never returns a three.js class name', () => {
+			// The broken version returned 'WebGLRenderer' / 'WebGPURenderer' / 'WebGL2Renderer',
+			// which no consumer expected: dc.js compared against 'WebGPURenderer' and
+			// DC.backendName is documented as one of the three lowercase values.
+			for (const r of [classicWebGL(), nodeWebGPU(), nodeWebGL2Fallback()]) {
+				expect(['webgl', 'webgpu', 'webgl2-fallback']).toContain(describeRenderer(r).backend);
+			}
 		});
 
 	});
 
-	describe('TSL and compute support', () => {
+	describe('capability flags follow the renderer family', () => {
 
-		it('(g) supportsTSL is false for classic WebGLRenderer', () => {
-			const renderer = mockWebGLRenderer();
-			const caps = describeRenderer(renderer);
-			expect(caps.supportsTSL).toBe(false);
+		it('supportsTSL is a node-renderer capability — true on BOTH node backends', () => {
+			expect(describeRenderer(classicWebGL()).supportsTSL).toBe(false);
+			expect(describeRenderer(nodeWebGPU()).supportsTSL).toBe(true);
+			// The WebGL2 fallback compiles the same TSL node graph down to GLSL, so gating the
+			// TSL postprocessing path on backend === 'webgpu' would wrongly exclude webgpu-gl.
+			expect(describeRenderer(nodeWebGL2Fallback()).supportsTSL).toBe(true);
 		});
 
-		it('(g) supportsTSL is true for WebGPURenderer', () => {
-			const renderer = mockWebGPURenderer();
-			const caps = describeRenderer(renderer);
-			expect(caps.supportsTSL).toBe(true);
+		it('supportsEffectComposer is WebGL-only — the classic GLSL chain', () => {
+			expect(describeRenderer(classicWebGL()).supportsEffectComposer).toBe(true);
+			// This is what makes the AO toggle disappear on the node path, where it does nothing.
+			expect(describeRenderer(nodeWebGPU()).supportsEffectComposer).toBe(false);
+			expect(describeRenderer(nodeWebGL2Fallback()).supportsEffectComposer).toBe(false);
 		});
 
-		it('(g) supportsCompute is false for classic WebGLRenderer', () => {
-			const renderer = mockWebGLRenderer();
-			const caps = describeRenderer(renderer);
-			expect(caps.supportsCompute).toBe(false);
+		it('supportsEffectComposer and supportsTSL are never both true', () => {
+			// They select the two arms of dc.js's render branch; overlap means both AO paths set
+			// up against one renderer.
+			for (const r of [classicWebGL(), nodeWebGPU(), nodeWebGL2Fallback()]) {
+				const c = describeRenderer(r);
+				expect(c.supportsEffectComposer && c.supportsTSL).toBe(false);
+			}
 		});
 
-		it('(g) supportsCompute is true for WebGPURenderer', () => {
-			const renderer = mockWebGPURenderer();
-			const caps = describeRenderer(renderer);
-			expect(caps.supportsCompute).toBe(true);
+		it('shadowTypeSettable is a classic-renderer concept', () => {
+			expect(describeRenderer(classicWebGL()).shadowTypeSettable).toBe(true);
+			expect(describeRenderer(nodeWebGPU()).shadowTypeSettable).toBe(false);
+		});
+
+		it('supportsCompute is real-WebGPU only — WebGL2 has no compute shaders', () => {
+			expect(describeRenderer(classicWebGL()).supportsCompute).toBe(false);
+			expect(describeRenderer(nodeWebGPU()).supportsCompute).toBe(true);
+			expect(describeRenderer(nodeWebGL2Fallback()).supportsCompute).toBe(false);
+		});
+
+		it('supportsOcclusionQuery is real-WebGPU only', () => {
+			// The old module returned true for plain WebGL2, which cannot do them at all.
+			expect(describeRenderer(classicWebGL()).supportsOcclusionQuery).toBe(false);
+			expect(describeRenderer(nodeWebGPU()).supportsOcclusionQuery).toBe(true);
+			expect(describeRenderer(nodeWebGL2Fallback()).supportsOcclusionQuery).toBe(false);
 		});
 
 	});
 
-	describe('effect composer support', () => {
+	describe('describeRenderer(null)', () => {
 
-		it('(f) supportsEffectComposer is true for WebGLRenderer', () => {
-			const renderer = mockWebGLRenderer();
-			const caps = describeRenderer(renderer);
-			expect(caps.supportsEffectComposer).toBe(true);
+		it('does not throw', () => {
+			expect(() => describeRenderer(null)).not.toThrow();
+			expect(() => describeRenderer(undefined)).not.toThrow();
 		});
 
-		it('(f) supportsEffectComposer is true for WebGPURenderer', () => {
-			const renderer = mockWebGPURenderer();
-			const caps = describeRenderer(renderer);
-			expect(caps.supportsEffectComposer).toBe(true);
+		it('returns an all-false descriptor with backend "unknown"', () => {
+			const caps = describeRenderer(null);
+			expect(caps.backend).toBe('unknown');
+			for (const key of ['isNode', 'shadowTypeSettable', 'supportsTSL', 'supportsCompute',
+				'supportsOcclusionQuery', 'supportsEffectComposer']) {
+				expect(caps[key]).toBe(false);
+			}
 		});
 
 	});
 
-	describe('occlusion query support', () => {
+	describe('backendLabel()', () => {
 
-		it('supportsOcclusionQuery is true for WebGL2Renderer', () => {
-			const renderer = mockWebGLRenderer({ contextType: 'webgl2' });
-			const caps = describeRenderer(renderer);
-			expect(caps.supportsOcclusionQuery).toBe(true);
+		it('maps each backend value to its UI string', () => {
+			expect(backendLabel('webgl')).toBe('WebGL');
+			expect(backendLabel('webgpu')).toBe('WebGPU');
+			expect(backendLabel('webgl2-fallback')).toBe('WebGPU (GL)');
 		});
 
-		it('supportsOcclusionQuery is false for WebGL1Renderer', () => {
-			const renderer = mockWebGLRenderer({ contextType: 'webgl1' });
-			const caps = describeRenderer(renderer);
-			expect(caps.supportsOcclusionQuery).toBe(false);
+		it('passes an unknown value through rather than rendering undefined', () => {
+			expect(backendLabel('unknown')).toBe('unknown');
 		});
 
-		it('supportsOcclusionQuery is true for node renderer (offscreen)', () => {
-			const renderer = mockWebGLRenderer({ isNode: true });
-			const caps = describeRenderer(renderer);
-			expect(caps.supportsOcclusionQuery).toBe(true);
+		it('labels every value describeRenderer can produce', () => {
+			for (const r of [classicWebGL(), nodeWebGPU(), nodeWebGL2Fallback(), null]) {
+				const label = backendLabel(describeRenderer(r).backend);
+				expect(typeof label).toBe('string');
+				expect(label.length).toBeGreaterThan(0);
+			}
+		});
+
+	});
+
+	describe('the discriminators still exist in the installed three.js', () => {
+		// If a three.js upgrade renames these, the browser silently reverts to the exact bug R2.4
+		// fixed: every flag pinned false and DC.backendName stuck on 'webgl'. Fail here instead.
+
+		it('WebGPURenderer sets isWebGPURenderer', () => {
+			const src = fs.readFileSync(path.join(THREE_SRC, 'renderers/webgpu/WebGPURenderer.js'), 'utf8');
+			expect(src).toMatch(/this\.isWebGPURenderer\s*=\s*true/);
+		});
+
+		it('WebGPUBackend sets isWebGPUBackend', () => {
+			const src = fs.readFileSync(path.join(THREE_SRC, 'renderers/webgpu/WebGPUBackend.js'), 'utf8');
+			expect(src).toMatch(/this\.isWebGPUBackend\s*=\s*true/);
+		});
+
+		it('the common Renderer assigns this.backend', () => {
+			const src = fs.readFileSync(path.join(THREE_SRC, 'renderers/common/Renderer.js'), 'utf8');
+			expect(src).toMatch(/this\.backend\s*=\s*backend/);
+		});
+
+		it('the classic WebGLRenderer still has no .backend', () => {
+			const src = fs.readFileSync(path.join(THREE_SRC, 'renderers/WebGLRenderer.js'), 'utf8');
+			expect(src).not.toMatch(/this\.backend\s*=/);
 		});
 
 	});

@@ -1,79 +1,100 @@
 /**
- * public_html/js/dc-caps.js — Step 7.1 renderer-capability module
+ * dc-caps.js — what the active renderer can actually do.
  *
- * Exports describeRenderer(renderer) which returns a normalised capability object
- * for the current Three.js renderer. Use these flags instead of ad-hoc renderer.backend
- * or instanceof checks scattered through dc.js.
+ * The datacenter scene runs on two renderers (see docs/dc_renderer_modes.md) and, as of the
+ * Phase 7 work, deliberately does different things on each. Before that, dc.js branched in
+ * exactly one place — renderer construction — and treated the two the same everywhere else.
+ * Now that they diverge on purpose, "which renderer is this and what does it support" is asked
+ * from several places, and answering it ad-hoc with `!!THREE.WebGPURenderer` sprinkled around is
+ * precisely how two code paths quietly stop matching.
+ *
+ * This module is the single answer. It is pure and has NO import-time side effects — in
+ * particular it does not import three.js, so it can be unit tested without a WebGL context and
+ * without dragging the whole engine into every Vitest run.
+ *
+ * Every discriminator below is a property three.js genuinely exposes. An earlier revision keyed
+ * off `renderer.info.type === 'offscreen'` and `renderer._tslm`; neither exists anywhere in
+ * three.js, so isNode and supportsTSL were permanently false, DC.backendName reported 'webgl' in
+ * all three modes, and the entire WebGPU postprocessing branch was unreachable. If you add a
+ * discriminator here, grep node_modules/three/src for it first.
  *
  * Run: yarn test:js
  */
 
-import * as THREE from 'three';
-
 /**
- * @param {THREE.WebGLRenderer|THREE.WebGPURenderer} renderer
+ * Describe a constructed renderer.
+ *
+ * IMPORTANT: the discriminator is the renderer OBJECT, not window.DC_RENDERER_MODE. The mode is a
+ * REQUEST; WebGPURenderer silently falls back to its WebGL2 backend wherever navigator.gpu is
+ * missing, so the URL can say "webgpu" while the real backend is WebGL2. Everything user-visible
+ * must report the backend, never the request.
+ *
+ * @param {Object} renderer a constructed THREE renderer, or null/undefined
  * @returns {{
- *   isNode: boolean,
- *   backend: string,
- *   shadowTypeSettable: boolean,
- *   supportsTSL: boolean,
- *   supportsCompute: boolean,
- *   supportsOcclusionQuery: boolean,
- *   supportsEffectComposer: boolean
+ *   isNode: boolean,                 true for WebGPURenderer (either backend)
+ *   backend: string,                 'webgl' | 'webgpu' | 'webgl2-fallback' | 'unknown'
+ *   shadowTypeSettable: boolean,     shadowMap.type is a classic-renderer concept
+ *   supportsTSL: boolean,            TSL node materials + the tsl/display postprocessing nodes
+ *   supportsCompute: boolean,        compute shaders (WebGPU only, no WebGL2 emulation)
+ *   supportsOcclusionQuery: boolean, occlusion queries (WebGPU only)
+ *   supportsEffectComposer: boolean, the classic GLSL EffectComposer chain
  * }}
  */
 export function describeRenderer(renderer) {
-	// Detect renderer type via constructor name rather than instanceof, which can fail
-	// across module boundaries (e.g., in Node test environments with different THREE instances).
-	const ctorName = renderer.constructor?.name || '';
-
-	// isNode: the node/offscreen renderer is the WebGLRenderer subclass that three.webgpu.js ships.
-	// It is identified by being a WebGLRenderer AND renderer.info.type === 'offscreen'.
-	const isNode = ctorName === 'WebGLRenderer' && renderer.info?.type === 'offscreen';
-
-	// Derive the backend string from the constructor name or backend object.
-	let backend;
-	if (ctorName === 'WebGPURenderer') {
-		backend = 'WebGPURenderer';
-	} else if (ctorName === 'WebGLRenderer') {
-		// Classic renderer — check the context version via the context itself.
-		const ctx = renderer.getContext?.();
-		// WebGLRenderingContext is the global in browsers; in Node tests it may not be available,
-		// so we fall back to checking the context's constructor name.
-		if (ctx && ctx.constructor?.name === 'WebGLRenderingContext') {
-			backend = 'WebGL1Renderer';
-		} else {
-			backend = 'WebGL2Renderer';
-		}
-	} else {
-		backend = 'Unknown';
+	if (!renderer) {
+		// Callers reach here when init() bails before constructing a renderer, and in tests.
+		// Returning an all-false descriptor keeps every `if (caps.x)` site falsy rather than
+		// throwing a TypeError from a null dereference deep inside a capability check.
+		return {
+			isNode: false, backend: 'unknown', shadowTypeSettable: false,
+			supportsTSL: false, supportsCompute: false,
+			supportsOcclusionQuery: false, supportsEffectComposer: false,
+		};
 	}
 
-	// shadowTypeSettable: both WebGLRenderer and WebGPURenderer paths allow shadow map type
-	// to be changed freely. The node renderer (WebGPU with WebGL2 backend) also supports it.
-	const shadowTypeSettable = !!(renderer.shadowMap);
+	// A classic WebGLRenderer has no .backend at all. The node renderer (WebGPURenderer, shipped
+	// in three.webgpu.js) always has one, and sets isWebGPURenderer on the instance. Check both:
+	// isWebGPURenderer is the declared marker, .backend is the structural one the pre-Phase-7
+	// code used successfully.
+	const isNode = !!(renderer.isWebGPURenderer || renderer.backend);
 
-	// supportsTSL: the Textured Shader Language (TSL) is only available on the WebGPU path.
-	const supportsTSL = !!(renderer._tslm); // three.js marks TSL-capable renderers with _tslm
-
-	// supportsCompute: compute shaders are a WebGPU-only feature.
-	const supportsCompute = !!(renderer.compute);
-
-	// supportsOcclusionQuery: occlusion queries are supported in WebGL2 via EXT_occlusion_query.
-	// The node renderer (WebGPU) always supports them natively.
-	const supportsOcclusionQuery = isNode || backend === 'WebGL2Renderer' || backend === 'WebGPURenderer';
-
-	// supportsEffectComposer: EffectComposer works on both WebGL and WebGPU renderers.
-	// It requires the renderer to have a proper WebGL/WebGPU context.
-	const supportsEffectComposer = ctorName === 'WebGLRenderer' || ctorName === 'WebGPURenderer';
+	// isWebGPUBackend tells the node renderer's two backends apart. It is set on WebGPUBackend and
+	// absent on WebGLBackend, so a node renderer that fell back to WebGL2 reports 'webgl2-fallback'.
+	const backend = !isNode
+		? 'webgl'
+		: (renderer.backend && renderer.backend.isWebGPUBackend ? 'webgpu' : 'webgl2-fallback');
+	const realWebGPU = backend === 'webgpu';
 
 	return {
 		isNode,
 		backend,
-		shadowTypeSettable,
-		supportsTSL,
-		supportsCompute,
-		supportsOcclusionQuery,
-		supportsEffectComposer,
+		// shadowMap.type is a WebGLRenderer concept; the node renderer manages its own shadow
+		// filtering through TSL ShadowNode and does not take PCFSoftShadowMap the same way.
+		shadowTypeSettable: !isNode,
+		// TSL is a node-renderer capability, not a separate flag. Both node backends compile TSL —
+		// the WebGL2 fallback emits GLSL from the same node graph — so this follows isNode, not
+		// realWebGPU.
+		supportsTSL: isNode,
+		// Compute shaders, indirect draw and atomics have no WebGL2 emulation, so they are
+		// WebGPU-only by construction — anything built on them is a SECOND implementation to
+		// maintain, not a migration.
+		supportsCompute: realWebGPU,
+		// Occlusion queries are the one genuinely WebGPU-only capability that matters to an indoor
+		// scene of rooms. WebGL cannot do them at all; our "one neighbour at full detail" LOD is a
+		// hand-rolled approximation of the same idea.
+		supportsOcclusionQuery: realWebGPU,
+		// The classic GLSL EffectComposer chain (and everything built on it, e.g. N8AO and pmndrs
+		// postprocessing) is WebGL-only. It does nothing on the node renderer, which is why the AO
+		// toggle must not appear there — the node path uses TSL GTAONode instead.
+		supportsEffectComposer: !isNode,
 	};
+}
+
+/**
+ * Human-readable backend name for the UI. Never returns the requested mode.
+ * @param {string} backend a value from describeRenderer().backend
+ * @returns {string}
+ */
+export function backendLabel(backend) {
+	return ({ webgl: 'WebGL', webgpu: 'WebGPU', 'webgl2-fallback': 'WebGPU (GL)' })[backend] || backend;
 }

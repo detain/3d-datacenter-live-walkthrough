@@ -19,7 +19,10 @@
 export const THREE_BASE = '/lib/three/build/';
 export const ADDONS_BASE = '/lib/three/examples/jsm/';
 export const LIL_GUI = '/lib/lil-gui/dist/lil-gui.esm.js';
-export const THREE_MESH_BVH = '/node_modules/three-mesh-bvh/build/index.umd.cjs';
+// index.module.js, NOT index.umd.cjs: the .cjs is a CommonJS bundle with no ES exports, and
+// .cjs has no MIME mapping in public_html/.htaccess so it is served as application/node, which
+// strict MIME checking rejects as a module script before it is even parsed.
+export const THREE_MESH_BVH = '/lib/three-mesh-bvh/build/index.module.js';
 
 /**
  * Resolve a location.search into the renderer mode and the three.js build it needs.

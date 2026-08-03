@@ -70,7 +70,15 @@ describe('dc.js — DC.bench() result has all required fields', () => {
     expect(body).not.toBeNull();
 
     // The return statement must include all five new fields
-    expect(body).toMatch(/\bao\s*:\s*false/);           // ao: false (not yet implemented)
+    // KNOWN DEFECT — see dc_remediation_plan.md step R3.7. `ao` is hardcoded false with a
+    // comment claiming AO is "not yet implemented", but Step 7.3 implemented it on the WebGL
+    // path: when options.ambientOcclusion is on, _composer renders with GTAOPass and every
+    // bench result still reports ao:false. The field that exists to make runs comparable
+    // actively lies. When R3.7 lands this must become a behavioural assertion:
+    //     expect(bench().ao).toBe(true)   with AO enabled and a composer present
+    // Asserting the wrong value here is deliberate — deleting the assertion would lose the
+    // only signal that the field exists at all.
+    expect(body).toMatch(/\bao\s*:\s*false/);
     expect(body).toMatch(/\bshadows\s*:\s*S\.shadowsEnabled/);
     expect(body).toMatch(/\bshadowMapSize\s*:\s*_shadowMapSize/);
     expect(body).toMatch(/\bpixelScale\s*:\s*S\.pixelScale/);

@@ -18,16 +18,24 @@ import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 // dc.js's own URL and drop the ?v=, so the adapter would go on being served from cache after an
 // edit that only bumped the <script> tags. dc.html modulepreloads the same URL.
 import { createPanel } from './dc-gui.js?v=p53';
-import { describeRenderer } from './dc-caps.js';
+import { describeRenderer, backendLabel } from './dc-caps.js';
 import Stats from "three/addons/libs/stats.module.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import * as BufferGeometryUtils from "three/addons/utils/BufferGeometryUtils.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
-import { computeBoundsTree, disposeBoundsTree } from "three-mesh-bvh";
+import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from "three-mesh-bvh";
 
-// Step 8.1: Patch BufferGeometry.prototype with BVH加速 raycasting
-BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
-BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
+// Step 8.1: patch three.js prototypes for BVH-accelerated raycasting.
+// These MUST be THREE.-prefixed — there is no bare BufferGeometry/Mesh binding in this module
+// (line 12 is `import * as THREE`), and an unprefixed assignment throws a ReferenceError at
+// module-evaluation time, before window.DC is ever created.
+// The Mesh.raycast patch is the load-bearing one: acceleratedRaycast is the ONLY code in
+// three-mesh-bvh that reads geometry.boundsTree. Without it the trees built in
+// extractModelMeshes() are never consulted and raycaster.firstHitOnly is inert, so the BVH
+// costs build time and memory and buys nothing.
+THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
+THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
+THREE.Mesh.prototype.raycast = acceleratedRaycast;
 let camera, scene, renderer, controls, controlObject, stats, inspector, gui, locations = {}, maxAnisotropy; // Declare global variables
 let caps = null; // Step 7.1: renderer capability descriptor
 let _postProcessing = null; // Step 7.4: TSL postprocessing pipeline (WebGPU AO via GTAONode)
@@ -71,8 +79,12 @@ let _viewportPending = null;
 // MINOR-7: requestIdleCallback polyfill - reuse a single MessageChannel instead of creating one per call
 let _ricChannel = null;
 
-// Step 9.5: Isolate render pass — dims all meshes except those in the keepSet
-const _isolateOriginalOpacities = new Map();  // meshId -> number (original opacity)
+// Step 9.5: Isolate render pass — saved material state, keyed by MATERIAL rather than by mesh id.
+// Opacity lives on the material and materials are shared across meshes in this scene (one wallMat
+// for every wall, one blockMat for every rack block), so keying by object let mesh B record
+// material M's already-dimmed value as M's "original" and made the dim permanent.
+const _isolateState = new Map();  // THREE.Material -> {opacity, transparent, depthWrite}
+const ISOLATE_DIM = 0.3;
 function scheduleViewportUpdate(data) {
     if (_viewportPending) {
         clearTimeout(_viewportPending);
@@ -158,9 +170,17 @@ const S = {
     pixelScale: 1.0,    // renderer pixel ratio multiplier (1.0 = full, 0.75 = 75%, etc.)
     shadowMapSize: 2048, // shadow map resolution (reduced on quality downgrade)
     lodBias: 0,         // LOD bias offset; >0 makes LOD switch to low-detail sooner (active Tier 3)
-    shadowsEnabled: false, // Phase 6: shadow map quality tier
+    // Phase 6: does the renderer have shadows on? init() turns them on, so the honest default is
+    // true. It was declared false and never assigned anywhere, which left BOTH quality-scaler
+    // shadow branches dead (they open on `S.shadowsEnabled &&`) and made DC.bench() report
+    // shadows:false on every run while shadows were rendering.
+    shadowsEnabled: true,
 };
 let _shadowMapSize = 2048; // internal shadow map size state (applied when shadows are active)
+// Where the sun sits relative to the room it is lighting. _fitShadowCamera() re-anchors the light
+// to this offset from each room's centre, so the light angle stays identical between buildings
+// while the shadow frustum still brackets whichever room you are standing in.
+const _SUN_OFFSET = { x: 60, y: 120, z: 40 };
 const UPGRADE_LOCKOUT_MS = 30000; // don't upgrade shadow map within 30s of a downgrade (oscillation guard)
 let _lastDowngradeAt = 0;         // timestamp of last shadow map or quality downgrade
 
@@ -224,8 +244,13 @@ function buildPortsByAsset(locId) {
                 const portData = switchData.ports[portId];
                 if (!portData.asset) continue;
                 const entry = { switchId, portId, port: portData.port, sw: switchData };
-                if (!_portsByAsset.has(portData.asset)) _portsByAsset.set(portData.asset, []);
-                _portsByAsset.get(portData.asset).push(entry);
+                // String keys, always. portData.asset arrives as a JSON NUMBER (PHP casts it with
+                // (int)), while the asset ids the info panel looks up with come from
+                // Object.keys() and are STRINGS. Map.get("123") never matches the key 123, so the
+                // Trace Cable button never appeared for any asset. Normalise at both ends.
+                const key = String(portData.asset);
+                if (!_portsByAsset.has(key)) _portsByAsset.set(key, []);
+                _portsByAsset.get(key).push(entry);
             }
         }
     }
@@ -255,7 +280,9 @@ function clearTrace() {
 // Step 9.6: Trace cables connected to a given asset (called from info panel button)
 // Traces the first cable connection found for this asset
 function traceCableForAsset(assetId) {
-    const connections = _portsByAsset.get(assetId);
+    // String(): see buildPortsByAsset. Callers reach here with a string from the info panel and
+    // with a number from the console, and both have to hit the same key.
+    const connections = _portsByAsset.get(String(assetId));
     if (!connections || connections.length === 0) return;
     const conn = connections[0];  // trace the first cable for this asset
     const routeKey = conn.switchId + ':' + conn.portId;
@@ -302,13 +329,21 @@ function cacheWithEvict(cacheMap, key, value, orderSet) {
     cacheMap.set(key, value);
 }
 
-// Step 6.5: Shadow policy — sun neither casts nor receives; cables receive but never cast;
-// racks and servers cast and receive (already set in their respective loaders, included here for completeness).
-function applyShadowPolicy(root) {
+// Step 6.5: one place that decides what casts and what receives, so the four loaders cannot
+// drift apart. Object3D.traverse() visits the node itself, so this takes a Mesh as happily as a
+// Group.
+//
+//   'model'  racks, servers, neighbour models — cast and receive
+//   'cable'  receives, never casts: a 3 cm bundle casts nothing readable at this scale and would
+//            cost a shadow-map draw per merged run
+//   'light'  the sun sphere itself — neither; it IS the light source
+function applyShadowPolicy(root, kind = 'model') {
+    const cast = kind === 'model';
+    const receive = kind !== 'light';
     root.traverse((n) => {
         if (!n.isMesh) return;
-        n.castShadow = true;
-        n.receiveShadow = true;
+        n.castShadow = cast;
+        n.receiveShadow = receive;
     });
 }
 
@@ -385,7 +420,10 @@ const options = {
 	scaleX: 8,  // Scale factor for x position
 	scaleZ: 9,  // Scale factor for z position
 	shadows: true,        // shadow rendering toggle (checkbox in Display folder)
-	shadowQuality: 'Medium', // Low=512 / Medium=1024 / High=2048
+	// 'High' == 2048, which is what _shadowMapSize and S.shadowMapSize both start at. This said
+	// 'Medium' while they said 2048 and the real map was three.js's 512 default — four numbers
+	// describing one texture, no two of them agreeing.
+	shadowQuality: 'High',   // Low=512 / Medium=1024 / High=2048
 	ambientOcclusion: false, // Step 7.3: GTAOPass ambient occlusion (Display folder toggle, requires EffectComposer)
 	overlay: 'none', // Step 9.7: capacity overlay source ('none' | 'freeU')
 };
@@ -697,17 +735,20 @@ function _upgradeQuality() {
 
 function _applyShadowMapSize() {
     // Walk the scene and update any shadow-casting lights' shadow map size.
-    // Called when _shadowMapSize changes due to auto-quality scaling.
+    // Called when _shadowMapSize changes due to auto-quality scaling, and from setShadowMapSize().
     if (!scene) return;
     scene.traverse((obj) => {
-        if (obj.isDirectionalLight || obj.isSpotLight) {
-            if (obj.shadow && obj.shadow.map) {
-                obj.shadow.mapSize.set(_shadowMapSize, _shadowMapSize);
-                obj.shadow.map.dispose();
-                obj.shadow.map = null;
-                if (obj.shadow.camera) obj.shadow.camera.updateProjectionMatrix();
-            }
+        if (!(obj.isDirectionalLight || obj.isSpotLight) || !obj.shadow) return;
+        // mapSize is set whether or not a map has been allocated yet. Requiring obj.shadow.map
+        // meant a size chosen before the first shadow render was silently discarded, and three.js
+        // then allocated at whatever mapSize still held.
+        obj.shadow.mapSize.set(_shadowMapSize, _shadowMapSize);
+        if (obj.shadow.map) {
+            // An allocated map is fixed-size — it has to be dropped for the new size to take.
+            obj.shadow.map.dispose();
+            obj.shadow.map = null;
         }
+        if (obj.shadow.camera) obj.shadow.camera.updateProjectionMatrix();
     });
 }
 
@@ -751,9 +792,22 @@ function setNetworkVisible(visible) {
     for (const b of lodBuildings) if (b.full && b.full.network) b.full.network.visible = visible;   // full neighbours' cabling too
 }
 
-// Step 6.2: Enable/disable shadow rendering and update all materials
+// Step 6.2: Enable/disable shadow rendering and update all materials.
+//
+// Writes all FOUR pieces of shadow state. It used to write only renderer.shadowMap.enabled, so
+// S.shadowsEnabled and options.shadows drifted away from what was actually rendering — and
+// _sunLight kept casting into a disabled map, paying the depth pass for nothing.
 function setShadowsEnabled(bool) {
-    renderer.shadowMap.enabled = bool;
+    // Callable from the GUI, which can exist before init() finishes on a slow load.
+    if (!renderer || !scene) return;
+    const on = !!bool;
+    S.shadowsEnabled = on;
+    options.shadows = on;
+    renderer.shadowMap.enabled = on;
+    if (_sunLight) _sunLight.castShadow = on;
+    // Re-fit on the way back on: the room may have been rebuilt (a location switch nulls
+    // roomBounds) while shadows were off, leaving the camera fitted to the previous building.
+    if (on) _fitShadowCamera();
     // Mark all materials as needing update to reflect shadow state change
     scene.traverse((obj) => {
         if (obj.isMesh && obj.material) {
@@ -763,65 +817,79 @@ function setShadowsEnabled(bool) {
     });
 }
 
-// Step 6.2: Change shadow map resolution (Low=512, Medium=1024, High=2048)
+// Step 6.2: Change shadow map resolution (Low=512, Medium=1024, High=2048).
+//
+// Accepts a label OR a raw pixel count, and writes every variable that tracks it. The old version
+// wrote none of _shadowMapSize / S.shadowMapSize / options.shadowQuality, so the auto quality
+// scaler — which reads _shadowMapSize — overwrote the user's choice on its next tick. And
+// sizeMap[512] is undefined, so a numeric 512 from the scaler's own downgrade path fell through
+// `|| 1024` and silently UPGRADED the map it was trying to shrink.
+const _SHADOW_SIZES = { Low: 512, Medium: 1024, High: 2048 };
+const _SHADOW_LABELS = { 512: 'Low', 1024: 'Medium', 2048: 'High' };
 function setShadowMapSize(quality) {
-    const sizeMap = { 'Low': 512, 'Medium': 1024, 'High': 2048 };
-    const size = sizeMap[quality] || 1024;
-    // Dispose old shadow map and force recreation at new resolution
-    if (_sunLight && _sunLight.shadow) {
-        if (_sunLight.shadow.map) {
-            _sunLight.shadow.map.dispose();
-            _sunLight.shadow.map = null;
-        }
-        _sunLight.shadow.mapSize.set(size, size);
-        _sunLight.shadow.camera.updateProjectionMatrix();
-    }
+    const size = typeof quality === 'number' ? quality : _SHADOW_SIZES[quality];
+    if (!Number.isFinite(size) || size <= 0) return;
+    _shadowMapSize = size;
+    S.shadowMapSize = size;
+    if (_SHADOW_LABELS[size]) options.shadowQuality = _SHADOW_LABELS[size];
+    _applyShadowMapSize();
 }
 
-// Step 9.5: Isolate render pass — dims all meshes except those whose id is in keepSet
+// Step 9.5: dim every mesh except those whose id is in keepSet.
+//
+// Two defects, each of which on its own made the feature do nothing visible:
+//
+//   1. `if (!m.transparent) continue;` skipped every OPAQUE material — which is every mesh in
+//      this scene. The mechanism is to SET transparent, not to require it, so nothing was ever
+//      dimmed and the whole pass was a no-op.
+//   2. Saved state was keyed by object id; see _isolateState above for why that corrupts shared
+//      materials permanently.
+//
+// The save also covers `transparent` and `depthWrite`, not just opacity: restoring opacity alone
+// leaves a formerly-opaque material stuck in the transparent render queue with depth writes off,
+// which sorts wrongly against everything behind it.
 function setIsolate(keepSet) {
-    // Traverse the scene and dim/un-dim meshes based on whether their id is in keepSet
+    if (!scene) return;
+    // DC.setIsolate(null) used to throw on keepSet.has(). No set, or an empty one, means
+    // "isolate nothing" — the same request as clearing.
+    if (!keepSet || typeof keepSet.has !== 'function' || keepSet.size === 0) { clearIsolate(); return; }
     scene.traverse((obj) => {
         if (!obj.isMesh || !obj.material) return;
-        // Skip meshes that don't have an id (e.g. helper objects, labels)
-        if (obj.id === undefined) return;
+        const keep = keepSet.has(obj.id);
         const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
         for (const m of mats) {
-            if (!m.transparent) continue;  // only touch transparent materials
-            const isIsolated = keepSet.has(obj.id);
-            if (isIsolated) {
-                // Restore original opacity if we have it stored
-                if (_isolateOriginalOpacities.has(obj.id)) {
-                    m.opacity = _isolateOriginalOpacities.get(obj.id);
-                } else {
-                    m.opacity = 1.0;
-                }
-            } else {
-                // Dim this mesh: store original opacity first time
-                if (!_isolateOriginalOpacities.has(obj.id)) {
-                    _isolateOriginalOpacities.set(obj.id, m.opacity);
-                }
-                m.opacity = 0.3;
+            if (keep) { _restoreIsolateMaterial(m); continue; }
+            // First touch wins: record the pristine state before anything dims it.
+            if (!_isolateState.has(m)) {
+                _isolateState.set(m, { opacity: m.opacity, transparent: m.transparent, depthWrite: m.depthWrite });
             }
+            m.opacity = ISOLATE_DIM;
+            m.transparent = true;
+            m.depthWrite = false;
+            m.needsUpdate = true;
         }
     });
 }
 
-// Step 9.5: Clear isolate — restore all meshes to their original opacity
+/** Put one material back exactly as it was, and forget it. */
+function _restoreIsolateMaterial(m) {
+    const saved = _isolateState.get(m);
+    if (!saved) return;
+    m.opacity = saved.opacity;
+    m.transparent = saved.transparent;
+    m.depthWrite = saved.depthWrite;
+    m.needsUpdate = true;
+    _isolateState.delete(m);
+}
+
+// Step 9.5: Clear isolate — restore every dimmed material to exactly what it was.
 function clearIsolate() {
-    if (_isolateOriginalOpacities.size === 0) return;  // nothing to clear
-    scene.traverse((obj) => {
-        if (!obj.isMesh || !obj.material) return;
-        if (obj.id === undefined) return;
-        const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-        for (const m of mats) {
-            if (!m.transparent) continue;
-            if (_isolateOriginalOpacities.has(obj.id)) {
-                m.opacity = _isolateOriginalOpacities.get(obj.id);
-            }
-        }
-    });
-    _isolateOriginalOpacities.clear();
+    if (_isolateState.size === 0) return;  // nothing to clear
+    // Iterate the saved map rather than the scene: a material whose mesh has since been removed
+    // (a location switch, an LOD swap) still needs restoring, because it may be shared with
+    // something still on screen.
+    for (const m of Array.from(_isolateState.keys())) _restoreIsolateMaterial(m);
+    _isolateState.clear();
 }
 
 // Refresh the x/y/z controllers' labels with the live camera position (throttled; programmatic camera
@@ -920,9 +988,25 @@ function fetchLocation(locId) {
         .then((data) => { mergeLocations(data, true); });
 }
 
+// Two questions, two predicates. Conflating them is what emptied the neighbourhood: the two-tier
+// boot leaves every location but options.location holding index data only, so a single _full test
+// answered "no" for all of them and buildCommunity() built a city of one.
+//
+/** Do we hold this location's FULL asset detail (servers, switches, ports)? Gates re-fetching. */
 function locationLoaded(locId) {
     const loc = locations[locId];
     return !!(loc && loc._full);
+}
+
+/**
+ * Do we know WHERE this location's racks sit? The index tier is enough — it ships
+ * racks[id] = {x, y} for every location, and locationFootprint() reads nothing else. This is the
+ * predicate the community layout wants: placing a neighbour on the street needs a footprint, not
+ * an inventory, and the detail arrives later via loadBuildingModels() when you walk close enough.
+ */
+function locationPlaced(locId) {
+    const loc = locations[locId];
+    return !!(loc && loc.racks && Object.keys(loc.racks).length > 0);
 }
 
 function switchLocation() {
@@ -992,7 +1076,12 @@ function _takeSessionRestore() {
 function _restoreLocation() {
     if (!_pendingRestore) return;
     const loc = Number(_pendingRestore.loc);
-    if (!Number.isFinite(loc) || loc <= 0 || !locationLoaded(loc)) return;
+    // locationPlaced, not locationLoaded: this runs right after the index-tier merge, so only the
+    // default location is _full yet. Requiring full detail here silently dropped every device-loss
+    // restore that named a different location. The guard's real job is rejecting a backup whose
+    // location no longer exists — presence in the index proves that much, and switchLocation()
+    // fetches the detail.
+    if (!Number.isFinite(loc) || loc <= 0 || !locationPlaced(loc)) return;
     options.location = loc;
 }
 
@@ -1040,7 +1129,10 @@ function _applyDeepLinkTarget() {
     }
 
     if (target.rack !== null) {
-        const rackKey = 'rack_' + target.rack;
+        // The bare rack id, NOT 'rack_' + id: datacenter.php keys the racks map by rack_id
+        // directly (`['racks'][$db->Record['rack']]`), so the prefixed key never matched and
+        // ?rack=<id> silently did nothing on every link the Copy Link button produced.
+        const rackKey = String(target.rack);
         const loc = locations[options.location];
         if (loc && loc.racks && loc.racks[rackKey]) {
             const rack = loc.racks[rackKey];
@@ -1078,9 +1170,11 @@ function flyToRackPosition(rackX, rackY) {
 function _copyDeepLink(assetId, rackKey) {
     const params = new URLSearchParams();
     params.set('location', String(Number(options.location)));
-    if (rackKey !== undefined && rackKey !== null) {
-        const rackNum = rackKey.replace('rack_', '');
-        params.set('rack', rackNum);
+    // rackKey is already the bare id the endpoint uses — no 'rack_' prefix to strip. An empty
+    // string counts as absent: the server panel passes '' when it has no rack, and `?rack=`
+    // used to win over the asset id and produce a link that resolved to nothing.
+    if (rackKey !== undefined && rackKey !== null && String(rackKey) !== '') {
+        params.set('rack', String(rackKey));
     } else if (assetId !== undefined && assetId !== null) {
         params.set('asset', String(assetId));
     }
@@ -1528,7 +1622,7 @@ function extractModelMeshes(root, scale) {
         if (n.isMesh && n.geometry) {
             parts.push({ geometry: n.geometry, material: n.material, matrix: n.matrixWorld.clone() });
             if (!n.geometry.boundingBox) n.geometry.computeBoundingBox();
-            n.geometry.computeBoundsTree(); // Step 8.1: BVH加速 raycasting
+            n.geometry.computeBoundsTree(); // Step 8.1: BVH-accelerated raycasting
             _b.copy(n.geometry.boundingBox).applyMatrix4(n.matrixWorld);
             box.union(_b);
         }
@@ -1628,13 +1722,7 @@ function getRackModels() {
 						if (scale !== false) {
 							model.scale.set(scale, scale, scale);
 						}
-                        model.traverse((n) => {
-                            if (n.isMesh) {
-                                n.castShadow = true;
-                                n.receiveShadow = true;
-                                //n.material.map.anisotropy = 16;
-                            }
-                        });
+                        applyShadowPolicy(model);
 
 						//model.rotation.y = rotationAngle; // Rotate around the Y-axis
 						models.racks[modelIdx] = extractModelMeshes(model, 10);
@@ -1695,13 +1783,7 @@ function getServerModels() {
 						if (scale !== false) {
 							model.scale.set(scale, scale, scale);
 						}
-                        model.traverse((n) => {
-                            if (n.isMesh) {
-                                n.castShadow = true;
-                                n.receiveShadow = true;
-                                //n.material.map.anisotropy = 16;
-                            }
-                        });
+                        applyShadowPolicy(model);
 						//model.rotation.z = rotationAngle; // Rotate around the Y-axis
 						models.servers[modelIdx] = extractModelMeshes(model, 10);
 						//console.log(gltf);
@@ -1981,6 +2063,10 @@ function displaySwitches(locId, dx, dz, sink) {
             objects.network.material.dispose();
         }
         objects.network = new THREE.Mesh(geo, new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: 0.6, metalness: 0.0, clearcoat: 0.6, clearcoatRoughness: 0.25 }));
+        // Same policy as the two build paths below. Without this the cached-reuse branch shipped
+        // cables with three.js defaults (castShadow false, receiveShadow FALSE), so whether cables
+        // took light and shadow depended on whether the geometry cache happened to hit.
+        applyShadowPolicy(objects.network, 'cable');
         objects.network.visible = options.showNetwork;
         objects.network.frustumCulled = false;
         scene.add(objects.network);
@@ -2134,8 +2220,7 @@ function displaySwitches(locId, dx, dz, sink) {
             }
             const material = new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: 0.6, metalness: 0.0, clearcoat: 0.6, clearcoatRoughness: 0.25 });
             const cables = new THREE.Mesh(geometry, material);
-            cables.castShadow = false;
-            cables.receiveShadow = true;
+            applyShadowPolicy(cables, 'cable');
             cables.visible = options.showNetwork;
             cables.frustumCulled = false;
             (sink ? sink.group : scene).add(cables);
@@ -2163,8 +2248,7 @@ function displaySwitches(locId, dx, dz, sink) {
     // matte plastic base + a clearcoat layer for a slight gloss / rounded depth on the cables
     const material = new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: 0.6, metalness: 0.0, clearcoat: 0.6, clearcoatRoughness: 0.25 });
     const cables = new THREE.Mesh(geometry, material);
-    cables.castShadow = false;
-    cables.receiveShadow = true;
+    applyShadowPolicy(cables, 'cable');
     cables.visible = options.showNetwork;
     cables.frustumCulled = false;
     (sink ? sink.group : scene).add(cables);
@@ -2782,7 +2866,11 @@ function buildCommunity() {
 	lodBuildings = []; dcBuildings = []; wallColliders = []; neighborBlinds = []; neighborDoors = [];
 	// eslint-disable-next-line no-unused-vars
 	for (const k in _spatialGrid) delete _spatialGrid[k]; // clear spatial hash (Fix A)
-	const ids = Object.keys(locationNames).map((n) => Number(locationNames[n])).filter((id) => locationLoaded(id));
+	// locationPlaced, NOT locationLoaded: the index tier exists purely so this layout knows every
+	// building's footprint. Filtering on _full here left ids.length === 1 after every boot, so the
+	// `ids.length >= 2` gate below never opened — no neighbours, no block proxies, no doors, and
+	// updateLOD() returning at its first line for the life of the page.
+	const ids = Object.keys(locationNames).map((n) => Number(locationNames[n])).filter((id) => locationPlaced(id));
 	ids.sort((a, b) => locName(a).localeCompare(locName(b)));
 	// the CURRENT building's walls/door go in the descriptor list too (walkability + lot perimeter)
 	if (roomBounds) dcBuildings.push({ id: Number(options.location), kind: 'current', minX: roomBounds.minX, maxX: roomBounds.maxX, minZ: roomBounds.minZ, maxZ: roomBounds.maxZ, doorSide: 'S', doorC: (roomBounds.minX + roomBounds.maxX) / 2, doorHalf: 8, extraDoors: roomSideDoors });
@@ -2922,7 +3010,7 @@ function loadRackType(t) {
 		const name = rackModelName(t);
 		if (name === null) return res();          // nothing to fetch -> settle now, don't wait out the race below
 		loadGlbWithFallback(dcUrl('/images/3d/racks/'), name, (gltf) => {
-			const model = gltf.scene; model.traverse((n) => { if (n.isMesh) { n.castShadow = true; n.receiveShadow = true; } });
+			const model = gltf.scene; applyShadowPolicy(model);
 			models.racks[t] = extractModelMeshes(model, 10); res();
 		}, res);                                  // every variant 404'd: already logged + noticed, just stop blocking
 	});
@@ -2933,7 +3021,7 @@ function loadServerType(t) {
 		const name = serverModelName(t);
 		if (name === null) return res();
 		loadGlbWithFallback(dcUrl('/images/3d/servers/gltf/exported-centered/'), name, (gltf) => {
-			const model = gltf.scene; model.traverse((n) => { if (n.isMesh) { n.castShadow = true; n.receiveShadow = true; } });
+			const model = gltf.scene; applyShadowPolicy(model);
 			models.servers[t] = extractModelMeshes(model, 10); res();
 		}, res);
 	});
@@ -3310,6 +3398,15 @@ function buildRoom() {
 	const roofSlab = new THREE.Mesh(new THREE.BoxGeometry(W + 4, 1.5, D + 4), new THREE.MeshStandardMaterial({ color: 0x55585e, roughness: 0.85 }));
 	roofSlab.position.set(cx, ROOM_CEIL_Y + 1.25, cz); group.add(roofSlab);
 
+	// Phase 6: something has to RECEIVE the shadows. Nothing in this room did — floor, walls,
+	// ceiling and roof slab all kept three.js's receiveShadow default of false — so racks could
+	// only cast onto other racks and still read as floating, which was the whole point of the
+	// phase. The floor is the one that matters: it is what grounds a rack visually.
+	floor.receiveShadow = true;
+	roofSlab.receiveShadow = true;
+	walls.traverse((n) => { if (n.isMesh) n.receiveShadow = true; });
+	ceiling.traverse((n) => { if (n.isMesh) n.receiveShadow = true; });
+
 	walls.visible = options.showWalls;
 	ceiling.visible = options.showCeiling;
 	scene.add(group);
@@ -3317,6 +3414,12 @@ function buildRoom() {
 	// wall colliders + a safe spawn spot (open margin near the maxZ wall, looking into the room)
 	roomBounds = { minX, maxX, minZ, maxZ };
 	roomSpawn = { x: cx, z: maxZ - ROOM_MARGIN * 0.5, lookX: cx, lookZ: cz };
+	// Fit the shadow frustum NOW, not in init(). roomBounds is assigned on the line above and did
+	// not exist when init() called this — _fitShadowCamera() bailed on its `!roomBounds` guard on
+	// every single load, leaving three.js's default +/-5 orthographic box: a ~10x10 column at the
+	// world origin, which is why shadows were invisible. This also has to run per location switch,
+	// since clearScene() nulls roomBounds and the next room has different extents.
+	_fitShadowCamera();
 }
 
 // Drop the player at a safe spot inside the walls, facing the racks. If the default spot is blocked
@@ -3441,6 +3544,7 @@ const _hoverMatrix = new THREE.Matrix4();
 const _hoverPos = new THREE.Vector3();
 const _hoverSize = new THREE.Vector3();
 const MAX_RAYCAST_DIST = 50;  // only raycast instanced meshes within this distance
+const _rcTempV = new THREE.Vector3();   // scratch for the raycast pre-filter; see raycastInstances()
 
 let highlightBox = null;
 let hovered = null;                            // { mesh, instanceId, kind, asset }
@@ -3464,17 +3568,30 @@ function ensureHighlightBox() {
 
 function raycastInstances(ndc) {
     if (objects.instanced.length === 0) return null;
-    // Fast distance pre-check — only test instanced meshes within MAX_RAYCAST_DIST
-    const nearbyInstanced = objects.instanced.filter(mesh => {
+    // Fast distance pre-check — only test instanced meshes within MAX_RAYCAST_DIST.
+    //
+    // F-02 was this filter being DIRECTIONAL. It projected the mesh onto the camera's forward
+    // axis and compared that to the radius, so a mesh 80 units ahead — the one you are staring
+    // straight at — projected to 80 and was discarded, while the same mesh behind you projected
+    // negative and was kept. With a room-spanning bounding sphere that meant standing at one end
+    // of a long room and looking down it dropped the whole mesh: clicking did nothing and the
+    // highlight never appeared. A plain distance test has no such orientation dependence, and a
+    // mesh you are looking away from is pickable the instant you turn.
+    const nearbyInstanced = objects.instanced.filter((mesh) => {
         if (!mesh.isMesh) return false;
-        // Fix F-02: mesh.position is always (0,0,0) on InstancedMesh — use boundingSphere.center instead
-        if (!mesh.boundingSphere) {
-            mesh.geometry.computeBoundingSphere();
-        }
-        const worldCenter = mesh.boundingSphere.center.clone().applyMatrix4(mesh.matrixWorld);
-        worldCenter.sub(camera.position);
-        const camFwd = camera.getWorldDirection(new THREE.Vector3());
-        return worldCenter.dot(camFwd) <= MAX_RAYCAST_DIST;
+        // InstancedMesh carries its OWN boundingSphere, in instance space, and its own
+        // computeBoundingSphere(). geometry.boundingSphere is the single-instance one and is the
+        // wrong space entirely — computing that and then reading mesh.boundingSphere (as this
+        // used to) leaves the property still undefined and throws on the next line.
+        if (!mesh.boundingSphere) mesh.computeBoundingSphere();
+        // No bounding sphere at all: INCLUDE the mesh. Excluding it would silently disable
+        // picking for that model, which is a worse failure than one extra intersect test.
+        const bs = mesh.boundingSphere;
+        if (!bs) return true;
+        _rcTempV.copy(bs.center).applyMatrix4(mesh.matrixWorld);
+        // Module-scope scratch vector, not two allocations per mesh: this runs from
+        // updateHighlight() on every frame.
+        return camera.position.distanceTo(_rcTempV) - bs.radius <= MAX_RAYCAST_DIST;
     });
     if (nearbyInstanced.length === 0) return null;
     raycaster.setFromCamera(ndc, camera);
@@ -3516,8 +3633,8 @@ function showInfo(hit) {
     const panel = document.getElementById('dcInfo');
     if (!panel || !hit || !hit.asset) return;
     const a = hit.asset;
-    // Close button
-    const closeBtn = '<button class="dc-info-close" onclick="document.getElementById(\'dcInfo\').style.display=\'none\'" aria-label="Close">&times;</button>';
+    // Close button. No inline onclick here or below — see _wireInfoPanel().
+    const closeBtn = '<button class="dc-info-close" aria-label="Close">&times;</button>';
     if (hit.kind === 'server') {
         // Status dot: green=active, red=off/canceled, yellow=warning/other
         let statusDot = '';
@@ -3540,15 +3657,14 @@ function showInfo(hit) {
               '" target="_blank" rel="noopener">View order #' + escapeHtml(String(a.order_id)) + ' &rarr;</a>'
             : '';
         // Step 9.6: Trace button for assets with cable connections
-        const connections = _portsByAsset.get(a.id);
+        const connections = _portsByAsset.get(String(a.id));
         const hasConnections = connections && connections.length > 0;
-        const traceBtn = hasConnections
-            ? '<button class="dc-info-trace" onclick="DC.traceCableForAsset(' + a.id + ')">Trace Cable &rarr;</button>'
-            : '';
-        // Step 9.3: Copy deep link button — extracts rackKey from placements
-        const rackKey = (hit.mesh && hit.mesh.userData && hit.mesh.userData.placements)
-            ? hit.mesh.userData.placements[hit.instanceId].rackKey : null;
-        const copyBtn = '<button class="dc-info-copy" onclick="_copyDeepLink(' + a.id + ', \'' + (rackKey || '') + '\')">Copy Link &rarr;</button>';
+        const traceBtn = hasConnections ? '<button class="dc-info-trace">Trace Cable &rarr;</button>' : '';
+        // Step 9.3: a server deep-links by asset id — that is the precise target, and it is what
+        // _applyDeepLinkTarget() resolves back to this exact server. (This used to read a
+        // `rackKey` off placements, which carries `assetId` and has never had a rackKey, so it
+        // was always undefined and the link came out as a bare `?rack=`.)
+        const copyBtn = '<button class="dc-info-copy">Copy Link &rarr;</button>';
         panel.innerHTML = closeBtn +
             '<div class="dc-info-title">' + escapeHtml(a.hostname || 'server') + '</div>' +
             '<div class="dc-info-row">' + statusDot + escapeHtml(a.status || 'unknown') + '</div>' +
@@ -3559,14 +3675,41 @@ function showInfo(hit) {
             '<div class="dc-info-links">' + assetLink + (orderLink ? ' ' + orderLink : '') + '</div>' +
             (traceBtn ? '<div class="dc-info-trace-btn">' + traceBtn + '</div>' : '') +
             '<div class="dc-info-copy-btn">' + copyBtn + '</div>';
+        _wireInfoPanel(panel, { assetId: a.id, rackKey: null, trace: hasConnections });
     } else {
-        // Step 9.3: Copy deep link button for racks — rackKey is directly on userData
-        const rackKey = (hit.mesh && hit.mesh.userData) ? hit.mesh.userData.rackKey : null;
-        const copyBtn = '<button class="dc-info-copy" onclick="_copyDeepLink(' + a.id + ', \'' + (rackKey || '') + '\')">Copy Link &rarr;</button>';
+        // Step 9.3: a rack deep-links by rack key. displayRacks() sets `rack.id = rackKey`, so
+        // the asset's own id IS the key the endpoint uses — no userData.rackKey (which has never
+        // been set on the instanced mesh) needed.
+        const copyBtn = '<button class="dc-info-copy">Copy Link &rarr;</button>';
         panel.innerHTML = closeBtn + '<div class="dc-info-title">Rack ' + escapeHtml(a.name || '') + '</div>' +
             '<div class="dc-info-copy-btn">' + copyBtn + '</div>';
+        _wireInfoPanel(panel, { assetId: null, rackKey: a.id, trace: false });
     }
     panel.style.display = 'block';
+}
+
+/**
+ * Attach the info panel's button behaviour after the markup is inserted.
+ *
+ * dc.js loads as <script type="module">, so its module-scope functions are NOT global. An inline
+ * `onclick="_copyDeepLink(...)"` is resolved in GLOBAL scope at click time and threw
+ * `ReferenceError: _copyDeepLink is not defined` — every Copy Link button in the product was
+ * dead. (Trace Cable used `DC.traceCableForAsset(...)`, which does exist on window, but it was
+ * unreachable for a different reason: the port index key mismatch above.)
+ *
+ * Hanging the functions on window would have fixed the ReferenceError and kept the real problem:
+ * the ids were being interpolated into a JS string inside an HTML attribute with no escaping —
+ * a hostname or rack key containing a quote breaks out of it. Listeners close over the values
+ * instead, so nothing is ever parsed as code and the sink is gone rather than guarded.
+ */
+function _wireInfoPanel(panel, { assetId, rackKey, trace }) {
+    const close = panel.querySelector('.dc-info-close');
+    if (close) close.addEventListener('click', () => { panel.style.display = 'none'; });
+    const copy = panel.querySelector('.dc-info-copy');
+    if (copy) copy.addEventListener('click', () => _copyDeepLink(assetId, rackKey));
+    if (!trace) return;
+    const traceBtn = panel.querySelector('.dc-info-trace');
+    if (traceBtn) traceBtn.addEventListener('click', () => traceCableForAsset(assetId));
 }
 
 function searchServers(query) {
@@ -3833,14 +3976,20 @@ async function init() {
     scene.add(light);
     // soft directional light so cables (and racks) get specular highlights / depth, not flat ambient
     _sunLight = new THREE.DirectionalLight(0xffffff, 1.1);
-    _sunLight.position.set(60, 120, 40);
+    _sunLight.position.set(_SUN_OFFSET.x, _SUN_OFFSET.y, _SUN_OFFSET.z);
     // Phase 6: enable shadow casting
     _sunLight.castShadow = true;
     _sunLight.shadow.bias = -0.001;
     _sunLight.shadow.normalBias = 0.02;
     _sunLight.shadow.camera.near = 1;
     _sunLight.shadow.camera.far = 500;
-    // Fit orthographic shadow camera to roomBounds in _fitShadowCamera()
+    // Set the map size HERE, at creation. Without it three.js allocated at its own 512 default
+    // while _shadowMapSize, S.shadowMapSize and the GUI all claimed something larger — four
+    // numbers, none of which described the map that existed. _fitShadowCamera() sizes the
+    // frustum; this sizes the texture.
+    _sunLight.shadow.mapSize.set(_shadowMapSize, _shadowMapSize);
+    // Frustum fitted in _fitShadowCamera(), called from the end of buildRoom() once roomBounds
+    // exists. Calling it before then is a no-op — that is the whole reason shadows never worked.
     scene.add(_sunLight);
     scene.add(_sunLight.target); // target must be in scene for shadows to work
     // a big, glowing sun up in the sky (the directional light above is its illumination)
@@ -3878,34 +4027,42 @@ async function init() {
     // no .capabilities on the node renderer — it exposes getMaxAnisotropy() directly
     maxAnisotropy = renderer.getMaxAnisotropy ? renderer.getMaxAnisotropy()
                                               : renderer.capabilities.getMaxAnisotropy();
-    _setupRendererSwitch();
-
-    // Step 7.1: capture renderer capabilities for use throughout the module
+    // Step 7.1: capture renderer capabilities FIRST. _setupRendererSwitch() below reads
+    // caps.isNode, and the context-loss wiring further down reads it too — leaving caps null
+    // here throws a TypeError straight out of init(), which strands the page on the loading
+    // curtain with no renderer, no shadows, no AO and no datacenter fetch.
     caps = describeRenderer(renderer);
+
+    _setupRendererSwitch();
 
     // Step 8.2: register KTX2Loader for compressed texture support (UASTC/ETC1S)
     loaderGltf.ktx2Loader = new KTX2Loader();
     loaderGltf.ktx2Loader.setTranscoderPath('/node_modules/three/examples/jsm/libs/basis/');
     loaderGltf.ktx2Loader.detectSupport(renderer);
 
-    // Step 7.4: set up WebGPU TSL postprocessing (GTAONode) if on the WebGPU path
-    if (caps.backend === 'WebGPURenderer') {
+    // Step 7.4: set up WebGPU TSL postprocessing (GTAONode) if on the node-renderer path.
+    // Gated on supportsTSL, not on a backend string: BOTH node backends compile TSL (the WebGL2
+    // fallback emits GLSL from the same node graph), so ?renderer=webgpu-gl must get this path
+    // too. caps.backend is 'webgpu' | 'webgl2-fallback' | 'webgl' — it never spells a class name.
+    if (caps.supportsTSL) {
         _setupWebgpuPostFX();
     }
 
-    // Step 7.3: set up WebGL EffectComposer (GTAOPass) for the classic WebGL renderer path
-    if (caps.supportsEffectComposer && caps.backend !== 'WebGPURenderer') {
+    // Step 7.3: set up the classic GLSL EffectComposer (GTAOPass). supportsEffectComposer is
+    // already !isNode, so the two paths above and here are mutually exclusive by construction —
+    // no second backend test needed.
+    if (caps.supportsEffectComposer) {
         _setupWebglPostFX();
     }
 
-    // Phase 6: enable shadow rendering
-    // NOTE: PCFSoftShadowMap is supported on the WebGPU/node-renderer path (via TSL ShadowFilterNode
-    // which includes PCFSoftShadowFilter in its filter library). On the classic WebGL path,
-    // PCFSoftShadowMap is deprecated and three.js automatically converts it to PCFShadowMap with a
-    // console warning — no guard needed since both paths produce valid shadows.
-    renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    _fitShadowCamera();
+    // Phase 6: enable shadow rendering.
+    // PCFSoftShadowMap is genuinely supported on the node/WebGPU path (ShadowNode's filter
+    // library carries PCFSoftShadowFilter), but it is DEPRECATED on the classic WebGL path:
+    // WebGLShadowMap.js converts it to PCFShadowMap and warns on every load. Asking for it there
+    // bought a console warning and PCFShadowMap anyway, so ask for what each path can give.
+    renderer.shadowMap.enabled = S.shadowsEnabled;
+    renderer.shadowMap.type = caps.isNode ? THREE.PCFSoftShadowMap : THREE.PCFShadowMap;
+    // No _fitShadowCamera() here — roomBounds does not exist yet. buildRoom() calls it.
 
     // IDEA-2: WebGL context loss handling
     _animationLoopCb = animate;  // stored callback; honoured on restore
@@ -4122,23 +4279,48 @@ async function init() {
             // frame, which makes requestPointerLock reject with "The document is not focused" — try
             // to take focus back first, then proceed either way.
             try { document.body.focus(); } catch (e) { /* body may not be focusable; harmless */ }
-            try {
-                // Request raw pointer input without acceleration via unadjustedMovement.
-                // Falls back to PointerLockControls.lock() if the browser rejects the option.
-                renderer.domElement.requestPointerLock({ unadjustedMovement: true });
-            } catch (err) {
-                console.warn('[dc] pointer lock with unadjustedMovement rejected, falling back:', err && err.message);
+            // Fall back to the plain PointerLockControls path. Its lock() returns a Promise in
+            // newer three.js and undefined in older builds, so guard before attaching .catch.
+            const plainLock = function () {
                 try {
-                    // lock() returns a Promise in newer PointerLockControls, undefined in older ones.
-                    const lockResult = controls.lock();
-                    if (lockResult && typeof lockResult.catch === 'function') {
-                        lockResult.catch(function (err) {
-                            console.warn('[dc] pointer lock rejected:', err && err.message);
-                        });
+                    const r = controls.lock();
+                    if (r && typeof r.catch === 'function') {
+                        r.catch(function (err) { console.warn('[dc] pointer lock rejected:', err && err.message); });
                     }
                 } catch (err) {
                     console.warn('[dc] pointer lock failed:', err && err.message);
                 }
+            };
+            try {
+                // Request raw pointer input without acceleration via unadjustedMovement. Without
+                // it, 1000 Hz gaming mice produce occasional movementX spikes that read as the
+                // camera snapping violently.
+                //
+                // requestPointerLock(options) returns a PROMISE and rejects ASYNCHRONOUSLY when
+                // the dictionary is refused or the lock is denied — it does not throw
+                // synchronously. Wrapping it in try/catch alone (as this used to) meant the catch
+                // only fired if domElement itself was null, the fallback below was unreachable on
+                // every real failure path, and the discarded promise produced an unhandled
+                // rejection. The outer try/catch stays for the synchronous TypeError some engines
+                // throw on an unknown option dictionary.
+                const el = renderer && renderer.domElement;
+                let requested = null;
+                if (el && typeof el.requestPointerLock === 'function') {
+                    try { requested = el.requestPointerLock({ unadjustedMovement: true }); }
+                    catch (e) { requested = null; }
+                }
+                if (requested && typeof requested.catch === 'function') {
+                    requested.catch(function (err) {
+                        console.warn('[dc] pointer lock with unadjustedMovement rejected, falling back:', err && err.message);
+                        plainLock();
+                    });
+                } else if (!requested) {
+                    // Older engines return undefined rather than a promise — they never took the
+                    // option dictionary, so go straight to the plain path.
+                    plainLock();
+                }
+            } catch (err) {
+                console.warn('[dc] pointer lock failed:', err && err.message);
             }
         });
     }
@@ -4208,11 +4390,13 @@ function animate() {
     maybeFlicker();
     updateDisco();
 
-    // Delegate to tick() — the single canonical render path shared by dc.html and dc-multi.js.
-    // tick() owns _tickSkippedFrames / _skipExpensiveUpdates so both the animate→tick chain
-    // (dc.html) and the direct tick() call (dc-multi via DC.setAnimationLoop) reach the same
+    // Delegate to DC.tick() — the single canonical render path shared by dc.html and dc-multi.js.
+    // tick owns _tickSkippedFrames / _skipExpensiveUpdates so both the animate→tick chain
+    // (dc.html) and the direct DC.tick() call (dc-multi via DC.setAnimationLoop) reach the same
     // idle-skip behaviour at the same frame count — no double-increment.
-    tick();
+    // It lives on the window.DC object literal, NOT in module scope: a bare tick() call throws
+    // ReferenceError every frame, _guardLoop swallows it, and the scene silently never paints.
+    if (window.DC && typeof window.DC.tick === 'function') window.DC.tick();
 }
 
 // Update controls based on user input
@@ -4346,11 +4530,35 @@ function _drawCalls() {
 function _fitShadowCamera() {
     if (!_sunLight || !roomBounds) return;
     const margin = 20; // extra margin so shadows aren't cut off at room edges
+    const cx = (roomBounds.minX + roomBounds.maxX) / 2;
+    const cz = (roomBounds.minZ + roomBounds.maxZ) / 2;
+    const w  = roomBounds.maxX - roomBounds.minX;
+    const d  = roomBounds.maxZ - roomBounds.minZ;
+
+    // A directional light's shadow camera looks down the light's OWN axis, so left/right/top/
+    // bottom are in light-view space, not world space. Writing world X/Z into them (as this used
+    // to) only lines up if the light happens to look straight down -Z; ours looks down from
+    // (60,120,40), so the box landed skewed and off-centre. Worse, the light itself never moved,
+    // so a room whose centre is far from the world origin fell outside the box entirely.
+    //
+    // Move the light so it hangs over THIS room at the same angle, aim it at the room centre, and
+    // size the box by the room's diagonal radius — that covers the footprint from any view
+    // orientation, so it cannot under-cover no matter which way the light ends up facing.
+    const radius = 0.5 * Math.hypot(w, d) + margin;
+    _sunLight.target.position.set(cx, 0, cz);
+    _sunLight.target.updateMatrixWorld();
+    _sunLight.position.set(cx + _SUN_OFFSET.x, _SUN_OFFSET.y, cz + _SUN_OFFSET.z);
+    _sunLight.updateMatrixWorld();
+
     const cam = _sunLight.shadow.camera;
-    cam.left   = roomBounds.minX - margin;
-    cam.right  = roomBounds.maxX + margin;
-    cam.top    = roomBounds.maxZ + margin;
-    cam.bottom = roomBounds.minZ - margin;
+    cam.left   = -radius;
+    cam.right  =  radius;
+    cam.top    =  radius;
+    cam.bottom = -radius;
+    // near/far run along the light axis. The light sits _SUN_OFFSET away from the room centre, so
+    // the far plane has to clear that plus the box, or the far half of the room stops casting.
+    cam.near = 1;
+    cam.far  = Math.hypot(_SUN_OFFSET.x, _SUN_OFFSET.y, _SUN_OFFSET.z) + 2 * radius;
     cam.updateProjectionMatrix();
 }
 
@@ -4406,7 +4614,8 @@ let _powerPreference = 'browser default';
 // webgpu-gl is a DIAGNOSTIC TOOL, not a fallback tier or production renderer. It forces the
 // node-renderer onto WebGL 2 so the architecture cost can be measured in isolation from the API.
 const _MODE_LABELS = { webgl: 'WebGL', webgpu: 'WebGPU', 'webgpu-gl': 'WebGPU/GL' };
-const _BACKEND_LABELS = { webgl: 'WebGL', webgpu: 'WebGPU', 'webgl2-fallback': 'WebGPU (GL)' };
+// Backend labels come from dc-caps.js's backendLabel(). Keeping a second table here is how the
+// button and the capability module get to disagree about what 'webgl2-fallback' is called.
 
 function _rendererMode() {
     const m = window.DC_RENDERER_MODE;
@@ -4414,13 +4623,13 @@ function _rendererMode() {
 }
 
 function _setupRendererSwitch() {
-    // Use caps.isNode to determine the backend family, then renderer.backend.isWebGPUBackend
-    // to distinguish 'webgpu' from 'webgl2-fallback' within the node renderer's two backends.
-    _backendName = !caps.isNode ? 'webgl' : (renderer.backend.isWebGPUBackend ? 'webgpu' : 'webgl2-fallback');
+    // describeRenderer() already resolved this from the renderer object — re-deriving it here is
+    // a second implementation of the same rule, and the two drifted apart once already.
+    _backendName = caps.backend;
     const btn = document.getElementById('dcRenderer');
     if (!btn) return;
     const next = _rendererMode() === 'webgl' ? 'webgpu' : 'webgl';
-    const here = _BACKEND_LABELS[_backendName] || _backendName;
+    const here = backendLabel(_backendName);
     btn.textContent = here + ' ⇄ ' + _MODE_LABELS[next];
     btn.title = 'Renderer: ' + here + ' — click to reload with ' + _MODE_LABELS[next];
     btn.addEventListener('click', () => {

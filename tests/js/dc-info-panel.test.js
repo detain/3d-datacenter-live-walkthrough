@@ -88,11 +88,18 @@ describe('dc.js — showInfo escapeHtml coverage', () => {
         expect(src).toMatch(/escapeHtml\(String\(a\.order_id\)\)/);
     });
 
-    it('close button has onclick to hide panel', () => {
+    it('the close button is rendered and wired with a listener', () => {
+        // R2.6: the close button carried an inline onclick that re-looked-up #dcInfo by id and
+        // set display:none. It happened to work — unlike the Copy Link button beside it, which
+        // called a module-scope function from global scope and threw — but it is the same
+        // pattern, so it moved to _wireInfoPanel() with the others rather than being left as the
+        // one inline handler in the file.
         const src = extractFn('showInfo');
-        // close button has onclick that sets display to none
         expect(src).toMatch(/dc-info-close/);
-        expect(src).toMatch(/style\.display.*none/);
+        expect(src).not.toMatch(/onclick=/);
+        const wire = extractFn('_wireInfoPanel');
+        expect(wire).toMatch(/\.dc-info-close/);
+        expect(wire).toMatch(/panel\.style\.display\s*=\s*'none'/);
     });
 });
 

@@ -153,6 +153,10 @@ function makeHarness(urlOutcome = () => 'ok', opts = {}) {
         extractFn('loadServerType'),
         extractFn('loadBuildingModels'),
         extractFn('locationLoaded'),
+        // The real thing, not a stub: it is self-contained (one traverse, no module state) and the
+        // rack/server loaders call it, so extracting it keeps this harness executing the shipped
+        // shadow policy rather than papering over a free identifier.
+        extractFn('applyShadowPolicy'),
         extractFn('enterFull'),
         extractFn('_readDeepLink'),
         // OVERLAY_SOURCES is a large multi-line object; override applyOverlay with a no-op instead of
@@ -165,7 +169,8 @@ function makeHarness(urlOutcome = () => 'ok', opts = {}) {
         'buildBuildingFull', 'buildNeighborInterior', 'scene',
         prelude + '\nreturn { rackTypes, serverTypes, GLB_VARIANTS, _failedGlbs, _inflightGlbs, glbVariantUrl,'
         + ' rackModelName, serverModelName, loadGlbWithFallback, getRackModels, getServerModels,'
-        + ' loadRackType, loadServerType, loadBuildingModels, locationLoaded, enterFull, _readDeepLink };'
+        + ' loadRackType, loadServerType, loadBuildingModels, locationLoaded, applyShadowPolicy,'
+        + ' enterFull, _readDeepLink };'
     );
     const api = factory(
         loaderGltf,

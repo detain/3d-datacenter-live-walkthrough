@@ -33,17 +33,15 @@ const GTAO_AVAILABLE = fs.existsSync(GTAO_PASS)
 // Mock WebGL renderer for caps test
 // ---------------------------------------------------------------------------
 
-function mockWebGLRenderer({ isNode = false, contextType = 'webgl2' } = {}) {
-    const ctx = contextType === 'webgl1'
-        ? /** @type {WebGLRenderingContext} */ ({ constructor: { name: 'WebGLRenderingContext' } })
-        : /** @type {WebGL2RenderingContext} */ ({ constructor: { name: 'WebGL2RenderingContext' } });
+// Shapes taken from what three.js actually sets — see tests/js/dc-caps.test.js for the
+// node_modules/three references. A classic WebGLRenderer has no .backend; the node renderer
+// (WebGPURenderer) always does.
+function mockWebGLRenderer() {
+    return { isWebGLRenderer: true, shadowMap: {} };
+}
 
-    return {
-        constructor: { name: 'WebGLRenderer' },
-        info: { type: isNode ? 'offscreen' : 'resource' },
-        getContext: () => ctx,
-        shadowMap: {},
-    };
+function mockNodeRenderer() {
+    return { isWebGPURenderer: true, backend: { isWebGPUBackend: true }, shadowMap: {} };
 }
 
 // ---------------------------------------------------------------------------
@@ -74,10 +72,17 @@ describe('dc-ao.test.js — Step 7.3 ambient occlusion on WebGL path', () => {
             expect(caps.supportsEffectComposer).toBe(true);
         });
 
-        it('supportsEffectComposer returns false for non-WebGL/WebGPU renderer', () => {
-            const unknownRenderer = { constructor: { name: 'UnknownRenderer' }, info: {} };
-            const caps = describeRenderer(/** @type {any} */ (unknownRenderer));
-            expect(caps.supportsEffectComposer).toBe(false);
+        it('supportsEffectComposer returns false for the node renderer', () => {
+            // R2.4: this used to assert `false` for a made-up 'UnknownRenderer', which tested a
+            // constructor-name allowlist rather than a capability. The property that actually
+            // matters is this one: EffectComposer is the classic GLSL chain and does nothing on
+            // the node renderer, so the AO toggle must not be offered there.
+            expect(describeRenderer(mockNodeRenderer()).supportsEffectComposer).toBe(false);
+        });
+
+        it('describeRenderer(null) returns a safe descriptor instead of throwing', () => {
+            expect(() => describeRenderer(null)).not.toThrow();
+            expect(describeRenderer(null).supportsEffectComposer).toBe(false);
         });
 
     });

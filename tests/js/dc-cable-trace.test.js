@@ -72,10 +72,16 @@ describe('dc.js — buildPortsByAsset function', () => {
         expect(src).toMatch(/port.*portData\.port/);
     });
 
-    it('maps assetId to array of connection entries', () => {
+    it('maps assetId to array of connection entries, keyed as a STRING', () => {
+        // R2.6: the index used to be keyed by the raw portData.asset, which arrives as a JSON
+        // NUMBER (PHP casts it with (int)), while every lookup passes an id that came from
+        // Object.keys() and is a STRING. Map.get("123") never matches the key 123, so the Trace
+        // Cable button never appeared for any asset in the product. The behavioural proof is in
+        // the round-trip test at the bottom of this file; this guards the key type at the source.
         const src = extractFn('buildPortsByAsset');
         expect(src).toMatch(/portData\.asset/);
-        expect(src).toMatch(/_portsByAsset\.set\(portData\.asset/);
+        expect(src).toMatch(/String\(portData\.asset\)/);
+        expect(src).not.toMatch(/_portsByAsset\.set\(portData\.asset[,)]/);
     });
 });
 
@@ -170,9 +176,9 @@ describe('dc.js — traceCableForAsset function', () => {
         expect(DC_SOURCE).toMatch(/^function traceCableForAsset\(/m);
     });
 
-    it('looks up connections from _portsByAsset', () => {
+    it('looks up connections from _portsByAsset with a normalised key', () => {
         const src = extractFn('traceCableForAsset');
-        expect(src).toMatch(/_portsByAsset\.get\(assetId\)/);
+        expect(src).toMatch(/_portsByAsset\.get\(String\(assetId\)\)/);
     });
 
     it('early returns if no connections found', () => {
@@ -200,9 +206,9 @@ describe('dc.js — traceCableForAsset function', () => {
 // ---------------------------------------------------------------------------
 describe('dc.js — showInfo trace button', () => {
 
-    it('showInfo looks up connections from _portsByAsset', () => {
+    it('showInfo looks up connections from _portsByAsset with a normalised key', () => {
         const src = extractFn('showInfo');
-        expect(src).toMatch(/_portsByAsset\.get\(a\.id\)/);
+        expect(src).toMatch(/_portsByAsset\.get\(String\(a\.id\)\)/);
     });
 
     it('showInfo creates a trace button for assets with connections', () => {
@@ -211,10 +217,18 @@ describe('dc.js — showInfo trace button', () => {
         expect(src).toMatch(/traceBtn.*dc-info-trace/);
     });
 
-    it('trace button calls DC.traceCableForAsset with asset id', () => {
+    it('the trace button is wired with a listener, not an inline onclick', () => {
+        // dc.js loads as type="module", so an inline onclick resolves in GLOBAL scope. The copy
+        // button next to this one used a module-scope function that way and threw ReferenceError
+        // on every click. Listeners also remove the escaping sink: ids were being interpolated
+        // into a JS string inside an HTML attribute.
         const src = extractFn('showInfo');
-        expect(src).toMatch(/DC\.traceCableForAsset\(/);
-        expect(src).toMatch(/a\.id/);
+        expect(src).toMatch(/dc-info-trace/);
+        expect(src).not.toMatch(/onclick=/);
+        const wire = extractFn('_wireInfoPanel');
+        expect(wire).toMatch(/\.dc-info-trace/);
+        expect(wire).toMatch(/addEventListener\('click'/);
+        expect(wire).toMatch(/traceCableForAsset\(/);
     });
 });
 
@@ -253,4 +267,84 @@ describe('dc.js — displaySwitches captures cable routes', () => {
         const src = extractFn('displaySwitches');
         expect(src).toMatch(/if \(routeKey && !_cableRoutes\.has\(routeKey\)\)/);
     });
+});
+
+// ---------------------------------------------------------------------------
+// The port index round-trip — the behavioural half of the key-type fix (R2.6).
+//
+// Everything above is source text. This runs the real buildPortsByAsset() and
+// traceCableForAsset() against a payload shaped like /ajax/datacenter.php's, where
+// `ports[<id>].asset` is a NUMBER, and looks it up with the STRING id the info panel actually
+// holds (server ids come from Object.keys(rack.servers)). That mismatch is what made the Trace
+// Cable button never appear, and no amount of source matching can see it.
+// ---------------------------------------------------------------------------
+describe('dc.js — the port index round-trips between number and string ids', () => {
+
+    /** Build a live sandbox over the real declarations. */
+    function makePortIndex(locations) {
+        const traced = [];
+        const src = [
+            'const _portsByAsset = new Map();',
+            extractFn('buildPortsByAsset'),
+            extractFn('traceCableForAsset'),
+            'return { buildPortsByAsset, traceCableForAsset, get: (k) => _portsByAsset.get(k) };',
+        ].join('\n');
+        // eslint-disable-next-line no-new-func
+        return {
+            ...new Function('locations', 'traceCable', src)(locations, (k) => traced.push(k)),
+            traced,
+        };
+    }
+
+    // datacenter.php emits ports[...].asset as (int) — a JSON number — while rack.servers is an
+    // object whose KEYS are the same ids as strings.
+    const LOCATIONS = {
+        4: {
+            racks: {
+                101: {
+                    servers: { 5150: { hostname: 'web1.test' } },
+                    switches: {
+                        900: { name: 'sw1', ports: { 7: { port: 'Gi0/1', asset: 5150 } } },
+                    },
+                },
+            },
+        },
+    };
+
+    it('finds an asset looked up with the STRING id the info panel holds', () => {
+        const idx = makePortIndex(LOCATIONS);
+        idx.buildPortsByAsset(4);
+        // '5150', not 5150 — this is exactly what showInfo() passes.
+        expect(idx.get('5150')).toBeDefined();
+        expect(idx.get('5150')).toHaveLength(1);
+    });
+
+    it('also finds it when called with a NUMBER from the console', () => {
+        const idx = makePortIndex(LOCATIONS);
+        idx.buildPortsByAsset(4);
+        idx.traceCableForAsset(5150);
+        expect(idx.traced).toEqual(['900:7']);
+    });
+
+    it('traces from the string id too', () => {
+        const idx = makePortIndex(LOCATIONS);
+        idx.buildPortsByAsset(4);
+        idx.traceCableForAsset('5150');
+        expect(idx.traced).toEqual(['900:7']);
+    });
+
+    it('does nothing for an asset with no connections', () => {
+        const idx = makePortIndex(LOCATIONS);
+        idx.buildPortsByAsset(4);
+        idx.traceCableForAsset(9999);
+        expect(idx.traced).toEqual([]);
+    });
+
+    it('clears the index between locations', () => {
+        const idx = makePortIndex(LOCATIONS);
+        idx.buildPortsByAsset(4);
+        idx.buildPortsByAsset(7);   // no such location
+        expect(idx.get('5150')).toBeUndefined();
+    });
+
 });

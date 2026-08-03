@@ -145,12 +145,79 @@ Read the fields carefully:
   auto-quality scaler drops it further under load — two runs at different `dpr` are not
   comparable, so check it before comparing FPS.
 - `drawCalls` is the worst (highest) per-frame count seen over the run.
-- `ao` is `false` — ambient occlusion is not yet implemented in this scene.
+- `ao` is **hardcoded** `false`. This is a known defect, not a description: Step 7.3 added a
+  real `EffectComposer` + `GTAOPass` chain on the WebGL path, so a bench run with ambient
+  occlusion enabled still reports `ao: false` and two runs that differ in AO look comparable
+  when they are not. Tracked as `dc_remediation_plan.md` step R3.7.
 - `shadows` is `true` when shadow rendering is active.
 - `shadowMapSize` is the shadow map resolution in pixels (typically 512, 1024, or 2048).
 - `pixelScale` is the quality scale multiplier applied to the renderer pixel ratio
   (`S.pixelScale`, distinct from `dpr` which is the effective ratio after auto-quality).
 - `triangles` is the per-frame triangle count from `renderer.info.render.triangles`.
+
+## Baseline measurements
+
+The draw-call baseline that Phase 8 of `dc_improve_plan.md` was gated on. It was never
+recorded at the time — Step 8.0 required a browser and was skipped, and Steps 8.1, 8.3 and
+8.4 all proceeded on estimates. Recorded here 2026-08-03 as part of the remediation
+(`dc_remediation_plan.md` step R1.7), once the page could boot again.
+
+### CI-equivalent room — 2026-08-03
+
+Chromium + SwiftShader via Playwright, `bootHermetic()` stubs, `?renderer=webgl`,
+`await DC.bench(10)`. Taken **twice** the same day, before and after Tier 2 of the remediation:
+
+| Field | Before Tier 2 | After Tier 2 |
+|---|---|---|
+| `backend` | `webgl` | `webgl` |
+| `drawCalls` | 108 | **168** |
+| `triangles` | 62,418 | **66,008** |
+| `avgFps` / `minFps` | `null` (`samples: 0`) | `null` (`samples: 0`) |
+| `dpr` | 0.8 | 0.8 |
+| `pixelScale` | 1 | 1 |
+| `shadows` | `false` | **`true`** |
+| `ao` | `false` | `false` |
+
+**The increase is the product working, not a regression.** The first reading was taken while
+`buildCommunity()` was placing no neighbours at all (`dc_remediation_plan.md` R2.1) and while the
+Playwright fixture served one location to both tiers, so the scene contained a single room shell
+and nothing else. It now contains two neighbour buildings' shells and block proxies — which is
+what the page is supposed to render. The old numbers described a scene the product never intends
+to produce, so the CI ceilings were re-derived from the new ones (`250` / `99000`).
+
+`shadows` flipping to `true` is R2.3: the flag was never assigned, so `bench()` reported `false`
+while shadows rendered. The reported value now matches `renderer.shadowMap.enabled`.
+
+**Read these caveats before quoting the numbers.**
+
+- **This is the room shell only.** `public_html/images/3d` is gitignored, so every rack and
+  server GLB 404s, and `bootHermetic()` stubs the character manifest to 404 as well. There
+  are no racks, no servers and no avatars in this measurement. A production room will be far
+  heavier. These figures are the right basis for the CI regression ceilings in
+  `tests/playwright/dc.spec.ts` and for nothing else.
+- **The FPS fields are unusable here.** `samples: 0` means the ring buffer never filled —
+  SwiftShader is a software rasteriser and its frame cadence says nothing about a real GPU.
+  The CI guard therefore asserts draw calls and triangles only. Do not add an FPS assertion
+  until the numbers come from real hardware.
+- **`ao: false` is still a defect, not a setting.** `bench()` hardcodes it
+  (`dc_remediation_plan.md` step R3.7), so it reports `false` whether or not the AO composer is
+  running. `shadows` was the same until R2.3 and now reports the truth.
+- **Shadows are enabled here but nothing casts.** With no rack or server models loaded, the only
+  meshes present are the room shell, which receives shadows and does not cast. The shadow depth
+  pass runs and costs draw calls; the visual result in this fixture is nothing. Shadow *casting*
+  cannot be verified in CI at all — it needs the gitignored 3D assets.
+
+### Still not measured
+
+A full room on real hardware, and a neighbour building swapped to full detail. Both need a
+GPU and a live datacenter payload. Step 8.0's original intent — measure in an aisle, then
+again beside a full-detail neighbour — remains open. `DC.lodState()` now reports neighbours in
+the fixture (R2.1), but nothing in CI walks close enough to force one to full detail.
+
+Step 8.3's cable-triangle reduction was performed without the measurement that was supposed to
+authorise it. At the 108 draw calls measured before Tier 2, the honest reading of Step 8.0's own
+gate ("if draw calls are already under ~100, skip Step 8.3 entirely") is that the reduction was
+not justified. It is harmless and has been kept.
 
 ## Findings
 

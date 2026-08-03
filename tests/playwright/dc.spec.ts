@@ -67,20 +67,58 @@ async function waitForPageLoad(page: any, timeout = 60000): Promise<boolean> {
 // it, leaving #dcLoading (inset:0, z-index:40) up for the life of the page and eating every pointer
 // interaction, which is the same dead end as the 403. Keep this key and options.location in step.
 // ---------------------------------------------------------------------------
-function datacenterStub() {
+function fullRacks(seed: number) {
   // Same shape /ajax/datacenter.php emits. Rack type 1 and server type 1 are real entries in dc.js's
   // rackTypes/serverTypes, so the room resolves two small meshopt GLBs instead of the full set.
   const racks: Record<string, any> = {};
   for (let r = 1; r <= 4; r++) {
     const servers: Record<string, any> = {};
     for (let s = 0; s < 3; s++) {
-      servers[String(100 + r * 10 + s)] = { hostname: `web${r}${s}.test`, start: 1 + s * 2, size: 1, type: 1 };
+      servers[String(seed + r * 10 + s)] = { hostname: `web${r}${s}.test`, start: 1 + s * 2, size: 1, type: 1 };
     }
-    racks[String(r)] = { x: r, y: 2, name: `R${r}`, type: 1, servers, switches: {} };
+    racks[String(seed + r)] = { x: r, y: 2, name: `R${r}`, type: 1, servers, switches: {} };
   }
-  return { locations: { 4: { name: 'Test DC', region: 'Test', racks } } };
+  return racks;
 }
-const DATACENTER_STUB = datacenterStub();
+
+// The full tier: ONE location, complete inventory. This is what ?location=<id> returns.
+const DATACENTER_STUB = { locations: { 4: { name: 'Test DC', region: 'Test', racks: fullRacks(100) } } };
+
+/**
+ * The index tier: EVERY location, racks stripped to {x, y} — datacenter.php:138-147.
+ *
+ * Three locations, not one, and that is load-bearing. buildCommunity() only lays out a street
+ * when it can place two or more buildings, so a single-location stub cannot tell a working
+ * community layout from an empty one — which is how the neighbours-and-LOD regression (R2.1)
+ * survived a full E2E suite. The index tier existing at all is what makes placing a neighbour
+ * possible without its inventory, so the fixture has to reproduce that asymmetry to be worth
+ * anything: locations 7 and 9 are placed here and never returned in full, exactly like a real
+ * boot.
+ */
+const DATACENTER_INDEX_STUB = {
+  locations: {
+    4: { name: 'Test DC', region: 'Test', racks: indexRacks(100) },
+    7: { name: 'Test DC West', region: 'Test', racks: indexRacks(200) },
+    9: { name: 'Test DC South', region: 'Test', racks: indexRacks(300) },
+  },
+};
+
+function indexRacks(seed: number) {
+  const racks: Record<string, any> = {};
+  for (let r = 1; r <= 4; r++) racks[String(seed + r)] = { x: r, y: 2 };
+  return racks;
+}
+
+// One switch with one port pointing at server 110, so buildPortsByAsset() has something to index
+// and Group 12 can assert the Trace Cable button appears. `asset` is a NUMBER here on purpose —
+// that is what PHP's (int) cast emits, and the mismatch against the string ids the info panel
+// holds is what kept the button hidden for every asset (R2.6).
+DATACENTER_STUB.locations[4].racks['101'].switches = {
+  900: {
+    name: 'sw1', asset: 0, start: 20, size: 1, totalPorts: 24, type: 6,
+    ports: { 7: { justport: 1, port: 'Gi0/1', asset: 110, datacenter: 4, rack: 101 } },
+  },
+};
 
 /**
  * 'throw' the WebSocket constructor throws (blocked / bad URL)
@@ -117,11 +155,14 @@ async function stubHub(page: any, mode: HubMode) {
 
 async function bootHermetic(page: any, url = '/admin/dc.html', hub: HubMode = 'dead') {
   await stubHub(page, hub);
+  // Answer the two tiers separately, the way the endpoint does. Serving the full payload to
+  // ?tier=index would collapse the fixture back to one location and hide anything that depends on
+  // the index/full split.
   await page.route('**/ajax/datacenter.php*', (route: any) =>
     route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify(DATACENTER_STUB),
+      body: JSON.stringify(route.request().url().includes('tier=index') ? DATACENTER_INDEX_STUB : DATACENTER_STUB),
     })
   );
   await page.route('**/images/3d/mixamo/manifest.json*', (route: any) =>
@@ -499,21 +540,43 @@ test.describe('Group 7: WebGL Availability', () => {
 
   // Run for both renderer modes: a broken import map or a three.webgpu.js that fails to parse
   // shows up here as a module error and nowhere else.
+  //
+  // That claim used to be false, and it cost two days. This test registered only
+  // page.on('pageerror'), but a module script that fails to LOAD fires an `error` event on the
+  // <script> element — it never reaches window.onerror, so pageerror sees nothing. When the
+  // import map pointed three-mesh-bvh at a .cjs served as application/node, the browser
+  // rejected it, dc.js never evaluated, window.DC was never created, zero canvases rendered —
+  // and this test passed. See dc_remediation_plan.md step R1.6.
+  //
+  // Two changes make it able to fail: console errors and failed requests are collected too,
+  // and the test now asserts on the PRODUCT (window.DC exists, a canvas exists) rather than
+  // only on the absence of a particular log line.
   for (const { label, url } of RENDERER_MODES) {
     test(`[${label}] no critical JS errors on page load`, async ({ page }) => {
       const errors: string[] = [];
       page.on('pageerror', (err) => errors.push(err.message));
+      page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+      page.on('requestfailed', (r) => errors.push(`requestfailed: ${r.url()}`));
 
       await bootHermetic(page, url);
       await page.waitForTimeout(3000);  // Wait for any async initialization
 
-      // Filter out known non-critical errors
+      // The scene must actually exist. These two assertions are the whole point of the test:
+      // an error-free page that rendered nothing is not a passing page.
+      expect(await page.evaluate(() => typeof (window as any).DC)).toBe('object');
+      expect(await page.locator('canvas').count()).toBeGreaterThan(0);
+
+      // Filter out known non-critical errors. NOTE: a MIME rejection mentions neither WebGL
+      // nor GPU nor "context", so it is NOT filtered here — that is deliberate. Do not widen
+      // this allowlist to make a red test green; widen it only for a failure you have
+      // diagnosed and decided to tolerate.
       const criticalErrors = errors.filter(
         (e) =>
           !e.includes('WebGL') &&
           !e.includes('GPU') &&
           !e.includes('context') &&
-          !e.includes('Failed to load resource')
+          !e.includes('Failed to load resource') &&
+          !e.includes('requestfailed:')   // hermetic stubs 404 assets by design
       );
 
       if (criticalErrors.length > 0) {
@@ -787,18 +850,41 @@ test.describe('Group 9: Renderer modes', () => {
 // ---------------------------------------------------------------------------
 // Group 10: Performance regression guard
 //
-// DC.bench(frames) runs the render loop for `frames` frames with a frozen
-// camera and returns { drawCalls, triangles, fps } measured during that run.
-// This group asserts those numbers stay within agreed CI thresholds so that
-// a code change that inflates draw calls or triangle count fails the gate
-// rather than silently degrading frame rate on every PR.
+// DC.bench(seconds) sweeps the IDLE_VIEWS camera presets for `seconds` seconds and returns
+// { backend, drawCalls, triangles, avgFps, minFps, samples, ao, shadows, shadowMapSize,
+//   pixelScale }.
+// NOTE the units and field names — an earlier version of this comment said "frames" and
+// "fps", and the annotation below logged `undefined` as a result.
 //
-// Thresholds are conservative headroom around what the stub room (4 racks,
-// 12 servers, 0 character assets) actually produces; they are NOT the
-// numbers a production room with full character assets would show.
+// WHAT CI ACTUALLY RENDERS: public_html/images/3d is gitignored, so in CI every rack and
+// server GLB 404s. bootHermetic() additionally stubs the manifest to 404, so there are no
+// character assets either. This benchmarks the ROOM SHELL ONLY — no racks, no servers, no
+// avatars. A production room with full assets will be far heavier; these thresholds cannot
+// speak to it, and must not be quoted as if they can.
+//
+// THRESHOLDS: derived from a measured run, not invented. See the Baseline measurements
+// section of docs/dc_renderer_modes.md for the numbers and the date. The previous ceilings
+// (400 / 2,000,000) were the plan's own placeholder values — roughly 32x the real triangle
+// count — and could not have caught any plausible regression.
 //
 // Uses continue-on-error: false in CI so a regression here BLOCKS the PR.
 // ---------------------------------------------------------------------------
+// Measured 2026-08-03 on the CI-equivalent stub room (chromium + SwiftShader, no 3D assets):
+//   drawCalls = 166, triangles = 65,898
+// Ceilings are ~1.5x those figures. Re-measure and re-derive if the stub room changes.
+//
+// RE-MEASURED the same day, after R2.1 and the tier-aware fixture. The first reading was
+// 108 / 62,418, taken while buildCommunity() was placing NO neighbours — the community layout
+// was broken and the stub served one location to both tiers. Both of those are now fixed, so
+// the room legitimately contains two neighbour buildings' shells and block proxies. The
+// increase is the feature working, not a regression; the old numbers described a scene the
+// product never intends to render.
+//
+// avgFps/minFps are deliberately NOT asserted: under SwiftShader the bench returns
+// samples=0 and avgFps=null, so an FPS assertion would either be vacuous or flaky. Frame
+// rate needs a real GPU to mean anything — see docs/dc_renderer_modes.md.
+const PERF_BUDGET = { drawCalls: 250, triangles: 99000 };
+
 test.describe('Group 10: Performance regression', () => {
   test.beforeEach(async ({ page }) => {
     test.setTimeout(300000);
@@ -806,18 +892,212 @@ test.describe('Group 10: Performance regression', () => {
     await waitForSceneLoaded(page);
   });
 
-  test('DC.bench(10) drawCalls < 400 and triangles < 2000000', async ({ page }) => {
-    const result = await page.evaluate(async () => {
-      // DC.bench is async because it awaits renderer.compile() the first time.
-      return (window as any).DC.bench(10);
-    });
+  test('DC.bench(10) stays within the measured render budget', async ({ page }) => {
+    const result = await page.evaluate(async () => (window as any).DC.bench(10));
 
+    // Printed, not just annotated: the annotation is invisible under the default reporter,
+    // which is why nobody noticed it was logging undefined.
+    console.log('[perf] ' + JSON.stringify(result));
     test.info().annotations.push({
       type: 'performance',
-      description: `drawCalls=${result.drawCalls} triangles=${result.triangles} fps=${result.fps}`,
+      description: `backend=${result.backend} drawCalls=${result.drawCalls} `
+        + `triangles=${result.triangles} avgFps=${result.avgFps} minFps=${result.minFps} `
+        + `samples=${result.samples}`,
     });
 
-    expect(result.drawCalls).toBeLessThan(400);
-    expect(result.triangles).toBeLessThan(2000000);
+    // Ceilings are ~1.5x the measured baseline — tight enough to catch a real regression,
+    // loose enough to absorb run-to-run jitter. Re-derive them if the stub room changes.
+    expect(result.drawCalls).toBeLessThan(PERF_BUDGET.drawCalls);
+    expect(result.triangles).toBeLessThan(PERF_BUDGET.triangles);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Group 11: The community layout — neighbour buildings and LOD (R2.1)
+//
+// This group exists because a regression that removed EVERY neighbour building, every block
+// proxy, every neighbour door and the entire LOD system went unnoticed through a full plan: the
+// features are only reachable once two or more locations are placed, and the old fixture served
+// one. The assertions below are deliberately about counts and reachability rather than pixels —
+// what broke was a filter predicate returning an empty list, and a length is exactly the shape of
+// that failure.
+// ---------------------------------------------------------------------------
+test.describe('Group 11: Community layout and LOD', () => {
+  test.beforeEach(async ({ page }) => {
+    test.setTimeout(150000);
+    await bootHermetic(page);
+    await waitForSceneLoaded(page);
+  });
+
+  test('every OTHER location in the index tier gets a neighbour building', async ({ page }) => {
+    // The index stub places 4, 7 and 9; only 4 is ever returned in full. lodBuildings holds
+    // neighbours only — dc.js skips options.location, because that one is the real room you are
+    // standing in — so 7 and 9 are the expected entries. The regression made this list empty.
+    const lod = await page.evaluate(() => (window as any).DC.lodState());
+    expect(Array.isArray(lod)).toBe(true);
+    const ids = lod.map((b: any) => b.id).sort((a: number, b: number) => a - b);
+    expect(ids).toEqual([7, 9]);
+  });
+
+  test('neighbours are placed from index data alone, without their inventory', async ({ page }) => {
+    // The point of the two-tier fetch: a neighbour needs a footprint to sit on the street, not a
+    // server list. 7 and 9 are never returned in full by the stub, so if placement required
+    // inventory there would be nothing here at all.
+    const lod = await page.evaluate(() => (window as any).DC.lodState());
+    expect(lod).toHaveLength(2);
+    // Nothing has forced them to full detail — they are across the street and have no inventory.
+    expect(lod.filter((b: any) => b.full)).toHaveLength(0);
+  });
+
+  test('updateLOD() runs instead of returning at its first line', async ({ page }) => {
+    // lodState() reports the per-neighbour distance updateLOD() writes each frame. A finite
+    // distance on every entry proves the loop body executed; the regression left lodBuildings
+    // empty, so updateLOD() bailed on `!lodBuildings.length` forever.
+    const dists = await page.evaluate(() => (window as any).DC.lodState().map((b: any) => b.dist));
+    expect(dists).toHaveLength(2);
+    for (const d of dists) expect(Number.isFinite(d)).toBe(true);
+  });
+
+  test('the location switcher lists every indexed location', async ({ page }) => {
+    // buildLocationButtons() renders from locationNames, which the index tier fills. A location
+    // that merges without a name is a button that never appears.
+    await expect(page.locator('#dcLocations button')).toHaveCount(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Group 12: The info panel's action buttons (R2.6)
+//
+// Every user-facing deliverable of Phase 9 was unreachable in a browser while its unit tests
+// passed, because those tests matched source text and the source text was there. Copy Link threw
+// ReferenceError on click (dc.js is a module, so an inline onclick resolves in global scope);
+// Trace Cable never rendered at all (the port index was keyed by number, looked up by string).
+// These exercise the panel the way a user does: click the button, look at what happened.
+//
+// showInfo() takes a hit object, so these synthesise one rather than depending on a raycast
+// against 3D models — public_html/images/3d is gitignored, so in CI there are no rack or server
+// meshes to click on at all.
+// ---------------------------------------------------------------------------
+test.describe('Group 12: Info panel actions', () => {
+  test.beforeEach(async ({ page }) => {
+    test.setTimeout(150000);
+    await bootHermetic(page);
+    await waitForSceneLoaded(page);
+  });
+
+  /** Open the panel for stub server 110, which the stub switch has a port for. */
+  const openServerPanel = (page: any, hostname = 'web10.test') => page.evaluate((h: string) => {
+    (window as any).DC.info({
+      mesh: { userData: {} }, instanceId: 0, kind: 'server',
+      asset: { id: '110', hostname: h, status: 'active', start: 1, size: 1, make: 'Dell', model: 'R640' },
+    });
+  }, hostname);
+
+  test('Copy Link writes a deep link that names the asset', async ({ page }) => {
+    await openServerPanel(page);
+    const copied = await page.evaluate(async () => {
+      const w = window as any;
+      w.__clip = null;
+      navigator.clipboard.writeText = (t: string) => { w.__clip = t; return Promise.resolve(); };
+      document.querySelector<HTMLButtonElement>('#dcInfo .dc-info-copy')!.click();
+      await new Promise((r) => setTimeout(r, 30));
+      return w.__clip;
+    });
+    expect(copied, 'Copy Link wrote nothing — the click handler did not run').not.toBeNull();
+    const url = new URL(copied);
+    expect(url.searchParams.get('asset')).toBe('110');
+    expect(url.searchParams.get('location')).toBe('4');
+    // No bare ?rack= — that was what the broken rackKey lookup produced.
+    expect(url.searchParams.get('rack')).toBeNull();
+  });
+
+  test('Trace Cable appears for an asset that has a switch port', async ({ page }) => {
+    // The port index key type in one assertion: the stub's port carries `asset: 110` (a number)
+    // and the panel looks up '110' (a string).
+    await openServerPanel(page);
+    await expect(page.locator('#dcInfo .dc-info-trace')).toHaveCount(1);
+  });
+
+  test('Trace Cable does not appear for an asset with no connections', async ({ page }) => {
+    await page.evaluate(() => {
+      (window as any).DC.info({
+        mesh: { userData: {} }, instanceId: 0, kind: 'server',
+        asset: { id: '999', hostname: 'unconnected.test', status: 'active', start: 1, size: 1 },
+      });
+    });
+    await expect(page.locator('#dcInfo .dc-info-trace')).toHaveCount(0);
+  });
+
+  test('clicking Trace Cable does not throw', async ({ page }) => {
+    const errors: string[] = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await openServerPanel(page);
+    await page.locator('#dcInfo .dc-info-trace').click();
+    await page.waitForTimeout(100);
+    expect(errors).toEqual([]);
+  });
+
+  test('the close button hides the panel', async ({ page }) => {
+    await openServerPanel(page);
+    await expect(page.locator('#dcInfo')).toBeVisible();
+    await page.locator('#dcInfo .dc-info-close').click();
+    await expect(page.locator('#dcInfo')).toBeHidden();
+  });
+
+  test('a hostile hostname is rendered as text, never as markup', async ({ page }) => {
+    // The XSS test the original plan called "the important one" and which was never written.
+    // Hostnames come from the assets table; anyone who can name a server can reach this sink.
+    await openServerPanel(page, '<img src=x onerror="window.__pwned=1">');
+    const out = await page.evaluate(() => ({
+      imgs: document.querySelectorAll('#dcInfo img').length,
+      title: document.querySelector('#dcInfo .dc-info-title')!.textContent,
+      pwned: !!(window as any).__pwned,
+    }));
+    expect(out.imgs).toBe(0);
+    expect(out.pwned).toBe(false);
+    expect(out.title).toBe('<img src=x onerror="window.__pwned=1">');
+  });
+
+  test('the action buttons are styled, not raw UA buttons', async ({ page }) => {
+    // They had no CSS at all and rendered as grey system buttons on a dark translucent panel.
+    await openServerPanel(page);
+    const style = await page.evaluate(() => {
+      const cs = getComputedStyle(document.querySelector('#dcInfo .dc-info-copy')!);
+      return { border: cs.borderTopStyle + ' ' + cs.borderTopWidth, cursor: cs.cursor };
+    });
+    expect(style.border).toBe('solid 1px');
+    expect(style.cursor).toBe('pointer');
+  });
+
+  test('DC.setIsolate dims the scene and clearIsolate restores it exactly', async ({ page }) => {
+    // Both isolate defects at once: the pass used to skip every opaque material (so nothing
+    // dimmed), and saved state keyed by object id corrupted shared materials permanently.
+    const out = await page.evaluate(() => {
+      const dc = (window as any).DC;
+      const before: any[] = [];
+      dc.scene.traverse((o: any) => {
+        if (o.isMesh && o.material && !Array.isArray(o.material)) {
+          before.push([o.material, o.material.opacity, o.material.transparent, o.material.depthWrite]);
+        }
+      });
+      dc.setIsolate(new Set([dc.scene.children[0].id]));
+      let dimmed = 0;
+      dc.scene.traverse((o: any) => {
+        if (o.isMesh && o.material && !Array.isArray(o.material) && o.material.opacity === 0.3) dimmed++;
+      });
+      dc.clearIsolate();
+      const exact = before.every(([m, op, tr, dw]) => m.opacity === op && m.transparent === tr && m.depthWrite === dw);
+      return { total: before.length, dimmed, restoredExactly: exact };
+    });
+    expect(out.total).toBeGreaterThan(0);
+    expect(out.dimmed).toBeGreaterThan(0);
+    expect(out.restoredExactly).toBe(true);
+  });
+
+  test('DC.setIsolate(null) clears instead of throwing', async ({ page }) => {
+    const threw = await page.evaluate(() => {
+      try { (window as any).DC.setIsolate(null); return false; } catch (e) { return true; }
+    });
+    expect(threw).toBe(false);
   });
 });

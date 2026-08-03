@@ -130,6 +130,20 @@ body.dc-has-inspector #dcWsToggle { top: 62px; }
 .dc-info-row { margin: 3px 0; color: #ccc; font-size: 13px; }
 .dc-info-links { margin-top: 6px; }
 .dc-info-links a { display: inline-block; margin-right: 10px; }
+/* Step 9.3 / 9.6 action buttons. They had no styles at all, so they rendered as default
+   UA-styled grey system buttons on a dark translucent panel — legible, but visibly not part of
+   the page. Same flat treatment as the rest of the HUD. */
+.dc-info-trace-btn, .dc-info-copy-btn { margin-top: 6px; }
+.dc-info-copy, .dc-info-trace {
+    background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.22);
+    color: #dfe6ee; font: inherit; font-size: 12px; border-radius: 4px;
+    padding: 4px 9px; cursor: pointer;
+}
+.dc-info-copy:hover, .dc-info-trace:hover { background: rgba(255, 255, 255, 0.16); color: #fff; }
+.dc-info-copy:active, .dc-info-trace:active { background: rgba(255, 255, 255, 0.24); }
+.dc-info-copy:focus-visible, .dc-info-trace:focus-visible { outline: 2px solid #4da3ff; outline-offset: 1px; }
+/* Trace is the more consequential action of the two — it draws into the scene. */
+.dc-info-trace { border-color: rgba(0, 255, 255, 0.4); color: #9ff; }
 
 /* --- Step 9.7: Capacity overlay legend --- */
 #dcOverlayLegend { position: fixed; bottom: 16px; right: 16px; z-index: 31;

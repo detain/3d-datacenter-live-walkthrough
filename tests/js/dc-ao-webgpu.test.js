@@ -14,6 +14,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { describeRenderer } from '../../public_html/js/dc-caps.js';
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -109,22 +110,33 @@ describe('dc.js — Step 7.4 WebGPU ambient occlusion via TSL', () => {
 
     describe('init() calls _setupWebgpuPostFX only for WebGPURenderer backend', () => {
 
-        it('(d) _setupWebgpuPostFX() is called only when caps.backend === \'WebGPURenderer\'', () => {
-            // Find where _setupWebgpuPostFX is called in init()
-            const initBody = getFunctionBody(DC_SOURCE, 'init');
-            if (!initBody) {
-                // init() is async and may not be a simple function declaration; search for the call
-                expect(DC_SOURCE).toMatch(/caps\.backend\s*===\s*['"]WebGPURenderer['"]/);
-                expect(DC_SOURCE).toMatch(/_setupWebgpuPostFX\s*\(\s*\)/);
-                return;
-            }
-            // The call should be inside a caps.backend === 'WebGPURenderer' check
-            expect(initBody).toMatch(/caps\.backend\s*===\s*['"]WebGPURenderer['"]/);
-            // And _setupWebgpuPostFX should be called within that branch
-            const webgpuBranchMatch = initBody.match(/caps\.backend\s*===\s*['"]WebGPURenderer['"][\s\S]*?\{([\s\S]*?)\n\s*\}/);
-            if (webgpuBranchMatch) {
-                expect(webgpuBranchMatch[1]).toMatch(/_setupWebgpuPostFX\s*\(\s*\)/);
-            }
+        it('(d) _setupWebgpuPostFX() is called only under caps.supportsTSL', () => {
+            // R2.4: the gate used to be `caps.backend === 'WebGPURenderer'`. describeRenderer()
+            // never returns a class name — backend is 'webgl' | 'webgpu' | 'webgl2-fallback' —
+            // so that comparison was false in every mode, and it would ALSO have excluded
+            // ?renderer=webgpu-gl, which compiles TSL through the WebGL2 backend.
+            const code = stripComments(DC_SOURCE);
+            expect(code).not.toMatch(/caps\.backend\s*===\s*['"]WebGPURenderer['"]/);
+            const gate = code.match(/if\s*\(\s*caps\.supportsTSL\s*\)\s*\{([\s\S]{0,200}?)\n\s*\}/);
+            expect(gate, 'no `if (caps.supportsTSL) { … }` block found in dc.js').not.toBeNull();
+            expect(gate[1]).toMatch(/_setupWebgpuPostFX\s*\(\s*\)/);
+        });
+
+        it('the WebGL composer setup is gated on supportsEffectComposer, which excludes the node path', () => {
+            // supportsEffectComposer is !isNode and supportsTSL is isNode, so the two setup calls
+            // are mutually exclusive by construction — no backend-string test is needed, and
+            // adding one back is how they start overlapping again.
+            const code = stripComments(DC_SOURCE);
+            // There is more than one supportsEffectComposer gate (the GUI's AO toggle is the
+            // other), so match them all and require that one of them wraps the setup call.
+            const gates = [...code.matchAll(/if\s*\(\s*caps\.supportsEffectComposer\s*\)\s*\{([\s\S]{0,200}?)\n\s*\}/g)];
+            expect(gates.length, 'no `if (caps.supportsEffectComposer) { … }` block found in dc.js').toBeGreaterThan(0);
+            expect(gates.some((g) => /_setupWebglPostFX\s*\(\s*\)/.test(g[1]))).toBe(true);
+            // And the setup call must exist nowhere else — an ungated one would run on the node
+            // renderer, where EffectComposer does nothing.
+            // (?<!function\s) so the declaration itself is not counted as a call site.
+            const calls = code.match(/(?<!function\s)_setupWebglPostFX\s*\(\s*\)/g) || [];
+            expect(calls.length).toBe(1);
         });
 
     });
@@ -170,12 +182,16 @@ describe('dc.js — Step 7.4 WebGPU ambient occlusion via TSL', () => {
 
     describe('dc-caps.js integration', () => {
 
-        it('caps.supportsTSL is correctly set based on renderer._tslm', () => {
-            // This is verified by dc-caps.test.js, but we confirm the property is used here
-            const DC_CAPS = path.resolve(__dirname, '../../public_html/js/dc-caps.js');
-            const capsSource = fs.readFileSync(DC_CAPS, 'utf8');
-            // supportsTSL should be derived from renderer._tslm
-            expect(capsSource).toMatch(/supportsTSL.*_tslm|_tslm.*supportsTSL/);
+        it('caps.supportsTSL is true for the node renderer and false for classic WebGL', () => {
+            // R2.4 (was a KNOWN DEFECT): this asserted supportsTSL derived from `renderer._tslm`,
+            // a property that exists nowhere in three.js — so supportsTSL was permanently false
+            // and the WebGPU AO branch below was unreachable no matter what dc.js did. It now
+            // calls the real module against renderer shapes three.js actually ships.
+            expect(describeRenderer({ isWebGLRenderer: true }).supportsTSL).toBe(false);
+            expect(describeRenderer({ isWebGPURenderer: true, backend: { isWebGPUBackend: true } }).supportsTSL).toBe(true);
+            // Both node backends compile TSL — the WebGL2 fallback lowers the same node graph to
+            // GLSL — so ?renderer=webgpu-gl must reach this path too.
+            expect(describeRenderer({ isWebGPURenderer: true, backend: {} }).supportsTSL).toBe(true);
         });
 
     });

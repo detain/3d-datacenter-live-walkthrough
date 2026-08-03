@@ -1,10 +1,23 @@
 /**
  * Unit tests for the render loop collapse in public_html/js/dc.js
  *
- * Verifies that animate() and DC.tick() form a single canonical render path
- * (Bug F-16), and that _tickSkippedFrames / _skipExpensiveUpdates are managed
- * exclusively by tick() so both the dc.html path and dc-multi path reach the
- * same idle-skip frame count.
+ * Verifies that animate() and DC.tick() form a single canonical render path (Bug F-16), and
+ * that _tickSkippedFrames / _skipExpensiveUpdates are managed exclusively by tick() so both
+ * the dc.html path and the dc-multi path reach the same idle-skip frame count.
+ *
+ * WHY THIS FILE WAS REWRITTEN (dc_remediation_plan.md step R1.4)
+ * The previous version asserted `expect(lastLine).toMatch(/^tick\(\);?$/)` — i.e. that the
+ * last line of animate() is a bare `tick();`. There is no module-scope `tick` in dc.js; the
+ * only one is a property on the window.DC object literal. So that call threw
+ * `ReferenceError: tick is not defined` on every single frame, _guardLoop swallowed it, and
+ * after 10 frames _loopErrorCount stopped even logging. The scene never painted on the
+ * dc.html path — the exact path Step 4.1 existed to protect — and the test asserted that it
+ * must stay that way.
+ *
+ * The lesson: a test that pattern-matches the source it was written against can only ever
+ * confirm that nobody edited the file. animate() is now EXECUTED here, with the same free
+ * identifiers injected that the module provides, so a call to something that does not exist
+ * fails loudly.
  *
  * Run: yarn test:js
  */
@@ -21,14 +34,14 @@ const DC_SOURCE = fs.readFileSync(DC_SRC, 'utf8');
 // Helpers
 // ----------------------------------------------------------------
 
-/** Strip single-line and multi-line comments so embedded identifiers don't cause false positives. */
+/** Strip comments so identifiers mentioned in prose don't cause false positives. */
 function stripComments(src) {
   return src
     .replace(/\/\/[^\n]*/g, '')
     .replace(/\/\*[\s\S]*?\*\//g, '');
 }
 
-/** Extract a top-level function body (column-0 function declaration) via brace-depth walk. */
+/** Extract a top-level function declaration (column-0) via a brace-depth walk. */
 function getFunctionBody(source, fnName) {
   const lines = source.split('\n');
   const startRe = new RegExp(`^function ${fnName}\\(\\)\\s*\\{`);
@@ -45,64 +58,127 @@ function getFunctionBody(source, fnName) {
   return null;
 }
 
+/**
+ * Compile a body of `function animate() {...}` source into a callable, injecting every free
+ * identifier animate() reads. Returns { run, calls } where calls records what animate did.
+ *
+ * Deliberately takes the source as an argument rather than reading it, so the non-vacuity
+ * test below can compile a deliberately-broken variant through the identical harness.
+ */
+function compileAnimate(bodySource, { contextLost = false, hidden = false, locked = true } = {}) {
+  const calls = { tick: 0, updateControls: 0, maybeCycleIdleView: 0, maybeFlicker: 0, updateDisco: 0 };
+  const fakeWindow = { DC: { tick: () => { calls.tick++; } } };
+  const deps = {
+    _contextLost: contextLost,
+    document: { hidden },
+    performance: { now: () => 1000 },
+    options: { useFirstPerson: false },
+    controls: { isLocked: locked, update: () => {} },
+    clock: { getDelta: () => 0.016 },
+    flyTo: { active: false },
+    updateControls: () => { calls.updateControls++; },
+    maybeCycleIdleView: () => { calls.maybeCycleIdleView++; },
+    maybeFlicker: () => { calls.maybeFlicker++; },
+    updateDisco: () => { calls.updateDisco++; },
+    window: fakeWindow,
+  };
+  const names = Object.keys(deps);
+  // eslint-disable-next-line no-new-func
+  const factory = new Function(...names, `${bodySource}; return animate;`);
+  return { run: factory(...names.map((n) => deps[n])), calls };
+}
+
 // ----------------------------------------------------------------
-// Tests — F-16: single canonical render loop
+// Behavioural — animate() actually runs
+// ----------------------------------------------------------------
+describe('dc.js — animate() executes and drives DC.tick()', () => {
+
+  it('the animate() declaration can be found in dc.js', () => {
+    // If this throws, animate() was renamed and every test below is silently testing nothing.
+    expect(getFunctionBody(DC_SOURCE, 'animate')).not.toBeNull();
+  });
+
+  it('runs without throwing and calls DC.tick() exactly once per frame', () => {
+    const { run, calls } = compileAnimate(getFunctionBody(DC_SOURCE, 'animate'));
+    expect(() => run()).not.toThrow();
+    expect(calls.tick).toBe(1);
+    run();
+    expect(calls.tick).toBe(2);
+  });
+
+  it('runs the per-frame overlays before delegating', () => {
+    const { run, calls } = compileAnimate(getFunctionBody(DC_SOURCE, 'animate'));
+    run();
+    expect(calls.maybeCycleIdleView).toBe(1);
+    expect(calls.maybeFlicker).toBe(1);
+    expect(calls.updateDisco).toBe(1);
+  });
+
+  it('short-circuits on a lost WebGL context — no tick, no overlays', () => {
+    const { run, calls } = compileAnimate(getFunctionBody(DC_SOURCE, 'animate'), { contextLost: true });
+    run();
+    expect(calls.tick).toBe(0);
+    expect(calls.updateDisco).toBe(0);
+  });
+
+  it('short-circuits on a hidden document — no tick', () => {
+    const { run, calls } = compileAnimate(getFunctionBody(DC_SOURCE, 'animate'), { hidden: true });
+    run();
+    expect(calls.tick).toBe(0);
+  });
+
+  it('tolerates window.DC not yet being assigned (init still in flight)', () => {
+    const body = getFunctionBody(DC_SOURCE, 'animate');
+    const names = ['_contextLost', 'document', 'performance', 'options', 'controls', 'clock',
+      'flyTo', 'updateControls', 'maybeCycleIdleView', 'maybeFlicker', 'updateDisco', 'window'];
+    // eslint-disable-next-line no-new-func
+    const fn = new Function(...names, `${body}; return animate;`)(
+      false, { hidden: false }, { now: () => 0 }, { useFirstPerson: false },
+      { isLocked: true, update: () => {} }, { getDelta: () => 0 }, { active: false },
+      () => {}, () => {}, () => {}, () => {}, {} /* window with no DC */);
+    expect(() => fn()).not.toThrow();
+  });
+
+  it('NON-VACUITY: the same harness fails on the pre-fix bare tick() call', () => {
+    // This is the test the original file should have had. Compile the defect and prove the
+    // harness catches it — otherwise every assertion above could be passing for free.
+    const broken = getFunctionBody(DC_SOURCE, 'animate')
+      .replace(/if \(window\.DC && typeof window\.DC\.tick === 'function'\) window\.DC\.tick\(\);/, 'tick();');
+    expect(broken).toMatch(/^\s*tick\(\);$/m);   // the substitution really happened
+    const { run } = compileAnimate(broken);
+    expect(() => run()).toThrow(/tick is not defined/);
+  });
+
+});
+
+// ----------------------------------------------------------------
+// Structural — contracts that must not silently drift
 // ----------------------------------------------------------------
 describe('dc.js — F-16 single canonical render loop', () => {
 
-  it('animate() ends with a tick() call (single canonical render path)', () => {
-    const body = getFunctionBody(DC_SOURCE, 'animate');
-    expect(body).not.toBeNull();
-    // Remove comments before checking — comment-mentions of tick() don't count
-    const codeOnly = stripComments(body);
-    // Find the last non-empty, non-closing-brace line; that's where tick() should be
-    const lines = codeOnly.split('\n').map(l => l.trim()).filter(l => l && l !== '}' && !l.startsWith('//'));
-    const lastLine = lines[lines.length - 1];
-    expect(lastLine).toMatch(/^tick\(\);?$/);
-  });
-
-  it('animate() does NOT increment _tickSkippedFrames in code', () => {
-    const body = getFunctionBody(DC_SOURCE, 'animate');
-    expect(body).not.toBeNull();
-    const codeOnly = stripComments(body);
-    // The increment form ++_tickSkippedFrames must not appear in animate() code
+  it('animate() does NOT own the idle-frame counter', () => {
+    const codeOnly = stripComments(getFunctionBody(DC_SOURCE, 'animate'));
     expect(codeOnly).not.toMatch(/\+\+_tickSkippedFrames/);
     expect(codeOnly).not.toMatch(/_tickSkippedFrames\s*=\s*[^=]/);
   });
 
-  it('tick() owns the _tickSkippedFrames idle-frame counter (pre-increment form)', () => {
-    // Pre-increment: ++_tickSkippedFrames — only tick() does this
+  it('tick() owns the _tickSkippedFrames idle-frame counter', () => {
     expect(DC_SOURCE).toMatch(/\+\+_tickSkippedFrames/);
     expect(DC_SOURCE).toMatch(/_skipExpensiveUpdates\s*=\s*true/);
   });
 
-  it('animate() does NOT call renderer.render() directly — tick() owns rendering', () => {
-    const body = getFunctionBody(DC_SOURCE, 'animate');
-    expect(body).not.toBeNull();
-    const codeOnly = stripComments(body);
+  it('animate() does NOT render directly — tick() owns rendering', () => {
+    const codeOnly = stripComments(getFunctionBody(DC_SOURCE, 'animate'));
     expect(codeOnly).not.toMatch(/renderer\.render\(/);
     expect(codeOnly).not.toMatch(/stats\.update\(\)/);
   });
 
-  it('animate() does NOT duplicate expensive per-frame updates (tick() handles them)', () => {
-    const body = getFunctionBody(DC_SOURCE, 'animate');
-    expect(body).not.toBeNull();
-    const codeOnly = stripComments(body);
-    expect(codeOnly).not.toMatch(/updateLabels\(\)/);
-    expect(codeOnly).not.toMatch(/updateLOD\(\)/);
-    expect(codeOnly).not.toMatch(/updateNeighborDoors\(\)/);
-    expect(codeOnly).not.toMatch(/updateRoomDoors\(\)/);
-    expect(codeOnly).not.toMatch(/updateGuiPos\(\)/);
-    expect(codeOnly).not.toMatch(/_updateFPS\(/);
-    expect(codeOnly).not.toMatch(/_autoQualityScale\(/);
-  });
-
-  it('document.hidden guard present in both animate() and tick()', () => {
-    const animateBody = getFunctionBody(DC_SOURCE, 'animate');
-    expect(animateBody).not.toBeNull();
-    expect(animateBody).toMatch(/document\.hidden/);
-    // tick() method on the DC object contains document.hidden
-    expect(DC_SOURCE).toMatch(/document\.hidden/);
+  it('animate() does NOT duplicate the expensive per-frame updates tick() handles', () => {
+    const codeOnly = stripComments(getFunctionBody(DC_SOURCE, 'animate'));
+    for (const fn of ['updateLabels\\(\\)', 'updateLOD\\(\\)', 'updateNeighborDoors\\(\\)',
+      'updateRoomDoors\\(\\)', 'updateGuiPos\\(\\)', '_updateFPS\\(', '_autoQualityScale\\(']) {
+      expect(codeOnly).not.toMatch(new RegExp(fn));
+    }
   });
 
   it('setAnimationLoop registers animate as the default renderer loop', () => {

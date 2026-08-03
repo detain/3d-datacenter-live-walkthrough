@@ -56,12 +56,22 @@ describe('dc.js quality scaler — Step 2.2', () => {
             expect(block).toMatch(/if\s*\(\s*S\.shadowsEnabled\s*&&/);
         });
 
-        it('(c) S.shadowsEnabled exists and defaults to false', () => {
-            // S object declaration (not any other shadowsEnabled reference).
+        it('(c) S.shadowsEnabled exists and defaults to TRUE', () => {
+            // R2.3: this required `false`, which is what kept both shadow tiers above dead. The
+            // flag was declared false and then assigned nowhere in the codebase, so the gates on
+            // lines 51 and 56 could never open — the "parked until Phase 6" tier stayed parked
+            // after Phase 6 shipped. init() enables shadows, so true is the honest default and
+            // the gates now describe reachable code.
             const sDecl = DC_SOURCE.match(/^const S = \{[\s\S]*?^};$/m);
             expect(sDecl).not.toBeNull();
-            expect(sDecl[0]).toMatch(/\bshadowsEnabled\s*:\s*false\b/);
+            expect(sDecl[0]).toMatch(/\bshadowsEnabled\s*:\s*true\b/);
             expect(sDecl[0]).not.toMatch(/\bshadowMapEnabled\b/); // removed in Step 2.1
+        });
+
+        it('(c2) S.shadowsEnabled is actually assigned somewhere', () => {
+            // The real defect was not the default — it was that nothing ever wrote the flag, so
+            // it could not track the renderer. setShadowsEnabled() now does.
+            expect(DC_SOURCE).toMatch(/S\.shadowsEnabled\s*=\s*/);
         });
     });
 

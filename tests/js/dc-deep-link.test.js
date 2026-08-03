@@ -191,22 +191,37 @@ describe('dc.js — _copyDeepLink function', () => {
 // ---------------------------------------------------------------------------
 describe('dc.js — showInfo copy link button', () => {
 
-    it('showInfo includes dc-info-copy onclick handler', () => {
+    it('showInfo renders the copy button and wires it with a LISTENER', () => {
+        // R2.6: this used to require `_copyDeepLink` inside showInfo, which it satisfied via an
+        // inline onclick="_copyDeepLink(...)". dc.js loads as type="module", so that attribute
+        // resolved the name in GLOBAL scope and threw `ReferenceError: _copyDeepLink is not
+        // defined` on every click — the button was dead in the product while this test passed.
         const src = extractFn('showInfo');
         expect(src).toMatch(/dc-info-copy/);
-        expect(src).toMatch(/_copyDeepLink/);
+        expect(src).not.toMatch(/onclick=/);
+        const wire = extractFn('_wireInfoPanel');
+        expect(wire).toMatch(/\.dc-info-copy/);
+        expect(wire).toMatch(/_copyDeepLink\(/);
     });
 
-    it('copy button uses rackKey from placements for servers', () => {
+    it('a server deep-links by asset id, not by a rackKey that never existed', () => {
+        // It read `placements[hit.instanceId].rackKey`. buildInstanced() stores `assetId` on
+        // placements and has never stored a rackKey, so this was always undefined — and
+        // `rackKey || ''` then made _copyDeepLink take its RACK branch with an empty string,
+        // producing a bare `?rack=` that resolves to nothing.
         const src = extractFn('showInfo');
-        // For servers, rackKey comes from hit.mesh.userData.placements[hit.instanceId].rackKey
-        expect(src).toMatch(/placements\[hit\.instanceId\]\.rackKey/);
+        expect(src).not.toMatch(/placements\[hit\.instanceId\]\.rackKey/);
+        expect(src).toMatch(/_wireInfoPanel\(panel,\s*\{\s*assetId:\s*a\.id/);
     });
 
-    it('copy button uses rackKey from userData for racks', () => {
-        const src = extractFn('showInfo');
-        // For racks, rackKey comes from hit.mesh.userData.rackKey
-        expect(src).toMatch(/userData\.rackKey/);
+    it('a rack deep-links by its rack key, which is the asset id displayRacks() assigns', () => {
+        // It read `hit.mesh.userData.rackKey`, which buildInstanced() never sets either.
+        // displayRacks() does `rack.id = rackKey`, so a.id IS the key the endpoint uses.
+        // Comments stripped first: the code deliberately NAMES userData.rackKey to explain why
+        // it is gone, and that documentation must not trip its own guard.
+        const src = extractFn('showInfo').replace(/\/\/[^\n]*/g, '');
+        expect(src).not.toMatch(/userData\.rackKey/);
+        expect(src).toMatch(/_wireInfoPanel\(panel,\s*\{\s*assetId:\s*null,\s*rackKey:\s*a\.id/);
     });
 
     it('copy button appears in server info panel innerHTML', () => {
@@ -248,4 +263,134 @@ describe('dc.js — loadDatacenter deep link integration', () => {
         // _applyDeepLinkTarget should be called in the final .then() block of loadDatacenter
         expect(DC_SOURCE).toMatch(/_applyDeepLinkTarget\(\)/);
     });
+});
+
+// ---------------------------------------------------------------------------
+// The behavioural half (R2.6). Everything above is source text; these run the real
+// _copyDeepLink() and _applyDeepLinkTarget() and assert on the URL that comes out and the rack
+// that gets found. Both defects below were invisible to source matching, because the code did
+// contain every string the old assertions looked for.
+// ---------------------------------------------------------------------------
+describe('dc.js — the deep link round-trips', () => {
+
+    /** Run _copyDeepLink() with a fake clipboard and return the URL it wrote. */
+    function copyLink(assetId, rackKey, { location = 4, href = 'https://mystage.interserver.net/admin/dc.php?renderer=webgl' } = {}) {
+        let written = null;
+        const navigatorStub = { clipboard: { writeText: (t) => { written = t; return Promise.resolve(); } } };
+        // eslint-disable-next-line no-new-func
+        const fn = new Function('options', 'location', 'navigator', 'URL', 'URLSearchParams',
+            extractFn('_copyDeepLink') + '\nreturn _copyDeepLink;')(
+            { location }, { href }, navigatorStub, URL, URLSearchParams);
+        fn(assetId, rackKey);
+        return written;
+    }
+
+    it('a rack link carries ?rack=<bare id>, with no rack_ prefix', () => {
+        const url = new URL(copyLink(null, '101'));
+        expect(url.searchParams.get('rack')).toBe('101');
+        expect(url.searchParams.get('asset')).toBeNull();
+    });
+
+    it('a server link carries ?asset=<id>', () => {
+        const url = new URL(copyLink('5150', null));
+        expect(url.searchParams.get('asset')).toBe('5150');
+        expect(url.searchParams.get('rack')).toBeNull();
+    });
+
+    it('an empty rackKey does not win over the asset id', () => {
+        // The server panel used to pass '' (from `rackKey || ''`), which took the rack branch and
+        // produced a bare `?rack=` — a link that resolves to nothing at all.
+        const url = new URL(copyLink('5150', ''));
+        expect(url.searchParams.get('asset')).toBe('5150');
+        expect(url.searchParams.get('rack')).toBeNull();
+    });
+
+    it('always carries the location, and drops unrelated params like ?renderer=', () => {
+        const url = new URL(copyLink('5150', null, { location: 9 }));
+        expect(url.searchParams.get('location')).toBe('9');
+        expect(url.searchParams.get('renderer')).toBeNull();
+    });
+
+    it('?rack= from a copied link resolves against the real racks map', () => {
+        // datacenter.php keys racks by the bare rack_id. _applyDeepLinkTarget() looked up
+        // 'rack_' + id, which matched nothing, so every rack deep link silently did nothing.
+        const flown = [];
+        const locations = { 4: { racks: { 101: { x: 3, y: 2 } } } };
+        // eslint-disable-next-line no-new-func
+        const fn = new Function('_deepLinkTarget', 'locations', 'options', 'flyToRackPosition',
+            'switchLocation', 'flyToServer',
+            extractFn('_applyDeepLinkTarget') + '\nreturn _applyDeepLinkTarget;')(
+            { location: null, rack: 101, asset: null }, locations, { location: 4 },
+            (x, y) => flown.push([x, y]), () => {}, () => {});
+        fn();
+        expect(flown).toEqual([[3, 2]]);
+    });
+
+    it('the full round-trip: copy a rack link, then resolve it', () => {
+        const rackId = '101';
+        const url = new URL(copyLink(null, rackId));
+        const target = Number(url.searchParams.get('rack'));
+        const flown = [];
+        // eslint-disable-next-line no-new-func
+        const fn = new Function('_deepLinkTarget', 'locations', 'options', 'flyToRackPosition',
+            'switchLocation', 'flyToServer',
+            extractFn('_applyDeepLinkTarget') + '\nreturn _applyDeepLinkTarget;')(
+            { location: null, rack: target, asset: null },
+            { 4: { racks: { 101: { x: 3, y: 2 } } } }, { location: 4 },
+            (x, y) => flown.push([x, y]), () => {}, () => {});
+        fn();
+        expect(flown).toHaveLength(1);
+    });
+
+});
+
+// ---------------------------------------------------------------------------
+// The XSS test the original plan called "the important one" and which was never written.
+// ---------------------------------------------------------------------------
+describe('dc.js — showInfo escapes hostile asset data', () => {
+
+    it('escapes every field it interpolates', () => {
+        // escapeHtml() is applied per field in showInfo(); this runs the real one over the
+        // payloads that reach it. A hostname is operator-supplied data from the assets table.
+        // eslint-disable-next-line no-new-func
+        const escapeHtml = new Function(extractFn('escapeHtml') + '\nreturn escapeHtml;')();
+        const hostile = '<script>alert(1)</script>';
+        const out = escapeHtml(hostile);
+        expect(out).not.toContain('<script>');
+        expect(out).toContain('&lt;script&gt;');
+    });
+
+    it('escapes the quote characters that break out of an HTML attribute', () => {
+        // eslint-disable-next-line no-new-func
+        const escapeHtml = new Function(extractFn('escapeHtml') + '\nreturn escapeHtml;')();
+        expect(escapeHtml('" onmouseover="alert(1)')).not.toContain('"');
+        expect(escapeHtml("' onmouseover='alert(1)")).not.toContain("'");
+        expect(escapeHtml('&')).toBe('&amp;');
+    });
+
+    it('every interpolated field in showInfo goes through escapeHtml', () => {
+        // The panel builds innerHTML by concatenation, so an unescaped field is a stored-XSS
+        // sink reachable by anyone who can name a server. Guarding this as source text is the
+        // right tool: the risk is a NEW field being added without the wrapper.
+        const src = extractFn('showInfo');
+        const interpolations = src.match(/'\s*\+\s*(a\.[A-Za-z_]+|hw|position|statusDot)/g) || [];
+        for (const frag of interpolations) {
+            const name = frag.replace(/^'\s*\+\s*/, '');
+            // statusDot is pre-escaped where it is built; the rest must be wrapped at use.
+            if (name === 'statusDot') continue;
+            expect(src, `${name} is interpolated without escapeHtml()`).toMatch(
+                new RegExp('escapeHtml\\(' + name.replace('.', '\\.'))
+            );
+        }
+    });
+
+    it('the ids are no longer interpolated into a JS string inside an HTML attribute', () => {
+        // The sink the original plan singled out: onclick="_copyDeepLink(<id>, '<rackKey>')".
+        // Listeners close over the values, so nothing is parsed as code — the sink is removed
+        // rather than escaped.
+        const src = extractFn('showInfo');
+        expect(src).not.toMatch(/onclick="/);
+        expect(src).not.toMatch(/_copyDeepLink\(' \+/);
+    });
+
 });

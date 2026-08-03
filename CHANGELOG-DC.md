@@ -22,6 +22,201 @@ Two browser tabs with the same session (same user) can now see each other in Dat
 
 ---
 
+### Remediation — Tier 1: the page boots again
+
+An eight-agent audit of `dc_improve_plan.md`'s execution (2026-08-03) found that the plan ran to completion — 54 steps, ~98 commits, 986 green tests — on top of a page that had not rendered a single frame since Phase 8.1 landed. Five fatals were stacked in the boot path, each hiding the next. Full findings and the remaining work: `dc_remediation_plan.md`.
+
+**Before:** `window.DC` undefined, 0 canvases, loading curtain stuck, `yarn test:e2e` 18 failed / 33 passed.
+**After:** scene boots, `yarn test:e2e` 1 failed / 50 passed (the one failure is a real Phase 7 defect, tracked as R2.4).
+
+#### R1.1 — Point the import map at the ESM build of three-mesh-bvh
+
+`dc.html` mapped the bare specifier `three-mesh-bvh` to `/node_modules/three-mesh-bvh/build/index.umd.cjs`. Two things were wrong with that: `.cjs` has no MIME mapping in `public_html/.htaccess`, so it was served as `application/node` and strict MIME checking rejected it as a module script before parsing; and it is the CommonJS bundle, which has no ES exports at all. The package's `exports["."].import` is the ESM entry, and the prebuilt ESM bundle sits in the same directory.
+
+| File | Change |
+|------|--------|
+| `public_html/admin/dc.html` | Import map and modulepreload → `/lib/three-mesh-bvh/build/index.module.js` |
+| `public_html/js/dc-renderer-mode.js` | `THREE_MESH_BVH` → same path, with a comment recording why `.cjs` fails |
+
+Also brings the path back onto the `/lib/` convention (the `node_modules` symlink) that `dc-renderer-mode.js:18`'s own comment states and the rest of the page follows.
+
+---
+
+#### R1.2 — Bind `BufferGeometry` and actually wire the BVH raycast
+
+Two defects in four lines. `dc.js` patched a bare `BufferGeometry.prototype`, but there is no such binding in the module — it does `import * as THREE from "three"` — so module evaluation threw `ReferenceError` before `window.DC` was ever created. And `acceleratedRaycast` was never imported: it is the **only** code in three-mesh-bvh that reads `geometry.boundsTree`, so the BVHs built in `extractModelMeshes()` were consulted by nothing and `raycaster.firstHitOnly` was inert. Step 8.1 was pure cost with zero benefit.
+
+| File | Change |
+|------|--------|
+| `public_html/js/dc.js` | Import `acceleratedRaycast`; `THREE.`-prefix all three prototype patches; add `THREE.Mesh.prototype.raycast = acceleratedRaycast`; replace two Chinese-character comment fragments |
+
+---
+
+#### R1.3 — Assign `caps` before anything reads it
+
+`init()` called `_setupRendererSwitch()` before assigning `caps`, and that function dereferences `caps.isNode`. Every page load in every renderer mode threw `TypeError: Cannot read properties of null (reading 'isNode')`, making everything after that line unreachable — the `caps` assignment itself, KTX2 registration, both AO setups, shadow enablement and the datacenter fetch.
+
+---
+
+#### R1.4 — Make `animate()` call a function that exists
+
+`animate()` ended with a bare `tick()`. There is no module-scope `tick` in `dc.js`; the only one is a property on the `window.DC` object literal. So it threw `ReferenceError` on every frame, `_guardLoop` swallowed it, and `_loopErrorCount` — which resets only on a *successful* frame — stopped logging after 10 frames and failed silently thereafter. On the `dc.html` path, the exact path Step 4.1 existed to protect, the scene painted nothing.
+
+Now `if (window.DC && typeof window.DC.tick === 'function') window.DC.tick();`, which also tolerates `init()` still being in flight.
+
+---
+
+#### R1.5 — Unpin the tests that asserted the broken state
+
+Four tests required defects to remain, so fixing the page turned CI red. Two were rewritten to execute production code instead of pattern-matching it:
+
+| File | Was | Now |
+|------|-----|-----|
+| `tests/js/dc-bvh.test.js` | Asserted the import map equals `index.umd.cjs`; unanchored regexes that matched broken and fixed code alike | Builds a real `BufferGeometry`, calls `computeBoundsTree()`, asserts `boundsTree` is populated; asserts `acceleratedRaycast` is imported; asserts the mapped URL is not a `.cjs`, exists on disk, has ES exports, and matches what `dc-renderer-mode.js` exports |
+| `tests/js/dc-render-loop.test.js` | `expect(lastLine).toMatch(/^tick\(\);?$/)` — required the ReferenceError | Compiles `animate()` with injected dependencies and **runs** it: asserts `DC.tick` is called once per frame, that `_contextLost` and `document.hidden` short-circuit, that a missing `window.DC` is tolerated — plus an explicit non-vacuity test proving the harness throws on the pre-fix bare `tick()` |
+
+Both rewrites were verified by reverting the production fix and watching them go red. `tests/js/dc-bench.test.js` and `tests/js/dc-ao-webgpu.test.js` still assert known-wrong values (`ao: false`, `renderer._tslm`) because the underlying code is not fixed until Tier 3; each now carries a comment naming its remediation step and the assertion that should replace it.
+
+---
+
+#### R1.6 — Make the Playwright smoke test capable of failing
+
+`tests/playwright/dc.spec.ts`'s *"no critical JS errors on page load"* registered only `page.on('pageerror')`. A module script that fails to **load** fires `error` on the `<script>` element and never reaches `window.onerror` — so the test passed on a page with zero canvases and no `window.DC`, for two days. Its own comment claimed *"a broken import map … shows up here as a module error and nowhere else"*, which was exactly backwards.
+
+It now also collects console errors and failed requests, and asserts on the product rather than the absence of a log line: `typeof window.DC === 'object'` and at least one `<canvas>`. Verified non-vacuous — reverting R1.1 produces `Expected: "object" / Received: "undefined"`.
+
+---
+
+#### R1.7 — Record the baseline that Phase 8 was gated on
+
+Step 8.0 required a draw-call baseline before any of Phase 8's optimisations; it was never performed, and Steps 8.1, 8.3 and 8.4 proceeded on estimates. Measured now that the page boots: **108 draw calls, 62,418 triangles** on the CI-equivalent stub room.
+
+The CI ceilings were `drawCalls < 400` / `triangles < 2000000` — the plan's own placeholder values, roughly **32× the real triangle count**, incapable of catching any plausible regression. They are now `165` / `95000`, ~1.5× the measurement, with the observed values and date recorded in the test.
+
+Also corrected in that test: the comment described `DC.bench()` as taking frames and returning `fps`, when it takes **seconds** and returns `avgFps`/`minFps` — so the annotation had been logging `undefined`. And it claimed the thresholds were "conservative headroom around what the stub room (4 racks, 12 servers…) actually produces"; `public_html/images/3d` is gitignored, so CI renders **no** racks or servers at all.
+
+| File | Change |
+|------|--------|
+| `docs/dc_renderer_modes.md` | New `## Baseline measurements` section with the numbers, the date, and three caveats (room shell only; FPS unusable under SwiftShader; `shadows`/`ao` false are defects not settings) |
+| `tests/playwright/dc.spec.ts` | `PERF_BUDGET` derived from the measurement; corrected API and scope comments; result printed, not just annotated |
+
+`avgFps`/`minFps` are deliberately **not** asserted — SwiftShader returns `samples: 0`, so an FPS assertion would be vacuous or flaky. That needs real hardware.
+
+---
+
+### Remediation — Tier 2: restore what regressed
+
+Six defects that shipped as "done" and were not. Each was verified in a real browser after the fix, and each fix was verified non-vacuous by reverting it and watching the new tests go red. Plan: `dc_remediation_plan.md` §R2.
+
+**Suites:** unit 1042 → **1071 passing**; E2E 51 → **64 passing** (two new groups). No test was deleted to make anything pass.
+
+#### R2.4 — Rewrite `dc-caps.js` against three.js properties that exist
+
+The capability module at the centre of Phase 7 detected renderers using two properties that are not in three.js at all: `renderer.info.type === 'offscreen'` (`grep -c offscreen node_modules/three/build/three.module.js` → 0) and `renderer._tslm` (`grep -rn _tslm node_modules/three/src/` → 0 hits). Both were invented, so `caps.isNode` and `caps.supportsTSL` were permanently `false`.
+
+The consequences ran well past those two flags. `DC.backendName` reported `webgl` in **all three** renderer modes — the exact failure Step 7.6 existed to prevent, and a regression, since the pre-Phase-7 line worked. The `#dcRenderer` button label and `bench().backend` were wrong with it. The entire Step 7.4 WebGPU render branch was unreachable. And `if (!caps.isNode)` was always true, so the classic `webglcontextlost` listeners attached on the node renderer too — which the comment three lines above says would "run both recovery paths against one loss".
+
+| Property | Now derived from |
+|---|---|
+| `isNode` | `renderer.isWebGPURenderer \|\| renderer.backend` — both real, verified at `WebGPURenderer.js:95` and `Renderer.js:113` |
+| `backend` | `renderer.backend.isWebGPUBackend` (`WebGPUBackend.js:88`) → `'webgl' \| 'webgpu' \| 'webgl2-fallback'`, never a class name |
+| `supportsTSL` | `isNode` — TSL is a node-renderer capability; **both** node backends compile it, so gating on `backend === 'webgpu'` would wrongly exclude `?renderer=webgpu-gl` |
+| `supportsEffectComposer` | `!isNode` — was inverted, which is why the AO toggle appeared on the WebGPU path where it does nothing |
+| `supportsOcclusionQuery` | `isNode && realWebGPU` — was true for plain WebGL2, which cannot do them at all |
+
+Also: `backendLabel()` is now exported (it was written but not), `describeRenderer(null)` returns a safe all-false descriptor instead of dereferencing `null.constructor`, and the unused `import * as THREE` is gone — the module has no import-time side effects, so it no longer drags the whole engine into every Vitest run. `dc.js` now reads `_backendName = caps.backend` rather than re-deriving the same rule a second way, and its duplicate `_BACKEND_LABELS` table is replaced by the exported `backendLabel()`.
+
+Verified in chromium: `?renderer=webgl` → `webgl`; `?renderer=webgpu` and `?renderer=webgpu-gl` → `webgl2-fallback` (SwiftShader has no WebGPU device, so the fallback is the honest answer). Before this, all three said `webgl`.
+
+`tests/js/dc-caps.test.js` was rebuilt: every fixture had been reverse-engineered from the broken implementation, so `info: { type: 'offscreen' }` and `_tslm: true` described properties on no real renderer and every assertion passed while the module was wrong in a browser. It now uses shapes three.js actually ships, and carries four contract tests that re-check those discriminators against the installed package so a version bump fails here rather than silently in production.
+
+---
+
+#### R2.1 — Give `buildCommunity()` back its neighbours
+
+Step 3.6 changed `locationLoaded()` to test `loc._full`. `buildCommunity()` filters with it and gates the whole neighbour city behind `if (ids.length >= 2)`. After the two-tier boot only `options.location` is `_full`, so `ids.length === 1`, `lodBuildings` stayed empty, and `updateLOD()` returned at its first line for the life of the page. **No neighbour buildings, no block proxies, no doors, no LOD** — a live regression, invisible because no test placed more than one location.
+
+The irony is exact: the index tier exists *"purely so the community layout knows every building's footprint"*, and `locationFootprint()` reads only `r.x`/`r.y` — precisely what the index provides. The one consumer of the index tier was the one call site not updated.
+
+The two questions were conflated, so they are now two predicates:
+
+| Predicate | Question | Used by |
+|---|---|---|
+| `locationLoaded(id)` | do we hold full asset detail? | `switchLocation()`, `loadBuildingModels()` |
+| `locationPlaced(id)` | do we know where its racks sit? | `buildCommunity()`, `_restoreLocation()` |
+
+`_restoreLocation()` was broken the same way: it gates on the predicate and runs *after* the index-only merge, so every device-loss restore naming a non-default location was silently dropped. It only needs the location to exist; `loadDatacenter()` fetches the detail on the next line.
+
+New `tests/js/dc-location-tiers.test.js` (13 tests) is the behavioural coverage the original plan asked for and never got — it called `mergeLocations` *"the highest-risk step in the phase; test it properly"*, and the only existing reference stubbed it in a way that discarded the `isFull` argument the whole design turns on.
+
+**The Playwright fixture was also wrong.** `bootHermetic()` served the same single-location payload to `?tier=index` and `?location=`, so the community layout could not be exercised at all — a fixture that cannot tell a working neighbourhood from an empty one. It is now tier-aware like the real endpoint: three locations in the index, one returned in full.
+
+---
+
+#### R2.2 — Make click-to-inspect actually work
+
+Step 1.4 was meant to replace a distance pre-filter that used `mesh.position` (always `(0,0,0)` on an `InstancedMesh`). It fixed the *source* of the position and kept the camera-forward dot product, which measures distance **along the view axis** — so a mesh 80 units ahead, the one you are staring at, scored 80 and was discarded, while the same mesh behind you scored negative and was kept. With a room-spanning bounding sphere, standing at one end of a long room and looking down it dropped the whole mesh: clicking did nothing and the highlight never appeared. That is F-02's exact symptom, unfixed.
+
+Now a plain distance test with the radius subtracted, so a large mesh whose centre is far but whose surface is at your feet is kept. A mesh with no bounding sphere is **included** rather than excluded — silently disabling picking for a whole model is worse than one extra intersect test. The latent `mesh.geometry.computeBoundingSphere()` bug is fixed too: that populates `geometry.boundingSphere` while the next line reads `mesh.boundingSphere`, which `InstancedMesh` owns separately. And the module-scope scratch vector Step 1.4 deleted is back — the shipped code allocated two `Vector3` per mesh per frame inside a function called every frame from `updateHighlight()`.
+
+`tests/js/dc-raycast-instances.test.js` asserted the broken `mesh.geometry.computeBoundingSphere()` line **must exist**. Replaced with 15 behavioural tests that run the real filter against fakes with real vector maths; 7 of them fail against the old code. The central one: *a mesh within `MAX_RAYCAST_DIST` is kept regardless of which way the camera faces.*
+
+---
+
+#### R2.3 — Make shadows cast onto something
+
+Shadows were enabled, cost GPU time every frame, and were essentially invisible. Five independent defects, and an explicit owner request that shipped non-functional:
+
+1. **The frustum was never fitted.** `_fitShadowCamera()` starts `if (!_sunLight || !roomBounds) return;` and its only call site was in `init()` — but `roomBounds` is not assigned until `buildRoom()`, which runs later from a fetch continuation. It bailed on every load, leaving three.js's default ±5 orthographic box: a ~10×10 column at the world origin. Verbatim the failure the original step warned about. Now called at the end of `buildRoom()`, after `roomBounds` — which also covers location switches, since `clearScene()` nulls it.
+2. **The fit was in the wrong space.** It wrote world X/Z into `cam.left/right/top/bottom`, which are **light-view** space. The light also never moved, so a room far from the origin fell outside the box entirely. The light is now re-anchored over each room at a fixed offset and aimed at its centre, and the box is sized by the room's diagonal radius — orientation-independent, so it cannot under-cover.
+3. **Nothing received shadows.** Zero `receiveShadow` assignments in `buildRoom()` — floor, walls, ceiling and roof slab all defaulted to `false`. Racks could only cast onto other racks, so *"racks read as floating"*, the stated purpose of Phase 6, was unfixed even with a correct frustum.
+4. **`S.shadowsEnabled` was never assigned.** Declared `false`, written nowhere. Both quality-scaler shadow branches gate on it, so Step 6.3 re-enabled nothing, and `DC.bench()` reported `shadows: false` while shadows rendered.
+5. **`shadow.mapSize` was never set at creation**, so the real map was three.js's 512 default while `_shadowMapSize` said 2048, `S.shadowMapSize` said 2048 and the GUI said 1024 — four numbers, no two agreeing. All four now start at 2048.
+
+`setShadowsEnabled()` now writes all four pieces of state and re-fits on the way back on, with guards so it cannot throw before `init()`. `setShadowMapSize()` now writes `_shadowMapSize`, `S.shadowMapSize` and `options.shadowQuality` — it wrote none of them, so the auto scaler overwrote the user's choice on its next tick — and accepts a numeric size: `sizeMap[512]` was `undefined`, so `|| 1024` turned the scaler's own downgrade into an **upgrade**.
+
+`applyShadowPolicy()` was defined and never called (`grep -c` → 1). It is now called at all four model sites, the four copy-pasted traverse blocks are gone, and it takes a `kind` so the two cable sites — plus a **third**, the cached-reuse branch, which had no shadow flags at all — share one policy. Cable shadow behaviour previously depended on whether the geometry cache hit.
+
+`renderer.shadowMap.type` is now `caps.isNode ? PCFSoftShadowMap : PCFShadowMap`. `PCFSoftShadowMap` is deprecated on the WebGL path — `WebGLShadowMap.js:99` converts it to `PCFShadowMap` and warns on every page load — while being genuinely supported on the node path. Asking for it unconditionally bought a console warning and `PCFShadowMap` anyway.
+
+Verified in chromium: frustum ±74 (was ±5), far plane 289, map 2048 (was 512), light anchored over the room centre, **73 receivers** (was 0), `bench().shadows` true, no deprecation warning. Casting itself is **not** verifiable in CI — `public_html/images/3d` is gitignored, so there are no rack or server models to cast.
+
+All four shadow test files were source-text regex, and two actively cemented the defects: `dc-shadow-policy.test.js` asserted the un-refactored traverse blocks must still exist, and hardcoded two cable sites when there are three. Rewritten behaviourally — `dc-shadow.test.js` runs the real `_fitShadowCamera()` and asserts the frustum brackets the room; `dc-shadow-gui.test.js` runs both setters and asserts what they write.
+
+---
+
+#### R2.5 — Handle the pointer-lock promise rejection
+
+`Element.requestPointerLock(options)` returns a **Promise** and rejects *asynchronously* when the option dictionary is refused or the lock is denied — it does not throw synchronously. The call was wrapped in `try/catch` alone, so the catch fired only if `domElement` was null, the `controls.lock()` fallback was unreachable on every real failure path (including the common *"The document is not focused"*), and the discarded promise produced an unhandled rejection.
+
+Now the returned value is captured and given a `.catch()` that falls back, `undefined` returns (older engines) go straight to the fallback, and the outer `try/catch` remains for the synchronous `TypeError` some engines throw on an unknown dictionary.
+
+`tests/js/dc-pointer-lock.test.js` was three source greps, one of which matched the *dead* catch block. Replaced with 10 tests that inject a rejecting `requestPointerLock`; 6 fail against the old code, including all three unhandled-rejection cases.
+
+---
+
+#### R2.6 — Wire up Phase 9's five dead UI entry points
+
+Every user-facing deliverable of Phase 9 was unreachable in a browser, each for a different reason. The underlying features worked from the console, which is why they looked done.
+
+| # | Feature | Cause | Fix |
+|---|---|---|---|
+| 1 | **Copy Link** | `dc.js` loads as `type="module"`, so the inline `onclick="_copyDeepLink(…)"` resolved a module-scope name in **global** scope and threw `ReferenceError` on every click | `_wireInfoPanel()` attaches listeners after the markup is inserted — for all three buttons, including Close |
+| 2 | **`?rack=` deep link** | Client looked up `'rack_' + id`; PHP keys racks by the bare id (`datacenter.php:128`) | Bare id at both ends |
+| 3 | **Isolate render pass** | `if (!m.transparent) continue;` skipped every **opaque** material — i.e. every mesh in the scene. The mechanism is to *set* `transparent`, not require it | Sets `transparent`/`opacity`/`depthWrite`, saves and restores all three |
+| 4 | **Trace Cable** | `_portsByAsset` keyed by PHP's `(int)` (a JSON number), looked up with an id from `Object.keys()` (a string). `Map.get("123")` never matches key `123` | `String()` at both ends |
+| 5 | **Admin nav entry** | `add_link()`'s 2nd argument is `$params`, not a URL — it rendered `index.php?/admin/dc.php` | URL passed as `$target`, keeping `$link_names` for the sidebar highlight |
+
+Defect 3 had a second half: saved state was keyed by **object id** while opacity lives on the **material**, and materials are shared in this scene (one `wallMat` for every wall). Object B recorded material M's already-dimmed `0.3` as M's "original", and `clearIsolate()` then pinned it there permanently. State is now keyed by material. `setIsolate(null)` also used to throw; it now clears.
+
+Replacing the inline handlers removed a sink as well as a bug: asset ids were being interpolated into a JS string inside an HTML attribute with no escaping. Listeners close over the values, so nothing is parsed as code. Hanging the functions on `window` would have fixed the `ReferenceError` and left the sink. The `.dc-info-copy` / `.dc-info-trace` buttons also had no CSS at all and rendered as grey UA system buttons on a dark panel.
+
+Verified in chromium: Copy Link writes `?location=4&asset=110` for a server and `?location=4&rack=101` for a rack; Trace Cable appears and draws its overlay; a hostname of `<img src=x onerror=…>` renders as literal text with zero injected elements; isolate dims 160 meshes and restores every one exactly.
+
+New Playwright **Group 11** (community layout, 4 tests) and **Group 12** (info panel actions, 9 tests). Group 12 includes the XSS test the original plan called *"the important one"* and which was never written. Three of Group 11 and two of Group 12 fail against the pre-fix code.
+
+---
+
 ### Where each `dc_improve_plan.md` step is recorded
 
 Phases 5–9 are written up under their own step headings below. Phases 0, 1 and 4 landed before that convention and are recorded by **finding ID** instead — this table is the bridge.
