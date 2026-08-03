@@ -450,6 +450,10 @@ The downloader now applies the same playable-label filter when it writes the vie
 | `scripts/mixamo_downloader/mixamo_downloader.py` | Added `VIEWER_PLAYABLE_LABELS`; filters `ch["animations"]` when emitting the manifest |
 | `scripts/mixamo_downloader/README.md` | Documented the filter |
 
+> **The generator was fixed; the deployed artifact was not.** `public_html/images/3d/mixamo/manifest.json` is currently **20.4 MB** (21,399,171 bytes, `generated_at 2026-08-03T07:25:58-04:00`) with 75,401 clips across 114 characters and up to 3,346 clips on a single character. It was regenerated *after* this fix landed, by something running unfiltered code, and is now **larger** than the 16.4 MB baseline the step set out to eliminate. The acceptance criterion — "under 100 KB and no character has more than 25 clips" — is **not met**, and Phase 3's headline win is not realised until the manifest is regenerated with the current downloader.
+>
+> Also outstanding: the drift test the step mandated (compare `PLAYABLE_LABELS` in `dc-multi.js` against `VIEWER_PLAYABLE_LABELS` in the Python, so the two lists cannot silently diverge) was never written. The DB already carries two labels — `look` and `type` — that appear in neither list.
+
 ---
 
 #### Step 3.4 — Let the browser cache the manifest
@@ -459,6 +463,10 @@ The site-wide "application/json expires immediately" rule forced a revalidation 
 | File | Change |
 |------|--------|
 | `public_html/.htaccess` | `<LocationMatch "^/images/3d/mixamo/manifest\.json$">` sets `Cache-Control: public, max-age=3600, stale-while-revalidate=86400` and unsets `Expires` |
+
+> **This was subsequently reverted and is currently inert.** The whole block at `public_html/.htaccess:77-82` is **commented out** — undone by commit `d01e841c44` ("fix", 2026-08-03). The manifest is once again governed by `ExpiresByType application/json "access plus 0 seconds"` at `.htaccess:395`, so every page load still pays a revalidation round-trip.
+>
+> The step's own verification command (`grep -n "mixamo/manifest" public_html/.htaccess`) passes **vacuously**, because it matches the commented-out line. The likely reason for the revert is that `<LocationMatch>` is not legal in `.htaccess` context — it is a server/vhost-config directive. Re-doing this step needs `<FilesMatch>` (or a vhost-level block), not an uncommenting.
 
 ---
 
