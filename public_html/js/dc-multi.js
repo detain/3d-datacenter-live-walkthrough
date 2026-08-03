@@ -26,13 +26,26 @@ let _lastCollisionCamDir = null;  // "x,y,z" rounded to 1 decimal (camera world 
 let _cachedLogoTexture = null;
 let _cachedGlassMaterial = null;
 
-let pixelScale = 0.8;  // quality scale factor for renderer pixel ratio (module-level storage for S.pixelScale)
+let pixelScale = 0.8;  // last value this module asked for; the authority is DC.S.pixelScale
 
-// Pixel scale setter — clamps to slider range and syncs renderer pixel ratio
+/**
+ * Pixel scale setter — DELEGATES to dc.js, which owns the renderer.
+ *
+ * This module's `S` and dc.js's `S` are different objects with the same name. Writing the scale
+ * into the local one (as this used to) left dc.js's S.pixelScale at its 1.0 default, so the
+ * third-person overlay booted at 0.8 and then the first window resize — which goes through
+ * dc.js's own pixel-ratio path — silently restored full resolution. That is F-10, and it was
+ * never fixed. The formula also differed between the two files; there is now one.
+ */
 function setPixelScale(v) {
-    pixelScale = Math.min(Math.max(v, 0.5), 1.0); // clamp to slider range [0.5, 1.0]
-    if (S.DC && S.DC.renderer) S.DC.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2) * pixelScale);
-    if (S) S.pixelScale = pixelScale;
+    if (S.DC && typeof S.DC.setPixelScale === 'function') {
+        pixelScale = S.DC.setPixelScale(v);
+    } else {
+        // dc.js not up yet (or a test harness without it): clamp locally and let the value be
+        // re-applied when the scene attaches.
+        pixelScale = Math.min(Math.max(Number(v) || 1, 0.5), 1.0);
+    }
+    S.pixelScale = pixelScale;
 }
 
 const S = {
@@ -277,10 +290,29 @@ async function loadCharacter(ch) {
     S.player.remove(S.model);
     S.model.traverse(o => {
       if (o.geometry) { o.geometry.dispose(); }
-      if (o.isMesh) {
+      // A SkinnedMesh's Skeleton owns a bone TEXTURE (the per-bone matrix data three.js uploads
+      // each frame). Nothing in the material walk below reaches it, so every character switch
+      // leaked one bone texture — on a rig with hundreds of bones that is the largest single
+      // allocation in the teardown.
+      if (o.isSkinnedMesh && o.skeleton && typeof o.skeleton.dispose === 'function') {
+        o.skeleton.dispose();
+      }
+      if (o.isMesh || o.isSkinnedMesh) {
         const mats = Array.isArray(o.material) ? o.material : [o.material];
         mats.forEach(m => {
-          if (m.map) m.map.dispose();
+          if (!m) return;
+          // Duck-type every texture-valued property instead of naming `.map` alone. Mixamo
+          // characters ship normalMap / roughnessMap / metalnessMap / aoMap / emissiveMap, and
+          // disposing only `.map` leaked all of them, on every switch, for the life of the tab.
+          // `'minFilter' in value` is the cheapest reliable Texture marker — every three.js
+          // Texture has it and nothing else on a material does.
+          for (const key of Object.keys(m)) {
+            const value = m[key];
+            if (value && typeof value === 'object' && 'minFilter' in value
+                && typeof value.dispose === 'function') {
+              value.dispose();
+            }
+          }
           m.dispose();
         });
       }
@@ -762,8 +794,20 @@ function syncPlayerFromCamera() {
   trySpawn();
 }
 
+// Interpolate a yaw the SHORT way round, so turning from just under +π to just over −π is a few
+// degrees rather than a 358° spin.
+//
+// R3.11: the previous one-liner was `((b - a + PI) % (2*PI)) - PI`, which only normalises when
+// `b - a >= -PI`. JavaScript's % keeps the sign of the DIVIDEND, so for a target below the current
+// facing by more than half a turn the modulo returns a negative value and subtracting PI pushes
+// the result further out instead of wrapping it back — down to −2π at the extreme. Both endpoints
+// are the same angle, so nothing looked broken; the avatar just took the long way round, for half
+// of all wrap cases. Found by R3.11 replacing the test's hand-copied lerpAngle with the real one.
 function lerpAngle(a, b, t) {
-  let d = ((b - a + Math.PI) % (Math.PI * 2)) - Math.PI;
+  const TWO_PI = Math.PI * 2;
+  let d = (b - a) % TWO_PI;
+  if (d > Math.PI) d -= TWO_PI;
+  else if (d < -Math.PI) d += TWO_PI;
   return a + d * t;
 }
 

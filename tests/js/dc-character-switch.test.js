@@ -252,3 +252,134 @@ describe('dc-multi.js — F-14 character-switch cleanup', () => {
     expect(S.current).toBeNull();
   });
 });
+
+// ----------------------------------------------------------------
+// Tests — R3.1: the GPU resources the teardown used to miss
+//
+// Step 4.4 was recorded as done and never touched dc-multi.js: the commit titled "fix 4.4"
+// contains Step 4.1's work. The teardown disposed geometry, materials and `.map` only, so every
+// character switch leaked the skeleton's bone texture plus normalMap / roughnessMap /
+// metalnessMap / aoMap — on a Mixamo rig, that is most of the memory.
+// ----------------------------------------------------------------
+describe('dc-multi.js — character-switch teardown disposes every GPU resource', () => {
+  let env;
+
+  /** A three.js-shaped Texture: 'minFilter' is the marker the teardown duck-types on. */
+  function texture(name) {
+    return { name, minFilter: 1006, disposed: 0, dispose() { this.disposed++; } };
+  }
+
+  /** A GLTF whose scene holds one SkinnedMesh with a skeleton and a fully-textured material. */
+  function texturedGltf(record) {
+    const THREE = require('./__mocks__/three.js');
+    const scene = new THREE.Group();
+    const maps = {
+      map: texture('base'),
+      normalMap: texture('normal'),
+      roughnessMap: texture('roughness'),
+      metalnessMap: texture('metalness'),
+      aoMap: texture('ao'),
+      emissiveMap: texture('emissive'),
+    };
+    const material = { ...maps, color: 0xffffff, disposed: 0, dispose() { this.disposed++; } };
+    const skeleton = { disposed: 0, dispose() { this.disposed++; } };
+    const skinned = {
+      isMesh: true, isSkinnedMesh: true, skeleton, material,
+      geometry: { disposed: 0, dispose() { this.disposed++; } },
+      children: [], traverse(cb) { cb(this); },
+    };
+    scene.add(skinned);
+    record.maps = maps;
+    record.material = material;
+    record.skeleton = skeleton;
+    record.geometry = skinned.geometry;
+    return { scene, animations: [] };
+  }
+
+  beforeEach(async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    env = await boot();
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await cleanup();
+    env = null;
+  });
+
+  it('disposes the skeleton, releasing the bone texture', async () => {
+    const first = {};
+    globalThis.__DCM_FAKE_GLTF__ = () => texturedGltf(first);
+    await env.DCM.loadCharacter(fakeChar('a', 'a.glb'));
+    globalThis.__DCM_FAKE_GLTF__ = () => texturedGltf({});
+    await env.DCM.loadCharacter(fakeChar('b', 'b.glb'));
+    // Skeleton.dispose() is what releases boneTexture (three/src/objects/Skeleton.js:298).
+    // Nothing in the material walk reaches it, so without this call it leaks on every switch.
+    expect(first.skeleton.disposed).toBe(1);
+  });
+
+  it('disposes EVERY texture map, not just .map', async () => {
+    const first = {};
+    globalThis.__DCM_FAKE_GLTF__ = () => texturedGltf(first);
+    await env.DCM.loadCharacter(fakeChar('a', 'a.glb'));
+    globalThis.__DCM_FAKE_GLTF__ = () => texturedGltf({});
+    await env.DCM.loadCharacter(fakeChar('b', 'b.glb'));
+    for (const [name, tex] of Object.entries(first.maps)) {
+      expect(tex.disposed, `${name} was not disposed`).toBe(1);
+    }
+  });
+
+  it('still disposes the material and geometry', async () => {
+    const first = {};
+    globalThis.__DCM_FAKE_GLTF__ = () => texturedGltf(first);
+    await env.DCM.loadCharacter(fakeChar('a', 'a.glb'));
+    globalThis.__DCM_FAKE_GLTF__ = () => texturedGltf({});
+    await env.DCM.loadCharacter(fakeChar('b', 'b.glb'));
+    expect(first.material.disposed).toBe(1);
+    expect(first.geometry.disposed).toBe(1);
+  });
+
+  it('does not dispose the same resource twice across three switches', async () => {
+    const first = {};
+    globalThis.__DCM_FAKE_GLTF__ = () => texturedGltf(first);
+    await env.DCM.loadCharacter(fakeChar('a', 'a.glb'));
+    for (const id of ['b', 'c']) {
+      globalThis.__DCM_FAKE_GLTF__ = () => texturedGltf({});
+      await env.DCM.loadCharacter(fakeChar(id, id + '.glb'));
+    }
+    expect(first.skeleton.disposed).toBe(1);
+    expect(first.maps.normalMap.disposed).toBe(1);
+  });
+
+  it('survives a material with no textures at all', async () => {
+    const THREE = require('./__mocks__/three.js');
+    globalThis.__DCM_FAKE_GLTF__ = () => {
+      const scene = new THREE.Group();
+      scene.add({
+        isMesh: true, material: { color: 0xffffff, dispose() {} },
+        geometry: { dispose() {} }, children: [], traverse(cb) { cb(this); },
+      });
+      return { scene, animations: [] };
+    };
+    await env.DCM.loadCharacter(fakeChar('a', 'a.glb'));
+    globalThis.__DCM_FAKE_GLTF__ = () => texturedGltf({});
+    await expect(env.DCM.loadCharacter(fakeChar('b', 'b.glb'))).resolves.not.toThrow();
+  });
+
+  it('survives a plain Mesh with no skeleton', async () => {
+    const THREE = require('./__mocks__/three.js');
+    globalThis.__DCM_FAKE_GLTF__ = () => {
+      const scene = new THREE.Group();
+      scene.add({
+        isMesh: true, isSkinnedMesh: false, material: { map: texture('m'), dispose() {} },
+        geometry: { dispose() {} }, children: [], traverse(cb) { cb(this); },
+      });
+      return { scene, animations: [] };
+    };
+    await env.DCM.loadCharacter(fakeChar('a', 'a.glb'));
+    globalThis.__DCM_FAKE_GLTF__ = () => texturedGltf({});
+    await expect(env.DCM.loadCharacter(fakeChar('b', 'b.glb'))).resolves.not.toThrow();
+  });
+});

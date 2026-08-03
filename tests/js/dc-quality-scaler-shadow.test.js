@@ -50,13 +50,16 @@ describe('dc.js quality scaler — Step 6.3 shadow tier re-enabled', () => {
             expect(block).toMatch(/shadow map size/i);
         });
 
-        it('calls _applyShadowMapSize before renderer.setPixelRatio', () => {
+        it('calls _applyShadowMapSize before the pixel-scale step', () => {
             // The shadow map step (now Step 1) must call _applyShadowMapSize
             // The pixel scale step (now Step 2) must call renderer.setPixelRatio
             // Since shadow is Step 1 and pixelScale is Step 2, _applyShadowMapSize appears first
+            // R3.2: the pixel step no longer calls renderer.setPixelRatio inline — there is
+            // exactly one such call in dc.js now, inside applyPixelRatio(). The ordering being
+            // asserted is unchanged; only the name of the marker moved.
             const fn = getFunctionSource('_reduceQuality');
             const shadowIdx = fn.indexOf('_applyShadowMapSize');
-            const pixelIdx = fn.indexOf('setPixelRatio');
+            const pixelIdx = fn.indexOf('applyPixelRatio');
             expect(shadowIdx).not.toBe(-1);
             expect(pixelIdx).not.toBe(-1);
             expect(shadowIdx).toBeLessThan(pixelIdx);
@@ -71,10 +74,11 @@ describe('dc.js quality scaler — Step 6.3 shadow tier re-enabled', () => {
     describe('(b) _upgradeQuality — shadow doubling LAST (after pixelScale and lodBias)', () => {
 
         it('shadow doubling is the last step in _upgradeQuality', () => {
-            // Verify the function ends with the shadow map doubling block
-            // by checking that setPixelRatio appears before _applyShadowMapSize
+            // Verify the function ends with the shadow map doubling block by checking that the
+            // pixel-scale step appears before _applyShadowMapSize. R3.2: the marker is now
+            // applyPixelRatio() — dc.js has exactly one renderer.setPixelRatio call, inside it.
             const fn = getFunctionSource('_upgradeQuality');
-            const pixelIdx = fn.indexOf('setPixelRatio');
+            const pixelIdx = fn.indexOf('applyPixelRatio');
             const shadowIdx = fn.indexOf('_applyShadowMapSize');
             expect(pixelIdx).not.toBe(-1);
             expect(shadowIdx).not.toBe(-1);

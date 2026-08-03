@@ -141,41 +141,106 @@ describe('dc.js — Step 7.4 WebGPU ambient occlusion via TSL', () => {
 
     });
 
-    describe('tick() 3-way render branch', () => {
+    // -----------------------------------------------------------------------
+    // R3.11 / R3.7: this block used to pin the 3-way render branch by regex —
+    //
+    //     if (options.ambientOcclusion && _composer) { _composer.render(); }
+    //     else if (caps.supportsTSL && _postProcessing) { renderer.render(scene, camera); }
+    //     else { renderer.render(scene, camera); }
+    //
+    // Four tests asserted that shape stayed exactly so. The second branch was BYTE-IDENTICAL to
+    // the third: the "WebGPU TSL path" rendered a plain frame, and a test that matched the text
+    // could not tell that. It was also unreachable, because supportsTSL was false everywhere at
+    // the time. The tests passed for four years' worth of nothing happening.
+    //
+    // R3.7 replaced the branch with a single drawFrame(), which both the normal and the idle-skip
+    // paths call, and gave the pipelines a real implementation. These run drawFrame() and
+    // aoActive() and observe what gets drawn.
+    // -----------------------------------------------------------------------
+    describe('drawFrame() — what actually paints the frame', () => {
 
-        it('(c) tick() 3-way branch checks options.ambientOcclusion && _composer (Step 7.3 AO path)', () => {
-            const tickBody = getTickBody(DC_SOURCE);
-            expect(tickBody).not.toBeNull();
-            const codeOnly = stripComments(tickBody);
-            // Step 7.3 path: EffectComposer-based AO
-            expect(codeOnly).toMatch(/options\.ambientOcclusion\s*&&\s*_composer/);
+        /** Compile the real drawFrame() + aoActive() over injected pipeline state. */
+        function compile({ ao = false, composer = false, postFX = false } = {}) {
+            const drew = [];
+            const options = { ambientOcclusion: ao };
+            const renderer = { render: (sc, cam) => drew.push(['plain', sc, cam]) };
+            const _composer = composer ? { render: () => drew.push(['composer']) } : null;
+            const _postProcessing = postFX ? { post: { render: () => drew.push(['node']) } } : null;
+            const src = [
+                getFunctionBody(DC_SOURCE, 'aoActive'),
+                getFunctionBody(DC_SOURCE, 'drawFrame'),
+                'return { drawFrame, aoActive };',
+            ].join('\n');
+            // eslint-disable-next-line no-new-func
+            const api = new Function('options', 'renderer', 'scene', 'camera', '_composer', '_postProcessing', src)(
+                options, renderer, 'SCENE', 'CAMERA', _composer, _postProcessing);
+            return { ...api, drew, options };
+        }
+
+        it('both functions are present in dc.js', () => {
+            // If either is renamed the harness silently compiles nothing useful.
+            expect(getFunctionBody(DC_SOURCE, 'drawFrame')).not.toBeNull();
+            expect(getFunctionBody(DC_SOURCE, 'aoActive')).not.toBeNull();
         });
 
-        it('(c) tick() 3-way branch checks caps.supportsTSL && _postProcessing (WebGPU TSL path)', () => {
-            const tickBody = getTickBody(DC_SOURCE);
-            expect(tickBody).not.toBeNull();
-            const codeOnly = stripComments(tickBody);
-            // Step 7.4 path: WebGPU TSL AO
-            expect(codeOnly).toMatch(/caps\.supportsTSL/);
-            expect(codeOnly).toMatch(/_postProcessing/);
+        it('draws plainly when ambient occlusion is off, whatever pipelines exist', () => {
+            const h = compile({ ao: false, composer: true, postFX: true });
+            h.drawFrame();
+            expect(h.drew).toEqual([['plain', 'SCENE', 'CAMERA']]);
         });
 
-        it('(c) tick() 3-way branch has plain renderer.render() fallback', () => {
-            const tickBody = getTickBody(DC_SOURCE);
-            expect(tickBody).not.toBeNull();
-            const codeOnly = stripComments(tickBody);
-            // The fallback should be renderer.render(scene, camera)
-            expect(codeOnly).toMatch(/renderer\.render\s*\(\s*scene\s*,\s*camera\s*\)/);
+        it('renders through the EffectComposer on the classic path', () => {
+            const h = compile({ ao: true, composer: true });
+            h.drawFrame();
+            expect(h.drew).toEqual([['composer']]);
         });
 
-        it('3-way branch pattern: if-else if-else with all three paths present', () => {
-            const tickBody = getTickBody(DC_SOURCE);
-            expect(tickBody).not.toBeNull();
-            const codeOnly = stripComments(tickBody);
-            // Should have all three conditions
-            expect(codeOnly).toMatch(/if\s*\(\s*options\.ambientOcclusion\s*&&\s*_composer\s*\)/);
-            expect(codeOnly).toMatch(/else\s+if\s*\(\s*caps\.supportsTSL/);
-            expect(codeOnly).toMatch(/else\s*\{[\s\S]*?renderer\.render/);
+        it('renders through the node pipeline when there is no composer', () => {
+            // The branch that was byte-identical to the fallback. It now draws something else.
+            const h = compile({ ao: true, postFX: true });
+            h.drawFrame();
+            expect(h.drew).toEqual([['node']]);
+        });
+
+        it('falls back to a plain render when AO is asked for but nothing built', () => {
+            // Both setups are async and either can fail to a null — the toggle must not break
+            // rendering when it does.
+            const h = compile({ ao: true });
+            h.drawFrame();
+            expect(h.drew).toEqual([['plain', 'SCENE', 'CAMERA']]);
+        });
+
+        it('draws exactly once per call on every path', () => {
+            for (const opts of [{ ao: false }, { ao: true, composer: true },
+                { ao: true, postFX: true }, { ao: true }]) {
+                const h = compile(opts);
+                h.drawFrame();
+                expect(h.drew.length, JSON.stringify(opts)).toBe(1);
+            }
+        });
+
+        it('aoActive() agrees with what drawFrame() does', () => {
+            // bench() and DC.postFX() both report aoActive(). If it disagreed with the renderer,
+            // a benchmark could claim AO was on for a frame drawn without it — which is exactly
+            // what bench()'s hardcoded `ao: false` did before R3.7.
+            for (const opts of [{ ao: false, composer: true }, { ao: true, composer: true },
+                { ao: true, postFX: true }, { ao: true }, { ao: false }]) {
+                const h = compile(opts);
+                h.drawFrame();
+                const drewPlain = h.drew[0][0] === 'plain';
+                expect(h.aoActive(), JSON.stringify(opts)).toBe(!drewPlain);
+            }
+        });
+
+        it('tick() delegates to drawFrame() on BOTH the normal and the idle-skip paths', () => {
+            // The idle branch used to know about the WebGL composer and not the node pipeline, so
+            // AO switched itself off after five idle minutes on the WebGPU path only. A single
+            // call site is what stops the two drifting again — this is a structural contract, so
+            // it is checked structurally, on purpose.
+            const tick = stripComments(getTickBody(DC_SOURCE));
+            expect((tick.match(/drawFrame\(\)/g) || []).length).toBe(2);
+            expect(tick).not.toMatch(/_composer\.render\(/);
+            expect(tick).not.toMatch(/renderer\.render\(/);
         });
 
     });

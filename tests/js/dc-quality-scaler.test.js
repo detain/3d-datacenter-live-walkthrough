@@ -106,14 +106,61 @@ describe('dc.js quality scaler — Step 2.2', () => {
             expect(snippetExists("console.info(`[dc] quality")).toBe(true);
         });
 
-        it('DOM toast is guarded on pixelScale at the floor (value > 0.5)', () => {
-            const fn = DC_SOURCE.match(
-                /^function _notifyQualityChange\([\s\S]*?^}/m
-            );
-            expect(fn).not.toBeNull();
-            const src = fn[0];
-            // DOM toast creation must be nested inside the pixelScale + value>0.5 guard
-            expect(src).toMatch(/if\s*\(\s*setting\s*===\s*['"]pixelScale['"]\s*&&\s*value\s*>\s*0\.5\s*\)/);
+        // R3.4: this used to require `value > 0.5`, under a comment claiming the toast fired "at
+        // the floor". It is the exact inverse — 0.5 IS the floor, so the toast fired on the
+        // barely-visible 1.0 -> 0.75 step and went silent at the one moment the user needed it.
+        // It also fired on UPGRADES, announcing "Auto-reduced quality" while quality recovered.
+        // Source matching could not see any of that, so this now runs the function.
+
+        /** Run _notifyQualityChange with a fake DOM and report whether a toast was created. */
+        function notify(setting, value, direction) {
+            const created = [];
+            const body = { appendChild: (el) => created.push(el) };
+            const documentStub = {
+                body,
+                createElement: () => ({ style: {}, textContent: '', remove() {} }),
+            };
+            const fnSrc = DC_SOURCE.match(/^function _notifyQualityChange\([\s\S]*?^}/m)[0];
+            // eslint-disable-next-line no-new-func
+            const fn = new Function('document', 'console', 'requestAnimationFrame', 'setTimeout',
+                fnSrc + '\nreturn _notifyQualityChange;')(
+                documentStub, { info() {} }, () => {}, () => {});
+            fn(setting, value, direction);
+            return { toasted: created.length > 0, text: created[0] && created[0].textContent };
+        }
+
+        it('toasts at the floor (0.5), where the scaler has nothing left to give', () => {
+            expect(notify('pixelScale', 0.5, 'down').toasted).toBe(true);
+        });
+
+        it('stays quiet on the intermediate downgrade step', () => {
+            expect(notify('pixelScale', 0.75, 'down').toasted).toBe(false);
+        });
+
+        it('never toasts on an upgrade, even at the floor value', () => {
+            // "⚠️ Auto-reduced quality" while quality is being restored is worse than silence.
+            expect(notify('pixelScale', 0.5, 'up').toasted).toBe(false);
+            expect(notify('pixelScale', 0.75, 'up').toasted).toBe(false);
+        });
+
+        it('never toasts for the other quality tiers', () => {
+            // Only pixelScale is visible enough to be worth interrupting the user over.
+            expect(notify('shadowMap', 512, 'down').toasted).toBe(false);
+            expect(notify('lodBias', 2, 'down').toasted).toBe(false);
+        });
+
+        it('the toast says what happened', () => {
+            expect(notify('pixelScale', 0.5, 'down').text).toMatch(/quality/i);
+        });
+
+        it('every call site passes a direction', () => {
+            // A missing direction silently means "not down", i.e. the toast never fires again.
+            const calls = DC_SOURCE.match(/_notifyQualityChange\([^)]*\)/g) || [];
+            const invocations = calls.filter((c) => !c.startsWith('_notifyQualityChange(setting'));
+            expect(invocations.length).toBeGreaterThan(0);
+            for (const c of invocations) {
+                expect(c, `${c} has no direction argument`).toMatch(/,\s*'(up|down)'\)$/);
+            }
         });
 
         it('no unconditional DOM toast', () => {

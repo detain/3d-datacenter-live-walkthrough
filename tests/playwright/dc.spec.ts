@@ -1101,3 +1101,244 @@ test.describe('Group 12: Info panel actions', () => {
     expect(threw).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Group 13: Ambient occlusion — the post-processing chain on BOTH backends (R3.7)
+//
+// Step 7.3 built a real EffectComposer + GTAOPass chain on the classic path. Step 7.4 was supposed
+// to build the node-renderer equivalent and instead shipped `_postProcessing = { ao, ready: true }`
+// — the imported TSL function stored in an object, with no pipeline, no pass and no output node.
+// The render branch that consumed it was byte-identical to the plain `else`, and was unreachable
+// anyway because `supportsTSL` was false at the time. Nothing failed; nothing rendered either.
+//
+// The only way to tell a real post-processing chain from a stub is to look at the pixels, so that
+// is what this group does: same frozen camera, AO off, AO on, compare. Two things had to be dealt
+// with before that comparison meant anything —
+//
+//   1. The idle-view demo cycles the camera through five presets and flies between them. Its
+//      motion swamps any image measurement, so #blocker is hidden, which makes
+//      maybeCycleIdleView() bail on its own guard.
+//   2. The auto-quality scaler now drops AO as its FIRST downgrade tier. SwiftShader is far below
+//      FPS_TARGET, so AO was being switched off within one tick of being switched on and the two
+//      captures came out byte-identical — a green test proving nothing. DC.setAutoQuality(false)
+//      pins the tiers; DC.postFX().suspendedByScaler confirms it held.
+//
+// Occlusion can only ever darken, so mean luminance is asserted to FALL. That is the direction of
+// effect a byte-length diff cannot give: noise, a broken colour channel or a black frame all change
+// the bytes too. The first working draft of the node path multiplied the colour by the whole AO
+// texel — GTAONode's target is RedFormat, so g and b are zero — and rendered the scene dark red.
+// It changed every byte. It also dropped mean luma by 118 of 255, which is what this bound catches.
+// ---------------------------------------------------------------------------
+const AO_MODES = [
+  { label: 'webgl (EffectComposer/GTAOPass)', url: '/admin/dc.html', mode: 'webgl' },
+  { label: 'node (TSL GTAONode)', url: '/admin/dc.html?renderer=webgpu', mode: 'node' },
+] as const;
+
+/** Freeze the scene: no demo camera, no quality scaler, and a fixed camera pose. */
+async function pinScene(page: any) {
+  await page.evaluate(async () => {
+    const bl = document.getElementById('blocker');
+    if (bl) bl.style.display = 'none';
+    const DC: any = (window as any).DC;
+    DC.setAutoQuality(false);
+    // setTimeout, not requestAnimationFrame. rAF is throttled hard when several SwiftShader pages
+    // are live at once — which is exactly what the two Playwright workers produce — and an
+    // rAF-driven warm-up loop stalls long past the test timeout. Nothing here needs a real
+    // presented frame: tick() renders synchronously, and the one capture that must read the
+    // drawing buffer does so immediately after its own tick(), before yielding.
+    const yieldToLoop = () => new Promise((r) => setTimeout(r, 0));
+    for (let i = 0; i < 30; i++) { DC.tick(); await yieldToLoop(); }   // let any in-flight flyTo land
+  });
+}
+
+/** Render with AO on or off at a fixed camera and return the frame's mean luminance. */
+async function captureLuma(page: any, ao: boolean): Promise<number> {
+  return page.evaluate(async (wantAo: boolean) => {
+    const DC: any = (window as any).DC;
+    DC.options.ambientOcclusion = wantAo;
+    DC.camera.position.set(0, 12, 40);
+    DC.camera.lookAt(0, 8, 0);
+    const yieldToLoop = () => new Promise((r) => setTimeout(r, 0));
+    for (let i = 0; i < 12; i++) { DC.tick(); await yieldToLoop(); }
+    DC.camera.position.set(0, 12, 40);
+    DC.camera.lookAt(0, 8, 0);
+    // No yield between this tick() and the read below: a WebGL drawing buffer is cleared once the
+    // frame is presented unless preserveDrawingBuffer is set, so the capture has to happen inside
+    // the same synchronous run as the render that produced it.
+    DC.tick();
+    const c = document.querySelector('canvas') as HTMLCanvasElement;
+    const off = document.createElement('canvas');
+    off.width = c.width; off.height = c.height;
+    const ctx = off.getContext('2d')!;
+    ctx.drawImage(c, 0, 0);
+    const d = ctx.getImageData(0, 0, off.width, off.height).data;
+    let sum = 0, n = 0;
+    for (let i = 0; i < d.length; i += 4 * 17) { sum += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]; n++; }
+    return sum / n;
+  }, ao);
+}
+
+for (const m of AO_MODES) {
+  // Serial with ONE page for the whole block, not a boot per test. Booting the scene under
+  // SwiftShader costs the better part of a minute; six boots per backend put this group alone at
+  // 16 minutes. Nothing here mutates state another test depends on beyond `ambientOcclusion`,
+  // which every test sets for itself.
+  test.describe(`Group 13: Ambient occlusion — ${m.label}`, () => {
+    test.describe.configure({ mode: 'serial', timeout: 240000 });
+
+    let page: any;
+    test.beforeAll(async ({ browser }) => {
+      // describe.configure({timeout}) sets the TEST timeout; a beforeAll hook keeps its own
+      // 30 s default, and booting this scene under SwiftShader takes longer than that.
+      test.setTimeout(240000);
+      page = await browser.newPage();
+      await bootHermetic(page, m.url);
+      await waitForSceneLoaded(page);
+      await pinScene(page);
+    });
+    test.afterAll(async () => { await page?.close(); });
+
+    test('a post-processing pipeline was built for this backend', async () => {
+      // 'none' means the dynamic import failed and AO silently does nothing — the state Step 7.4
+      // shipped in, except that back then it also logged "initialized".
+      const fx = await page.evaluate(() => (window as any).DC.postFX());
+      expect(fx.mode).toBe(m.mode);
+    });
+
+    test('DC.postFX() reports AO as inactive until it is asked for', async () => {
+      const fx = await page.evaluate(() => {
+        (window as any).DC.options.ambientOcclusion = false;
+        return (window as any).DC.postFX();
+      });
+      expect(fx.requested).toBe(false);
+      expect(fx.active).toBe(false);
+    });
+
+    test('DC.postFX().active follows the option once a pipeline exists', async () => {
+      const fx = await page.evaluate(() => {
+        (window as any).DC.options.ambientOcclusion = true;
+        return (window as any).DC.postFX();
+      });
+      expect(fx.requested).toBe(true);
+      expect(fx.active).toBe(true);
+    });
+
+    test('switching AO on changes the rendered frame, and darkens it', async () => {
+      const plain = await captureLuma(page, false);
+      const withAo = await captureLuma(page, true);
+      const delta = withAo - plain;
+      // Something must have been drawn at all — a black canvas would pass a "they differ" test.
+      expect(plain).toBeGreaterThan(20);
+      // Occlusion darkens. Lower bound: it must actually do something.
+      expect(delta).toBeLessThan(-0.5);
+      // Upper bound: and it must not do something catastrophic. -118 was the RedFormat bug.
+      expect(delta).toBeGreaterThan(-40);
+    });
+
+    test('the scaler did not silently switch AO off during the measurement', async () => {
+      // If this ever fails, the test above was comparing two AO-off frames and its "they differ"
+      // assertion was measuring frame-to-frame noise.
+      await captureLuma(page, true);
+      const fx = await page.evaluate(() => (window as any).DC.postFX());
+      expect(fx.suspendedByScaler).toBe(false);
+      expect(fx.active).toBe(true);
+    });
+
+    test('bench() reports AO honestly rather than hardcoding false', async () => {
+      // `ao: false` was hardcoded with a comment claiming AO was "not yet implemented", so every
+      // bench result claimed AO was off while the composer was rendering — in the one field whose
+      // whole purpose is making two runs comparable.
+      const out = await page.evaluate(async () => {
+        const DC: any = (window as any).DC;
+        DC.options.ambientOcclusion = true;
+        const on = DC.postFX().active;
+        DC.options.ambientOcclusion = false;
+        return { on, off: DC.postFX().active };
+      });
+      expect(out.on).toBe(true);
+      expect(out.off).toBe(false);
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Group 14: The auto-quality scaler's AO tier (R3.7)
+//
+// AO is a full extra screen-resolution pass over depth and normals with a denoise on top — the most
+// expensive thing in the frame by a distance, and the first thing a person would switch off. The
+// scaler had no AO tier at all, so a page struggling *because of* AO would grind its shadow map and
+// pixel scale to the floor and never touch the actual cost.
+//
+// Running under SwiftShader is what makes this testable without faking anything: the fixture really
+// is far below FPS_TARGET, so the downgrade path is the live one.
+// ---------------------------------------------------------------------------
+test.describe('Group 14: Auto-quality drops ambient occlusion first', () => {
+  test.describe.configure({ timeout: 240000 });
+
+  test.beforeEach(async ({ page }) => {
+    await bootHermetic(page, '/admin/dc.html');
+    await waitForSceneLoaded(page);
+  });
+
+  test('AO is dropped, and it is dropped BEFORE any other tier', async ({ page }) => {
+    // Sampled at the tick AO is suspended, not at the end of the run. SwiftShader is so far below
+    // FPS_TARGET that the scaler keeps walking down the remaining tiers afterwards — by tick 80
+    // the shadow map is already at its 512 floor, which says nothing about ordering. What the
+    // tier is for is that AO goes first, so the sample has to be taken when it goes.
+    const out = await page.evaluate(async () => {
+      const DC: any = (window as any).DC;
+      const bl = document.getElementById('blocker'); if (bl) bl.style.display = 'none';
+      DC.setAutoQuality(true);
+      DC.options.ambientOcclusion = true;
+      const yieldToLoop = () => new Promise((r) => setTimeout(r, 0));
+      // The baseline is whatever the page booted with, NOT the module defaults: dc-multi.js
+      // applies a 0.8 pixel scale on load, so asserting `pixelScale === 1` here would be
+      // asserting against a state this page never has.
+      const before = { shadowMap: DC.quality.shadowMapSize, pixelScale: DC.quality.pixelScale };
+      let atDrop = null;
+      // FPS_WINDOW is 60, and _autoQualityScale() does nothing until the ring buffer is full.
+      for (let i = 0; i < 120; i++) {
+        DC.tick();
+        if (!atDrop && DC.postFX().suspendedByScaler) {
+          atDrop = { shadowMap: DC.quality.shadowMapSize, pixelScale: DC.quality.pixelScale, tick: i };
+        }
+        await yieldToLoop();
+      }
+      return { fx: DC.postFX(), before, atDrop };
+    });
+    expect(out.fx.requested).toBe(false);
+    expect(out.fx.suspendedByScaler).toBe(true);
+    expect(out.atDrop, 'the scaler never dropped AO at all').not.toBeNull();
+    // Nothing cheaper had been touched yet at the moment AO went.
+    expect(out.atDrop.shadowMap).toBe(out.before.shadowMap);
+    expect(out.atDrop.pixelScale).toBe(out.before.pixelScale);
+    // Deliberately NOT asserting which tick it fired on. The FPS ring buffer is filled by the
+    // page's own animation loop from the moment it boots, not by this loop, so by the time the
+    // evaluate starts it is already full and the scaler acts within a handful of manual ticks.
+    // An "at least FPS_WINDOW ticks" assertion would be asserting a fiction about the harness.
+  });
+
+  test('setAutoQuality(false) pins AO on, which is what makes Group 13 measurable', async ({ page }) => {
+    const out = await page.evaluate(async () => {
+      const DC: any = (window as any).DC;
+      const bl = document.getElementById('blocker'); if (bl) bl.style.display = 'none';
+      DC.setAutoQuality(false);
+      DC.options.ambientOcclusion = true;
+      const yieldToLoop = () => new Promise((r) => setTimeout(r, 0));
+      for (let i = 0; i < 80; i++) { DC.tick(); await yieldToLoop(); }
+      return DC.postFX();
+    });
+    expect(out.requested).toBe(true);
+    expect(out.suspendedByScaler).toBe(false);
+  });
+
+  test('setAutoQuality reports and reflects the state it was given', async ({ page }) => {
+    const out = await page.evaluate(() => {
+      const DC: any = (window as any).DC;
+      const a = DC.setAutoQuality(false), afterOff = DC.autoQuality;
+      const b = DC.setAutoQuality(true), afterOn = DC.autoQuality;
+      return { a, afterOff, b, afterOn };
+    });
+    expect(out).toEqual({ a: false, afterOff: false, b: true, afterOn: true });
+  });
+});

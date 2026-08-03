@@ -118,8 +118,17 @@ describe('dc-ao.test.js — Step 7.3 ambient occlusion on WebGL path', () => {
                 expect(DC_JS_SOURCE).toMatch(/_setupWebglPostFX\(\)/);
             });
 
-            it('(d) DC.tick uses _composer.render() when ambientOcclusion && _composer', () => {
-                expect(DC_JS_SOURCE).toMatch(/options\.ambientOcclusion\s*&&\s*_composer/);
+            it('(d) the composer is what draws the frame when AO is on', () => {
+                // R3.11/R3.7: this used to grep for `options.ambientOcclusion && _composer`,
+                // pinning the exact text of a render branch that has since been collapsed into
+                // drawFrame(). The behaviour it was reaching for is exercised properly in
+                // tests/js/dc-ao-webgpu.test.js ("drawFrame() — what actually paints the frame"),
+                // which runs the real function, and in tests/playwright/dc.spec.ts Group 13,
+                // which compares the rendered pixels. What is left here is the one-line contract
+                // that the composer is reachable from the draw path at all.
+                const code = DC_JS_SOURCE.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+                expect(code).toMatch(/_composer\.render\(\)/);
+                expect(code).toMatch(/function drawFrame\(\)/);
             });
 
             it('(d) _composer and _aoPass are declared as module variables', () => {

@@ -88,117 +88,197 @@ describe('dc.js — buildPortsByAsset function', () => {
 // ---------------------------------------------------------------------------
 // traceCable function
 // ---------------------------------------------------------------------------
-describe('dc.js — traceCable function', () => {
-
-    it('is declared at top level', () => {
-        expect(DC_SOURCE).toMatch(/^function traceCable\(/m);
-    });
-
-    it('calls clearTrace first to remove existing overlay', () => {
-        const src = extractFn('traceCable');
-        expect(src).toMatch(/clearTrace\(\)/);
-    });
-
-    it('looks up route points from _cableRoutes', () => {
-        const src = extractFn('traceCable');
-        expect(src).toMatch(/_cableRoutes\.get\(routeKey\)/);
-    });
-
-    it('creates a THREE.BufferGeometry from route points', () => {
-        const src = extractFn('traceCable');
-        expect(src).toMatch(/THREE\.BufferGeometry/);
-        expect(src).toMatch(/setFromPoints/);
-    });
-
-    it('creates a LineBasicMaterial with bright color (0x00ffff cyan)', () => {
-        const src = extractFn('traceCable');
-        expect(src).toMatch(/LineBasicMaterial/);
-        expect(src).toMatch(/color.*0x00ffff/);
-    });
-
-    it('creates a THREE.Line and adds it to the scene', () => {
-        const src = extractFn('traceCable');
-        expect(src).toMatch(/new THREE\.Line\(/);
-        expect(src).toMatch(/scene\.add\(_traceOverlay\)/);
-    });
-
-    it('sets renderOrder to 1000 for overlay priority', () => {
-        const src = extractFn('traceCable');
-        expect(src).toMatch(/_traceOverlay\.renderOrder = 1000/);
-    });
-
-    it('is exposed on window.DC', () => {
-        expect(DC_SOURCE).toMatch(/traceCable: traceCable/);
-    });
-});
-
 // ---------------------------------------------------------------------------
-// clearTrace function
+// traceCable / clearTrace / traceCableForAsset — EXECUTED (R3.11)
+//
+// These three were nineteen regexes over their own source text: "the function contains the string
+// scene.add(_traceOverlay)", "the function contains renderOrder = 1000", and so on. Each one
+// restated a line of dc.js and could only ever confirm that nobody had edited it.
+//
+// What that cannot see is the thing that actually matters here — the overlay's LIFECYCLE. A trace
+// allocates a BufferGeometry and a LineBasicMaterial and parents them to the scene; every one of
+// those has to be released when the trace is replaced or cleared, or clicking Trace Cable a few
+// dozen times leaks GPU memory for the life of the page. "clearTrace() contains .dispose()" says
+// nothing about whether it is reached, called once, or called on the right object.
 // ---------------------------------------------------------------------------
-describe('dc.js — clearTrace function', () => {
+describe('dc.js — the trace overlay lifecycle, executed', () => {
 
-    it('is declared at top level', () => {
-        expect(DC_SOURCE).toMatch(/^function clearTrace\(/m);
+    /** Minimal three.js stand-ins that record allocation and disposal. */
+    function makeTHREE(log) {
+        class BufferGeometry {
+            constructor() { this.points = null; log.push(['geometry:new']); }
+            setFromPoints(pts) { this.points = pts; return this; }
+            dispose() { log.push(['geometry:dispose']); this.disposed = true; }
+        }
+        class LineBasicMaterial {
+            constructor(opts) { this.opts = opts; log.push(['material:new', opts]); }
+            dispose() { log.push(['material:dispose']); this.disposed = true; }
+        }
+        class Line {
+            constructor(geometry, material) { this.geometry = geometry; this.material = material; }
+        }
+        class Vector3 {
+            constructor(x, y, z) { this.x = x; this.y = y; this.z = z; }
+        }
+        return { BufferGeometry, LineBasicMaterial, Line, Vector3 };
+    }
+
+    /** Live sandbox over the real traceCable / clearTrace / traceCableForAsset. */
+    function makeTracer(routes = {}, ports = {}) {
+        const log = [];
+        const scene = {
+            children: [],
+            add(o) { this.children.push(o); log.push(['scene:add']); },
+            remove(o) { const i = this.children.indexOf(o); if (i >= 0) this.children.splice(i, 1); log.push(['scene:remove']); },
+        };
+        const src = [
+            'let _traceOverlay = null;',
+            'const _cableRoutes = new Map(Object.entries(routes));',
+            'const _portsByAsset = new Map(Object.entries(ports));',
+            extractFn('traceCable'),
+            extractFn('clearTrace'),
+            extractFn('traceCableForAsset'),
+            'return { traceCable, clearTrace, traceCableForAsset, overlay: () => _traceOverlay };',
+        ].join('\n');
+        // eslint-disable-next-line no-new-func
+        const api = new Function('THREE', 'scene', 'routes', 'ports', src)(
+            makeTHREE(log), scene, routes, ports);
+        return { ...api, scene, log };
+    }
+
+    const ROUTE = [[0, 0, 0], [1, 2, 3], [4, 5, 6]];
+
+    it('draws a line through every route point, in order', () => {
+        const t = makeTracer({ '900:7': ROUTE });
+        t.traceCable('900:7');
+        const line = t.overlay();
+        expect(line).toBeTruthy();
+        expect(line.geometry.points.map((p) => [p.x, p.y, p.z])).toEqual(ROUTE);
     });
 
-    it('early returns if no overlay exists', () => {
-        const src = extractFn('clearTrace');
-        expect(src).toMatch(/if \(!_traceOverlay\) return/);
+    it('parents the overlay to the scene', () => {
+        const t = makeTracer({ '900:7': ROUTE });
+        t.traceCable('900:7');
+        expect(t.scene.children).toEqual([t.overlay()]);
     });
 
-    it('removes overlay from scene', () => {
-        const src = extractFn('clearTrace');
-        expect(src).toMatch(/scene\.remove\(_traceOverlay\)/);
+    it('draws in a colour that stands out, above everything else', () => {
+        // A trace you cannot see through the racks is not a trace. renderOrder puts it on top;
+        // cyan is the one colour nothing else in this scene uses.
+        const t = makeTracer({ '900:7': ROUTE });
+        t.traceCable('900:7');
+        expect(t.overlay().material.opts.color).toBe(0x00ffff);
+        expect(t.overlay().renderOrder).toBe(1000);
     });
 
-    it('disposes geometry and material', () => {
-        const src = extractFn('clearTrace');
-        expect(src).toMatch(/_traceOverlay\.geometry\.dispose\(\)/);
-        expect(src).toMatch(/_traceOverlay\.material\.dispose\(\)/);
+    it('refuses to draw a route with fewer than two points', () => {
+        // One point is not a line, and setFromPoints would build a degenerate geometry.
+        for (const pts of [[], [[0, 0, 0]]]) {
+            const t = makeTracer({ '900:7': pts });
+            t.traceCable('900:7');
+            expect(t.overlay()).toBeNull();
+            expect(t.scene.children).toEqual([]);
+        }
     });
 
-    it('sets _traceOverlay to null after disposal', () => {
-        const src = extractFn('clearTrace');
-        expect(src).toMatch(/_traceOverlay = null/);
+    it('does nothing for an unknown route key', () => {
+        const t = makeTracer({ '900:7': ROUTE });
+        t.traceCable('nope');
+        expect(t.overlay()).toBeNull();
     });
 
-    it('is exposed on window.DC', () => {
-        expect(DC_SOURCE).toMatch(/clearTrace: clearTrace/);
-    });
-});
-
-// ---------------------------------------------------------------------------
-// traceCableForAsset function
-// ---------------------------------------------------------------------------
-describe('dc.js — traceCableForAsset function', () => {
-
-    it('is declared at top level', () => {
-        expect(DC_SOURCE).toMatch(/^function traceCableForAsset\(/m);
-    });
-
-    it('looks up connections from _portsByAsset with a normalised key', () => {
-        const src = extractFn('traceCableForAsset');
-        expect(src).toMatch(/_portsByAsset\.get\(String\(assetId\)\)/);
+    it('LEAK: tracing a second cable disposes the first', () => {
+        // The one that matters. traceCable() starts with clearTrace() for this reason; without it
+        // every click leaks a geometry and a material, and nothing about the page looks wrong.
+        const t = makeTracer({ a: ROUTE, b: ROUTE });
+        t.traceCable('a');
+        const first = t.overlay();
+        t.traceCable('b');
+        expect(first.geometry.disposed).toBe(true);
+        expect(first.material.disposed).toBe(true);
+        expect(t.overlay()).not.toBe(first);
+        expect(t.scene.children).toEqual([t.overlay()]);   // and only one is left parented
     });
 
-    it('early returns if no connections found', () => {
-        const src = extractFn('traceCableForAsset');
-        expect(src).toMatch(/if \(!connections.*return/);
+    it('LEAK: fifty traces leave exactly one overlay in the scene', () => {
+        const t = makeTracer({ a: ROUTE });
+        for (let i = 0; i < 50; i++) t.traceCable('a');
+        expect(t.scene.children).toHaveLength(1);
+        const news = t.log.filter((e) => e[0] === 'geometry:new').length;
+        const disposes = t.log.filter((e) => e[0] === 'geometry:dispose').length;
+        expect(news - disposes).toBe(1);
     });
 
-    it('constructs routeKey from switchId and portId', () => {
-        const src = extractFn('traceCableForAsset');
-        expect(src).toMatch(/conn\.switchId.*conn\.portId/);
+    it('LEAK: a failed trace still clears the previous one', () => {
+        // clearTrace() runs before the route lookup, so switching to an asset with no route
+        // removes the stale overlay rather than leaving the wrong cable highlighted.
+        const t = makeTracer({ a: ROUTE });
+        t.traceCable('a');
+        t.traceCable('missing');
+        expect(t.overlay()).toBeNull();
+        expect(t.scene.children).toEqual([]);
     });
 
-    it('calls traceCable with the routeKey', () => {
-        const src = extractFn('traceCableForAsset');
-        expect(src).toMatch(/traceCable\(routeKey\)/);
+    it('clearTrace removes, disposes and forgets', () => {
+        const t = makeTracer({ a: ROUTE });
+        t.traceCable('a');
+        const line = t.overlay();
+        t.clearTrace();
+        expect(t.scene.children).toEqual([]);
+        expect(line.geometry.disposed).toBe(true);
+        expect(line.material.disposed).toBe(true);
+        expect(t.overlay()).toBeNull();
     });
 
-    it('is exposed on window.DC', () => {
-        expect(DC_SOURCE).toMatch(/traceCableForAsset: traceCableForAsset/);
+    it('clearTrace is idempotent and safe with nothing traced', () => {
+        const t = makeTracer();
+        expect(() => { t.clearTrace(); t.clearTrace(); }).not.toThrow();
+        expect(t.log).toEqual([]);
     });
+
+    it('traceCableForAsset traces the asset\'s first connection', () => {
+        const t = makeTracer(
+            { '900:7': ROUTE },
+            { 5150: [{ switchId: '900', portId: '7', port: 'Gi0/1' }] });
+        t.traceCableForAsset('5150');
+        expect(t.overlay()).toBeTruthy();
+        expect(t.overlay().geometry.points).toHaveLength(3);
+    });
+
+    it('traceCableForAsset does nothing, and breaks nothing, for an unconnected asset', () => {
+        const t = makeTracer({ '900:7': ROUTE }, {});
+        expect(() => t.traceCableForAsset('5150')).not.toThrow();
+        expect(t.overlay()).toBeNull();
+    });
+
+    it('NON-VACUITY: removing the clearTrace() call makes the leak tests fail', () => {
+        // Prove the harness can see the leak, rather than passing because disposal never mattered.
+        const leaky = extractFn('traceCable').replace(/^\s*clearTrace\(\);\n/m, '');
+        expect(leaky).not.toMatch(/clearTrace\(\);/);
+        const log = [];
+        const scene = { children: [], add(o) { this.children.push(o); }, remove(o) { this.children.splice(this.children.indexOf(o), 1); } };
+        // eslint-disable-next-line no-new-func
+        const api = new Function('THREE', 'scene', 'routes', [
+            'let _traceOverlay = null;',
+            'const _cableRoutes = new Map(Object.entries(routes));',
+            leaky,
+            extractFn('clearTrace'),
+            'return { traceCable };',
+        ].join('\n'))(makeTHREE(log), scene, { a: ROUTE, b: ROUTE });
+        api.traceCable('a');
+        api.traceCable('b');
+        expect(scene.children).toHaveLength(2);              // the leak, reproduced
+        expect(log.filter((e) => e[0] === 'geometry:dispose')).toHaveLength(0);
+    });
+
+    it('all three are reachable from the console via window.DC', () => {
+        // Structural on purpose: an export list has nothing to execute. The Copy Link and Trace
+        // Cable buttons call through window.DC, and so does the E2E suite.
+        for (const name of ['traceCable', 'clearTrace', 'traceCableForAsset']) {
+            expect(DC_SOURCE).toMatch(new RegExp(`${name}: ${name}`));
+        }
+    });
+
 });
 
 // ---------------------------------------------------------------------------

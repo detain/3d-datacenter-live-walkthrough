@@ -108,35 +108,24 @@ describe('dc.js — DC.bench() result has all required fields', () => {
 
 describe('dc.js — DC.bench() idle mechanism uses noteUserInput()', () => {
 
-  it('bench calls noteUserInput() to reset idle, not _tickSkippedFrames directly', () => {
+  // R3.3: these three used to assert bench()'s `window.DC.noteUserInput ? … : reset the counters`
+  // dance and the frame counter behind it. noteUserInput() is now a module-scope function that
+  // bench() calls directly — there is no counter to fall back to, and no reason to reach through
+  // window for a function in the same module. The behavioural coverage lives in
+  // tests/js/dc-idle-skip.test.js, which runs it against an injected clock.
+
+  it('bench calls noteUserInput() directly, with no window round-trip or counter fallback', () => {
     const body = getObjectMethodBody(DC_SOURCE, 'bench');
     expect(body).not.toBeNull();
     const codeOnly = stripComments(body);
-
-    // The idle reset must go through noteUserInput() when available
-    expect(codeOnly).toMatch(/if\s*\(\s*window\.DC\.noteUserInput\s*\)\s*window\.DC\.noteUserInput\(\)/);
+    expect(codeOnly).toMatch(/noteUserInput\(\)/);
+    expect(codeOnly).not.toMatch(/window\.DC\.noteUserInput/);
+    expect(codeOnly).not.toMatch(/_tickSkippedFrames/);
   });
 
-  it('bench falls back to direct reset only when noteUserInput is not available', () => {
-    const body = getObjectMethodBody(DC_SOURCE, 'bench');
-    expect(body).not.toBeNull();
-    const codeOnly = stripComments(body);
-
-    // The fallback pattern: if noteUserInput doesn't exist, set counters directly
-    // Look for: else { _tickSkippedFrames = 0; _skipExpensiveUpdates = false; }
-    expect(codeOnly).toMatch(/else\s*\{[^}]*_tickSkippedFrames\s*=\s*0[^}]*_skipExpensiveUpdates\s*=\s*false[^}]*\}/);
-  });
-
-  it('noteUserInput is exposed on window.DC and resets idle skip unconditionally', () => {
-    const codeOnly = stripComments(DC_SOURCE);
-
-    // noteUserInput must be defined in the window.DC object
-    expect(codeOnly).toMatch(/noteUserInput\s*:\s*function\s*\(\)\s*\{/);
-
-    // It must unconditionally reset _tickSkippedFrames and _skipExpensiveUpdates
-    // (unlike setLodFocus which checks for position change first)
-    expect(codeOnly).toMatch(/noteUserInput[\s\S]{0,300}_tickSkippedFrames\s*=\s*0/);
-    expect(codeOnly).toMatch(/noteUserInput[\s\S]{0,300}_skipExpensiveUpdates\s*=\s*false/);
+  it('noteUserInput is exposed on window.DC', () => {
+    // bench() is the in-module caller; the export is for the console and for tests.
+    expect(stripComments(DC_SOURCE)).toMatch(/noteUserInput:\s*noteUserInput/);
   });
 
   it('setLodFocus still uses the moved check (not unconditional reset)', () => {

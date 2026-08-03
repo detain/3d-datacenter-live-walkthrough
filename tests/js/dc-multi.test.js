@@ -38,16 +38,47 @@ vi.mock('three/addons/loaders/DRACOLoader.js', () => ({
 }));
 
 // ----------------------------------------------------------------
-// Constants from dc-multi.js (verified by reading the source)
+// Constants and functions, READ FROM THE SOURCE (R3.11)
+//
+// These used to be hand-transcribed literals under a comment saying they were "verified by
+// reading the source" — which was true on the day it was written and unverifiable ever after.
+// A changed constant in dc-multi.js would leave this file asserting the old design, and passing.
+// Everything below is extracted at run time and throws if the declaration is renamed or reshaped.
 // ----------------------------------------------------------------
-const WALK = 14;
-const RUN = 34;
-const RUN_THRESH = 22;
-const GRAVITY = 980;
-const JUMP_V = 130;
-const G_PER_MS2 = 100;
-const CAM_MIN = 4.5;
-const CAM_MAX = 62;
+/** Read a numeric `const NAME = <n>` — including one declared in a comma list. */
+function constant(name) {
+  const m = MULTI_SOURCE.match(new RegExp(`(?:^const |, )${name}\\s*=\\s*(-?[\\d.]+)\\s*[,;]`, 'm'));
+  if (!m) throw new Error(`${name} not found in dc-multi.js — was it renamed or made non-literal?`);
+  return Number(m[1]);
+}
+
+/** Slice a top-level `function NAME(...) {...}` by walking to a balanced brace. */
+function sliceFn(name) {
+  const start = MULTI_SOURCE.search(new RegExp(`^function ${name}\\(`, 'm'));
+  if (start < 0) throw new Error(`${name}() not found in dc-multi.js — was it renamed?`);
+  let depth = 0, seen = false;
+  for (let i = start; i < MULTI_SOURCE.length; i++) {
+    const ch = MULTI_SOURCE[i];
+    if (ch === '{') { depth++; seen = true; }
+    else if (ch === '}') { depth--; if (seen && depth === 0) return MULTI_SOURCE.slice(start, i + 1); }
+  }
+  throw new Error(`${name}() has unbalanced braces`);
+}
+
+const RUN_THRESH = constant('RUN_THRESH');
+const GRAVITY = constant('GRAVITY');
+const JUMP_V = constant('JUMP_V');
+const G_PER_MS2 = constant('G_PER_MS2');
+const CAM_MIN = constant('CAM_MIN');
+const CAM_MAX = constant('CAM_MAX');
+// WALK/RUN are `let`, not `const` — the GUI's Walk Speed / Run Speed sliders reassign them at
+// run time — so they need their own extractor.
+function letPair() {
+  const m = MULTI_SOURCE.match(/^let WALK\s*=\s*([\d.]+),\s*RUN\s*=\s*([\d.]+)\s*;/m);
+  if (!m) throw new Error('let WALK = …, RUN = … not found in dc-multi.js — was it reshaped?');
+  return [Number(m[1]), Number(m[2])];
+}
+const [WALK, RUN] = letPair();
 
 // ----------------------------------------------------------------
 // Tests: movement constants
@@ -59,18 +90,83 @@ describe('dc-multi.js — movement constants', () => {
     expect(getSpeed(true)).toBe(RUN);
   });
 
-  it('RUN_THRESH=22 correctly gates run vs walk animation', () => {
-    const chooseAnimation = (speed, actions) => {
-      if (speed >= RUN_THRESH && actions.run) return 'run';
-      if (actions.walk) return 'walk';
-      return 'idle';
-    };
+  // R3.11: this block used to declare its own four-line `chooseAnimation` and assert against
+  // that. It could not fail for any change to dc-multi.js — and the copy did not even share the
+  // real signature: the real one takes (moving, speed), consults S.grounded and S.gestureUntil,
+  // and calls play() rather than returning a string. Below runs the real function.
+  //
+  /** Compile the real chooseAnimation() with the module's collaborators injected. */
+  function compileChooseAnimation({ grounded = true, gestureUntil = 0, actions = {}, now = 1000 } = {}) {
+    const played = [];
+    const S = { grounded, gestureUntil, actions };
+    // eslint-disable-next-line no-new-func
+    const fn = new Function('S', 'play', 'performance', 'RUN_THRESH',
+      `${sliceFn('chooseAnimation')}; return chooseAnimation;`)(
+      S, (label, fade) => played.push([label, fade]), { now: () => now }, RUN_THRESH);
+    return { fn, played, S };
+  }
 
-    expect(chooseAnimation(14, { walk: true, run: true })).toBe('walk');
-    expect(chooseAnimation(22, { walk: true, run: true })).toBe('run');
-    expect(chooseAnimation(34, { walk: true, run: true })).toBe('run');
-    expect(chooseAnimation(14, { walk: true })).toBe('walk');
-    expect(chooseAnimation(14, {})).toBe('idle');
+  it('RUN_THRESH gates run vs walk when both clips are loaded', () => {
+    const both = { walk: {}, run: {} };
+    let h = compileChooseAnimation({ actions: both });
+    h.fn(true, RUN_THRESH - 1);
+    expect(h.played[0][0]).toBe('walk');
+
+    h = compileChooseAnimation({ actions: both });
+    h.fn(true, RUN_THRESH);          // the boundary is >=, so exactly RUN_THRESH runs
+    expect(h.played[0][0]).toBe('run');
+
+    h = compileChooseAnimation({ actions: both });
+    h.fn(true, RUN);
+    expect(h.played[0][0]).toBe('run');
+  });
+
+  it('falls back down the chain when a clip has not loaded', () => {
+    // Clips stream in behind the character, so any of them can be missing on an early frame.
+    let h = compileChooseAnimation({ actions: { walk: {} } });
+    h.fn(true, RUN);                 // fast enough to run, but no run clip
+    expect(h.played[0][0]).toBe('walk');
+
+    h = compileChooseAnimation({ actions: {} });
+    h.fn(true, WALK);                // nothing loaded at all
+    expect(h.played[0][0]).toBe('idle');
+  });
+
+  it('standing still plays idle, with the slower fade', () => {
+    const h = compileChooseAnimation({ actions: { walk: {}, run: {} } });
+    h.fn(false, 0);
+    expect(h.played).toEqual([['idle', 0.25]]);
+  });
+
+  it('being airborne wins over locomotion', () => {
+    const h = compileChooseAnimation({ grounded: false, actions: { jump: {}, run: {}, walk: {} } });
+    h.fn(true, RUN);
+    expect(h.played).toEqual([['jump', 0.12]]);
+  });
+
+  it('airborne with no jump clip falls through to locomotion rather than freezing', () => {
+    const h = compileChooseAnimation({ grounded: false, actions: { walk: {} } });
+    h.fn(true, WALK);
+    expect(h.played[0][0]).toBe('walk');
+  });
+
+  it('an active gesture suppresses locomotion until it expires', () => {
+    // gestureUntil is a performance.now() deadline, so this needs the injected clock.
+    let h = compileChooseAnimation({ now: 1000, gestureUntil: 2000, actions: { walk: {}, run: {} } });
+    h.fn(true, RUN);
+    expect(h.played).toEqual([]);
+
+    h = compileChooseAnimation({ now: 2001, gestureUntil: 2000, actions: { walk: {}, run: {} } });
+    h.fn(true, RUN);
+    expect(h.played[0][0]).toBe('run');
+  });
+
+  it('a jump is NOT suppressed by an active gesture', () => {
+    // The grounded check comes first on purpose: a gesture playing while you walk off a ledge
+    // must not leave you falling in a dance pose.
+    const h = compileChooseAnimation({ grounded: false, now: 1000, gestureUntil: 2000, actions: { jump: {} } });
+    h.fn(true, WALK);
+    expect(h.played).toEqual([['jump', 0.12]]);
   });
 
   it('jump physics: JUMP_V=130, GRAVITY=980, G_PER_MS2=100', () => {
@@ -155,26 +251,45 @@ describe('dc-multi.js — S state object', () => {
 // Tests: lerpAngle function
 // ----------------------------------------------------------------
 describe('dc-multi.js — lerpAngle helper', () => {
-  it('lerpAngle normalizes angle differences to [-PI, PI]', () => {
-    // From dc-multi.js:
-    // function lerpAngle(a, b, t) {
-    //   let d = ((b - a + Math.PI) % (Math.PI * 2)) - Math.PI;
-    //   return a + d * t;
-    // }
-    const lerpAngle = (a, b, t) => {
-      let d = ((b - a + Math.PI) % (Math.PI * 2)) - Math.PI;
-      return a + d * t;
-    };
+  // R3.11: this suite used to paste lerpAngle's two lines into the test and assert against the
+  // paste, with the original quoted above it in a comment. It ran the real function zero times.
+  // eslint-disable-next-line no-new-func
+  const lerpAngle = new Function(`${sliceFn('lerpAngle')}; return lerpAngle;`)();
 
-    // Same angle -> no change
-    expect(lerpAngle(0.5, 0.5, 0.3)).toBeCloseTo(0.5);
+  it('interpolates linearly when no wrap is involved', () => {
+    expect(lerpAngle(0.5, 0.5, 0.3)).toBeCloseTo(0.5, 12);
+    expect(lerpAngle(0.0, 0.1, 1.0)).toBeCloseTo(0.1, 12);
+    expect(lerpAngle(0.0, 1.0, 0.5)).toBeCloseTo(0.5, 12);
+    expect(lerpAngle(0.0, Math.PI / 2, 0.5)).toBeCloseTo(Math.PI / 4, 12);
+  });
 
-    // Small difference
-    expect(lerpAngle(0.0, 0.1, 1.0)).toBeCloseTo(0.1);
+  it('takes the SHORT way round the wrap — the entire reason this function exists', () => {
+    // Turning from just under +π to just over −π is a few degrees, not a 358° spin. A plain
+    // lerp between the raw numbers spins the avatar the long way, which is what this normalises.
+    const a = Math.PI - 0.1, b = -Math.PI + 0.1;   // 0.2 rad apart across the seam
+    const half = lerpAngle(a, b, 0.5);
+    // Halfway is ±π, i.e. the seam itself. Compare as a wrapped delta from a.
+    const delta = ((half - a + Math.PI) % (Math.PI * 2)) - Math.PI;
+    expect(Math.abs(delta)).toBeCloseTo(0.1, 12);
+    // And emphatically NOT the long way, which a naive lerp would give.
+    expect(Math.abs(half - (a + b) / 2)).toBeGreaterThan(1);
+  });
 
-    // Linear interpolation (no wrap needed)
-    expect(lerpAngle(0.0, 1.0, 0.5)).toBeCloseTo(0.5);
-    expect(lerpAngle(0.0, Math.PI / 2, 0.5)).toBeCloseTo(Math.PI / 4);
+  it('t=0 returns the start and t=1 returns the target, modulo a full turn', () => {
+    const a = 2.0, b = -2.5;
+    expect(lerpAngle(a, b, 0)).toBeCloseTo(a, 12);
+    const end = lerpAngle(a, b, 1);
+    const wrapped = ((end - b + Math.PI) % (Math.PI * 2)) - Math.PI;
+    expect(Math.abs(wrapped)).toBeCloseTo(0, 12);
+  });
+
+  it('never moves more than half a turn in one call', () => {
+    // The normalised delta is bounded by π, so a single call cannot overshoot past the seam.
+    for (let a = -Math.PI; a <= Math.PI; a += 0.25) {
+      for (let b = -Math.PI; b <= Math.PI; b += 0.25) {
+        expect(Math.abs(lerpAngle(a, b, 1) - a), `a=${a} b=${b}`).toBeLessThanOrEqual(Math.PI + 1e-9);
+      }
+    }
   });
 });
 
@@ -346,26 +461,30 @@ describe('dc-multi.js — mode transition', () => {
 // Tests: GESTURE_ORDER and GESTURE_NAMES constants
 // ----------------------------------------------------------------
 describe('dc-multi.js — gesture constants', () => {
-  // GESTURE_ORDER from dc-multi.js line 669
-  const GESTURE_ORDER = ["dance1", "dance2", "clap", "dying", "wave", "dance3", "dance4", "salute", "cheer",
-    "bow", "point", "thumbsup", "talk", "laugh", "think", "shrug", "punch", "kick", "sit", "backflip", "jacks"];
+  // R3.11: GESTURE_ORDER and GESTURE_NAMES were both transcribed into this file, so
+  // "GESTURE_NAMES has entries for all gestures in GESTURE_ORDER" compared one local literal
+  // against another and could never see a real mismatch. Both now come from the source.
+  const GESTURE_ORDER = (() => {
+    const m = MULTI_SOURCE.match(/const GESTURE_ORDER\s*=\s*\[([\s\S]*?)\]/);
+    if (!m) throw new Error('GESTURE_ORDER not found in dc-multi.js — was it renamed?');
+    return (m[1].match(/["']([^"']+)["']/g) || []).map((x) => x.slice(1, -1));
+  })();
+  const GESTURE_NAMES_SRC = (() => {
+    const m = MULTI_SOURCE.match(/const GESTURE_NAMES\s*=\s*\{([\s\S]*?)\};/);
+    if (!m) throw new Error('GESTURE_NAMES not found in dc-multi.js — was it renamed?');
+    return m[1];
+  })();
 
-  it('GESTURE_ORDER contains expected gestures', () => {
-    expect(GESTURE_ORDER.length).toBe(21);
+  it('GESTURE_ORDER is populated and starts where the key bindings expect', () => {
+    expect(GESTURE_ORDER.length).toBeGreaterThan(10);
     expect(GESTURE_ORDER[0]).toBe('dance1');
-    expect(GESTURE_ORDER).toContain('wave');
-    expect(GESTURE_ORDER).toContain('clap');
-    expect(GESTURE_ORDER).toContain('salute');
+    for (const g of ['wave', 'clap', 'salute']) expect(GESTURE_ORDER).toContain(g);
   });
 
-  it('GESTURE_NAMES has entries for all gestures in GESTURE_ORDER', () => {
-    const GESTURE_NAMES = { dance1: "Samba", dance2: "Hip-Hop", dance3: "Breakdance", dance4: "Gangnam",
-      clap: "Clap", wave: "Wave", dying: "Dying", salute: "Salute", cheer: "Cheer", bow: "Bow", point: "Point",
-      thumbsup: "Thumbs Up", talk: "Talk", laugh: "Laugh", think: "Think", shrug: "Shrug", punch: "Punch",
-      kick: "Kick", sit: "Sit", backflip: "Backflip", jacks: "Jumping Jacks" };
-
+  it('GESTURE_NAMES has an entry for every gesture in GESTURE_ORDER', () => {
+    // A gesture bound to a key with no display name shows "undefined" in the HUD.
     for (const gesture of GESTURE_ORDER) {
-      expect(GESTURE_NAMES).toHaveProperty(gesture);
+      expect(new RegExp(`(^|[{,\\s])${gesture}\\s*:`).test(GESTURE_NAMES_SRC), gesture).toBe(true);
     }
   });
 
@@ -383,60 +502,29 @@ describe('dc-multi.js — gesture constants', () => {
 
 // ----------------------------------------------------------------
 // Tests: Camera wheel step and limits
+//
+// R3.11: this block used to contain TWO more hand-written onWheel re-implementations, each with
+// its own transcribed CAM_MIN / CAM_MAX / WHEEL_STEP, asserting against itself. They duplicated
+// what tests/js/dc-wheel-dolly.test.js was also doing with a third copy — three copies of the
+// same fiction and zero calls into dc-multi.js. The real handler is now executed, once, in
+// dc-wheel-dolly.test.js, which covers the dolly, the mode transitions and both limits.
+//
+// What is left here is the one thing that file does not check: that the wheel constants are
+// internally consistent with the camera range they clamp. Read from source, not transcribed.
 // ----------------------------------------------------------------
 describe('dc-multi.js — camera wheel constants', () => {
-  it('WHEEL_STEP = 5 follow-distance change per wheel notch', () => {
-    const WHEEL_STEP = 5;
-    expect(WHEEL_STEP).toBe(5);
+  const WHEEL_STEP = constant('WHEEL_STEP');
+
+  it('a wheel notch is a usable fraction of the camera range', () => {
+    // Too large and the dolly jumps between two positions; too small and it feels dead.
+    const range = CAM_MAX - CAM_MIN;
+    expect(WHEEL_STEP).toBeGreaterThan(0);
+    expect(WHEEL_STEP).toBeLessThan(range / 4);
   });
 
-  it('onWheel logic for first-person mode (pop to third-person on scroll out)', () => {
-    const CAM_MIN = 4.5, CAM_MAX = 62;
-    const WHEEL_STEP = 5;
-    let mode = 'first';
-    let camDist = 4.5;  // at CAM_MIN
-
-    // Scroll out in first-person mode should pop to third-person at CAM_MIN
-    const onWheel = (out) => {
-      if (mode === 'first') {
-        if (out) { camDist = CAM_MIN; mode = 'third'; }
-        return;
-      }
-      if (out) {
-        camDist = Math.min(CAM_MAX, camDist + WHEEL_STEP);
-      } else {
-        const nd = camDist - WHEEL_STEP;
-        if (nd < CAM_MIN) mode = 'first';
-        else camDist = nd;
-      }
-    };
-
-    // Scroll out from first-person
-    onWheel(true);
-    expect(mode).toBe('third');
-    expect(camDist).toBe(CAM_MIN);
-  });
-
-  it('onWheel zoom in third-person decreases camDist', () => {
-    const CAM_MIN = 4.5, CAM_MAX = 62;
-    const WHEEL_STEP = 5;
-    let mode = 'third';
-    let camDist = 20;
-
-    // Scroll in (negative deltaY)
-    const onWheelIn = () => {
-      const nd = camDist - WHEEL_STEP;
-      if (nd < CAM_MIN) mode = 'first';
-      else camDist = nd;
-    };
-
-    onWheelIn();
-    expect(camDist).toBe(15);
-    expect(mode).toBe('third');
-
-    // Scroll all the way in
-    for (let i = 0; i < 5; i++) onWheelIn();
-    expect(mode).toBe('first');  // crossed CAM_MIN threshold
+  it('the camera range is non-degenerate', () => {
+    expect(CAM_MIN).toBeGreaterThan(0);
+    expect(CAM_MAX).toBeGreaterThan(CAM_MIN);
   });
 });
 

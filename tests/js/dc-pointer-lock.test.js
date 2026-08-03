@@ -81,9 +81,9 @@ function compileHandler({ requestPointerLock = 'resolve', lockResult = 'undefine
 	const consoleStub = { warn: (...a) => calls.warns.push(a.map(String).join(' ')) };
 
 	// eslint-disable-next-line no-new-func
-	const fn = new Function('controls', 'renderer', 'document', 'console',
+	const fn = new Function('controls', 'renderer', 'document', 'console', 'noteUserInput',
 		'return function () ' + HANDLER_BODY + ';')(
-		controls, { domElement }, documentStub, consoleStub);
+		controls, { domElement }, documentStub, consoleStub, () => { calls.noteUserInput = (calls.noteUserInput || 0) + 1; });
 
 	return { fn, calls };
 }
@@ -183,10 +183,10 @@ describe('dc.js — pointer lock click handler', () => {
 
 	it('does nothing at all when there are no controls yet', async () => {
 		// eslint-disable-next-line no-new-func
-		const fn = new Function('controls', 'renderer', 'document', 'console',
+		const fn = new Function('controls', 'renderer', 'document', 'console', 'noteUserInput',
 			'return function () ' + HANDLER_BODY + ';')(
 			null, { domElement: { requestPointerLock: () => { throw new Error('must not be called'); } } },
-			{ body: { focus() {} } }, { warn: vi.fn() });
+			{ body: { focus() {} } }, { warn: vi.fn() }, () => {});
 		expect(() => fn()).not.toThrow();
 	});
 

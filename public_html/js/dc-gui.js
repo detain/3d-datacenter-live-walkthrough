@@ -62,6 +62,11 @@ function lilController(ctrl) {
         enable(v) { ctrl.enable(v); return w; },
         disable() { ctrl.disable(); return w; },
         label(n, val) { ctrl.$name.innerHTML = valMarkup(n, val); return w; },
+        // R3.7: re-read the bound object into the widget. Both GUIs cache the value at
+        // construction and only refresh on user interaction, so anything that changes an option
+        // programmatically — the auto-quality scaler dropping ambient occlusion, for one — leaves
+        // the widget showing the opposite of what is actually set.
+        updateDisplay() { ctrl.updateDisplay(); return w; },
     };
     return w;
 }
@@ -182,6 +187,13 @@ function inspectorController(object, property, editor, subItem, teardowns) {
         disable() { return w.enable(false); },
         label(n, val) {
             if (labelEl) labelEl.innerHTML = valMarkup(n, val);
+            return w;
+        },
+        // R3.7: the Inspector counterpart of lil-gui's updateDisplay(). writeWidget is the same
+        // path listen()'s poll uses, so a programmatic option change lands in the widget without
+        // having to install a permanent rAF poll on every controller that might change.
+        updateDisplay() {
+            if (editor) writeWidget(editor, object[property]);
             return w;
         },
     };

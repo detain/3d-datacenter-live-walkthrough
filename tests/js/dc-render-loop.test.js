@@ -156,15 +156,29 @@ describe('dc.js — animate() executes and drives DC.tick()', () => {
 // ----------------------------------------------------------------
 describe('dc.js — F-16 single canonical render loop', () => {
 
-  it('animate() does NOT own the idle-frame counter', () => {
+  // R3.3: the idle gate is no longer a frame counter — it is wall-clock time since the last real
+  // input. The contract these two guard is unchanged (tick() owns the gate, animate() does not
+  // touch it); only the mechanism moved. See tests/js/dc-idle-skip.test.js for the behaviour.
+
+  it('animate() does NOT own the idle gate', () => {
     const codeOnly = stripComments(getFunctionBody(DC_SOURCE, 'animate'));
-    expect(codeOnly).not.toMatch(/\+\+_tickSkippedFrames/);
-    expect(codeOnly).not.toMatch(/_tickSkippedFrames\s*=\s*[^=]/);
+    expect(codeOnly).not.toMatch(/_refreshIdleState/);
+    expect(codeOnly).not.toMatch(/_skipExpensiveUpdates\s*=/);
   });
 
-  it('tick() owns the _tickSkippedFrames idle-frame counter', () => {
-    expect(DC_SOURCE).toMatch(/\+\+_tickSkippedFrames/);
-    expect(DC_SOURCE).toMatch(/_skipExpensiveUpdates\s*=\s*true/);
+  it('tick() owns the idle gate', () => {
+    // tick is a property on the window.DC object literal, not a top-level declaration, so it is
+    // located by its `tick: function () {` head and walked to a balanced brace.
+    const start = DC_SOURCE.indexOf('tick: function () {');
+    expect(start, 'dc.js no longer declares a tick: property on window.DC').toBeGreaterThan(-1);
+    let depth = 0, end = start;
+    for (let i = DC_SOURCE.indexOf('{', start); i < DC_SOURCE.length; i++) {
+      if (DC_SOURCE[i] === '{') depth++;
+      else if (DC_SOURCE[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+    }
+    const codeOnly = stripComments(DC_SOURCE.slice(start, end + 1));
+    expect(codeOnly).toMatch(/_refreshIdleState\(now\)/);
+    expect(codeOnly).toMatch(/if\s*\(\s*_skipExpensiveUpdates\s*\)/);
   });
 
   it('animate() does NOT render directly — tick() owns rendering', () => {

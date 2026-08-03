@@ -40,6 +40,17 @@ let camera, scene, renderer, controls, controlObject, stats, inspector, gui, loc
 let caps = null; // Step 7.1: renderer capability descriptor
 let _postProcessing = null; // Step 7.4: TSL postprocessing pipeline (WebGPU AO via GTAONode)
 let _composer = null, _aoPass = null; // Step 7.3: EffectComposer + GTAOPass for ambient occlusion
+// R3.7: the auto-quality scaler drops AO first and restores it last. _aoSuspended distinguishes
+// "the scaler turned it off" from "the user never wanted it", so recovery gives AO back only to
+// someone who asked for it. _aoController is the GUI widget, so the checkbox follows.
+let _aoSuspended = false;
+let _aoController = null;
+// R3.7: the auto-quality scaler can be pinned off. Anyone comparing two renders — a benchmark, a
+// screenshot, the E2E suite — needs the settings to hold still; otherwise the scaler silently
+// rewrites the thing being measured mid-measurement. Ambient occlusion made this unavoidable
+// rather than merely nice: it is the first tier dropped, so on any machine below FPS_TARGET it is
+// switched off within a second of being switched on and can never be observed at all.
+let _autoQualityEnabled = true;
 let prevTime = performance.now();
 let objects = {instanced: [], network: null, rackLabels: [], labels: [], room: null, community: null}, models = { racks: {}, servers: {} }, locationNames = {};
 let sunCore = null, sunGlow = null;  // sun spheres (Fix #5 disposal)
@@ -53,10 +64,34 @@ let lodBuildings = [];  // per-neighbour state {id, foot, dx,dz, wall rect, door
 const _spatialGrid = {};
 const _gridCellSize = 50;  // units per grid cell
 
-// Idle-frame skip tracking: after 18000 idle frames (5 min at 60fps), skip expensive per-frame updates
-const _IDLE_FRAME_THRESHOLD = 18000;
-let _tickSkippedFrames = 0;
+// Idle skip: after five minutes with NO USER INPUT, stop doing the expensive per-frame work
+// (labels, highlight, blinds, the quality scaler) and just draw.
+//
+// This used to count FRAMES — 18000 of them — and reset only from setLodFocus(), which dc-multi.js
+// drives. On the dc.html path nothing called it, so nothing ever reset the counter: after 18000
+// frames the scene degraded regardless of whether the user was actively walking around, and never
+// came back. Wall-clock since the last real input is what "idle" means, so that is what it now
+// measures, and every input path calls noteUserInput().
+const _IDLE_MS = 300000;                    // 5 minutes, the same intent as 18000 frames at 60fps
+let _lastInputAt = 0;                       // performance.now() of the last user input; 0 = never
 let _skipExpensiveUpdates = false;
+
+/**
+ * Stamp "the user just did something". Called from every real input path — key down and up,
+ * pointer lock, canvas clicks, location switches — and by bench() so the FPS ring buffer keeps
+ * filling. It existed before this and was called from NOWHERE.
+ */
+function noteUserInput() {
+    _lastInputAt = performance.now();
+    _skipExpensiveUpdates = false;
+}
+
+/** Recompute the idle gate from input recency. Called once per frame from tick(). */
+function _refreshIdleState(now) {
+    // _lastInputAt starts at 0, so a page nobody has touched since load goes idle _IDLE_MS after
+    // the timer origin — which is what we want for a dashboard left on a wall.
+    _skipExpensiveUpdates = (now - _lastInputAt) > _IDLE_MS;
+}
 
 // IDEA-2: WebGL context loss state (set by context loss/restored event listeners in init())
 let _contextLost = false;
@@ -181,6 +216,12 @@ let _shadowMapSize = 2048; // internal shadow map size state (applied when shado
 // to this offset from each room's centre, so the light angle stays identical between buildings
 // while the shadow frustum still brackets whichever room you are standing in.
 const _SUN_OFFSET = { x: 60, y: 120, z: 40 };
+// R3.7: GTAO works in world units and defaults to a 0.25-unit sampling radius, which suits a scene
+// where a character is ~1.8 units tall. Here a rack is ~19 units and a 1U server ~1, so 0.25 samples
+// a sphere smaller than a single server and finds nothing to occlude against. Both node and classic
+// paths use these so the two backends produce a comparable image.
+const _AO_RADIUS = 1.0;      // world units — roughly one rack unit
+const _AO_THICKNESS = 4.0;   // view-space depth tolerance before a sample is treated as unrelated
 const UPGRADE_LOCKOUT_MS = 30000; // don't upgrade shadow map within 30s of a downgrade (oscillation guard)
 let _lastDowngradeAt = 0;         // timestamp of last shadow map or quality downgrade
 
@@ -461,13 +502,11 @@ function computeFreeU() {
 				occupiedU += server.size || 1;
 			}
 		}
-		// Switches also take U space
-		if (rack.switches) {
-			for (const switchId of Object.keys(rack.switches)) {
-				const sw = rack.switches[switchId];
-				occupiedU += sw.size || 1;
-			}
-		}
+		// Switches are DELIBERATELY not added. A switch is a row in `assets` and already
+		// appears in rack.servers above; the switchmanager query in datacenter.php joins the
+		// same asset row and emits it a SECOND time under rack.switches with its own
+		// start/size. Counting both charged every switch's U twice, inflating occupiedU and
+		// understating free capacity — the overlay showed racks as fuller than they are.
 		const freeU = Math.max(0, totalU - occupiedU);
 		result.set(rackId, freeU / totalU);
 	}
@@ -498,12 +537,12 @@ function applyOverlay() {
 	// Collect all rack InstancedMeshes
 	const rackMeshes = objects.instanced.filter((m) => m.userData.kind === 'rack');
 	for (const inst of rackMeshes) {
-		// Ensure instance color is enabled on this mesh
-		if (!inst.instanceColor) {
-			inst.instanceColor = new THREE.InstancedBufferAttribute(
-				new Float32Array(inst.count * 3), 3
-			);
-		}
+		// Do NOT hand-roll instanceColor. This used to allocate
+		// `new THREE.InstancedBufferAttribute(new Float32Array(count * 3), 3)`, and a Float32Array
+		// is ZERO-filled — RGB (0,0,0). Any instance the loop below did not write on a given pass
+		// therefore rendered BLACK rather than untinted. three.js's own setColorAt() allocates the
+		// attribute WHITE-filled on first use, which is the correct neutral, so letting it do the
+		// work removes the failure mode entirely.
 		const assetData = inst.userData.assetData; // array of rack objects, index = instanceId
 		for (let i = 0; i < inst.count; i++) {
 			const rack = assetData[i];
@@ -652,6 +691,7 @@ function _updateFPS(now) {
 }
 
 function _autoQualityScale(now) {
+    if (!_autoQualityEnabled) return;   // R3.7: pinned quality — see DC.setAutoQuality()
     if (_fpsCount < FPS_WINDOW) return; // not enough data yet
 
     // MAJOR-3: Iterate over the correct ring buffer slots (not the whole array)
@@ -676,13 +716,31 @@ function _autoQualityScale(now) {
 }
 
 function _reduceQuality() {
+    // Step 0 (R3.7): drop ambient occlusion first. It is a full extra screen-resolution pass over
+    // depth + normals with a denoise on top — comfortably the most expensive thing in the frame,
+    // and the first thing a human would switch off. The scaler had no AO tier at all, so a page
+    // struggling with AO on would grind its shadow map and pixel scale down to the floor while
+    // leaving the actual cost untouched.
+    //
+    // _aoSuspended remembers that the USER asked for AO, so _upgradeQuality can give it back.
+    // Without that distinction, restoring it would silently switch AO on for someone who never
+    // wanted it, every time the frame rate recovered.
+    if (aoActive()) {
+        _aoSuspended = true;
+        options.ambientOcclusion = false;
+        _syncGuiControllers();
+        _notifyQualityChange('ambientOcclusion', false, 'down');
+        _lastDowngradeAt = Date.now();
+        return;
+    }
+
     // Step 1: halve the shadow map size — Phase 6.3 (tried first, before pixelScale)
     if (S.shadowsEnabled && _shadowMapSize >= 1024) {
         _shadowMapSize = Math.max(512, _shadowMapSize / 2);
         S.shadowMapSize = _shadowMapSize;
         // Re-configure the active shadow lights with the new map size
         _applyShadowMapSize();
-        _notifyQualityChange('shadowMap', _shadowMapSize);
+        _notifyQualityChange('shadowMap', _shadowMapSize, 'down');
         _lastDowngradeAt = Date.now();
         return;
     }
@@ -691,22 +749,22 @@ function _reduceQuality() {
     if (S.pixelScale > 0.5) {
         S.pixelScale = Math.max(0.5, S.pixelScale - 0.25);
         if (renderer) {
-            renderer.setPixelRatio(Math.min(window.devicePixelRatio * S.pixelScale, 2));
+            applyPixelRatio();
         }
-        _notifyQualityChange('pixelScale', S.pixelScale);
+        _notifyQualityChange('pixelScale', S.pixelScale, 'down');
         return;
     }
 
     // Step 3: make LOD more aggressive (higher bias = objects switch to low-LOD sooner)
     S.lodBias = Math.min(S.lodBias + 0.5, 2);
-    _notifyQualityChange('lodBias', S.lodBias);
+    _notifyQualityChange('lodBias', S.lodBias, 'down');
 }
 
 function _upgradeQuality() {
     // Reverse Step 3: reduce LOD bias (make LOD less aggressive)
     if (S.lodBias > 0) {
         S.lodBias = Math.max(0, S.lodBias - 0.5);
-        _notifyQualityChange('lodBias', S.lodBias);
+        _notifyQualityChange('lodBias', S.lodBias, 'up');
         return;
     }
 
@@ -714,9 +772,9 @@ function _upgradeQuality() {
     if (S.pixelScale < 1.0) {
         S.pixelScale = Math.min(1.0, S.pixelScale + 0.25);
         if (renderer) {
-            renderer.setPixelRatio(Math.min(window.devicePixelRatio * S.pixelScale, 2));
+            applyPixelRatio();
         }
-        _notifyQualityChange('pixelScale', S.pixelScale);
+        _notifyQualityChange('pixelScale', S.pixelScale, 'up');
         return;
     }
 
@@ -728,8 +786,29 @@ function _upgradeQuality() {
         _shadowMapSize = Math.min(2048, _shadowMapSize * 2);
         S.shadowMapSize = _shadowMapSize;
         _applyShadowMapSize();
-        _notifyQualityChange('shadowMap', _shadowMapSize);
+        _notifyQualityChange('shadowMap', _shadowMapSize, 'up');
         return;
+    }
+
+    // Reverse Step 0 (R3.7): give AO back last, and only to someone who asked for it. It is the
+    // most expensive tier, so it is the first dropped and the last restored — and the lockout that
+    // guards the shadow map guards this too, or a scene sitting exactly at FPS_TARGET would
+    // oscillate AO on and off every upgrade cooldown.
+    if (_aoSuspended) {
+        if (Date.now() - _lastDowngradeAt < UPGRADE_LOCKOUT_MS) return;
+        _aoSuspended = false;
+        options.ambientOcclusion = true;
+        _syncGuiControllers();
+        _notifyQualityChange('ambientOcclusion', true, 'up');
+    }
+}
+
+// Push a programmatic options change back into the AO widget. Both GUI backends read the bound
+// object once at construction, so a scaler that writes options.ambientOcclusion leaves the
+// checkbox showing the opposite of the truth until the user clicks something.
+function _syncGuiControllers() {
+    if (_aoController && typeof _aoController.updateDisplay === 'function') {
+        _aoController.updateDisplay();
     }
 }
 
@@ -752,10 +831,48 @@ function _applyShadowMapSize() {
     });
 }
 
-function _notifyQualityChange(setting, value) {
-    console.info(`[dc] quality ${setting} \u2192 ${typeof value === 'number' ? value.toFixed(2) : value}`);
-    // Only DOM toast for pixelScale at the floor (value > 0.5 means not yet at minimum 0.5)
-    if (setting === 'pixelScale' && value > 0.5) {
+// direction is 'down' (a forced quality reduction) or 'up' (recovery). It decides whether the
+// user sees a toast at all: telling someone their quality was "auto-reduced" while it is being
+// restored is worse than saying nothing.
+/**
+ * The ONE place that computes and applies the renderer's pixel ratio.
+ *
+ * There used to be five call sites across two files with TWO different formulas. dc.js used
+ * `Math.min(devicePixelRatio * pixelScale, 2)` — clamping the PRODUCT — which silently discards
+ * pixelScale entirely on any display where devicePixelRatio >= 2 / pixelScale: a 3x phone at
+ * scale 0.8 got 2.0, i.e. no reduction at all, precisely when the reduction matters most.
+ * dc-multi.js used `Math.min(devicePixelRatio, 2) * pixelScale`, which is the correct order: cap
+ * the device ratio for memory, THEN apply the user's quality scale. That one wins.
+ */
+function applyPixelRatio() {
+    if (!renderer) return;
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2) * S.pixelScale);
+    // R3.7: the pixel ratio scales the drawing buffer, so the post-processing targets have to
+    // follow it. Without this the quality scaler could drop pixelScale to 0.5 and AO would keep
+    // rendering at full resolution — the one place where it costs the most and helps the least.
+    resizePostFX();
+}
+
+/**
+ * Set the quality scale and apply it. Returns the clamped value so callers can mirror it without
+ * re-implementing the clamp.
+ */
+function setPixelScale(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return S.pixelScale;
+    S.pixelScale = Math.min(Math.max(n, 0.5), 1.0);   // slider range
+    applyPixelRatio();
+    return S.pixelScale;
+}
+
+function _notifyQualityChange(setting, value, direction) {
+    console.info(`[dc] quality ${direction === 'up' ? '\u2191' : '\u2193'} ${setting} \u2192 ${typeof value === 'number' ? value.toFixed(2) : value}`);
+    // Toast once, at the FLOOR — the point where the scaler has nothing left to give and the
+    // user needs to know why the page looks soft. The condition used to be `value > 0.5`, which
+    // is the exact inverse: it fired on the 1.0 -> 0.75 step (a barely visible change) and went
+    // silent at 0.5, the actual floor, under a comment claiming it fired "at the floor". It also
+    // fired on UPGRADES, so recovering to 0.75 announced "Auto-reduced quality".
+    if (direction === 'down' && setting === 'pixelScale' && value <= 0.5) {
         const notification = document.createElement('div');
         notification.style.cssText =
             'position:fixed;bottom:20px;right:20px;background:#ff9800;color:#000;' +
@@ -926,11 +1043,13 @@ function displayGui() {
     displayFolder.add(options, 'useFirstPerson').onChange( () => { setupControls(); });
     displayFolder.add(options, 'shadows').name('shadows').onChange((v) => { setShadowsEnabled(v); });
     displayFolder.add(options, 'shadowQuality', ['Low', 'Medium', 'High']).name('shadow quality').onChange((v) => { setShadowMapSize(v); });
-    // Step 7.3: ambient occlusion toggle — only shown when EffectComposer is available (WebGL path;
-    // the WebGPU path uses TSL GTAONode instead, handled by _setupWebgpuPostFX)
-    if (caps.supportsEffectComposer) {
-        displayFolder.add(options, 'ambientOcclusion').name('ambient occlusion');
-    }
+    // Step 7.3 / R3.7: ambient occlusion toggle. Gated on supportsEffectComposer, it was hidden on
+    // the node path — where AO now genuinely works via TSL — and shown on the classic path even
+    // when the composer import had failed, so the checkbox could be present and do nothing. Both
+    // paths implement AO, so offer it on both; the frame-time cost is the reason it defaults off.
+    // The controller is kept so the auto-quality scaler can push its own changes back into it.
+    _aoController = displayFolder.add(options, 'ambientOcclusion').name('ambient occlusion')
+        .onChange(() => { _aoSuspended = false; });   // a manual toggle overrides the scaler
     // Step 9.7: capacity overlay dropdown — tint racks by free U slot ratio (red=full, amber=half, green=empty)
     displayFolder.add(options, 'overlay', { 'None': 'none', 'Free U': 'freeU' }).name('capacity overlay').onChange(() => { applyOverlay(); });
     const moveFolder = gui.addFolder( 'Movement' );
@@ -1010,6 +1129,7 @@ function locationPlaced(locId) {
 }
 
 function switchLocation() {
+    noteUserInput();   // Step 4.3: switching buildings is deliberate activity
     const el = document.getElementById('dcLocations');
     if (el) el.querySelectorAll('button').forEach((b) => b.classList.toggle('active', Number(b.dataset.loc) === Number(options.location)));
     // Fly out of the current building and down into the new one (data is already loaded up front).
@@ -1242,8 +1362,7 @@ function clearScene() {
         stats.dom.parentNode.removeChild(stats.dom);
     }
     // Reset idle skip state (Bug #2: clearScene must not leave stale skip mode from a previous scene)
-    _tickSkippedFrames = 0;
-    _skipExpensiveUpdates = false;
+    noteUserInput();
     // Step 9.5: Clear isolate render pass state
     clearIsolate();
     // NOTE: do NOT detachKeyHandlers() here. attachKeyHandlers() is already idempotent (guarded by
@@ -3924,6 +4043,7 @@ function setupInteraction() {
     if (renderer && renderer.domElement) {
         // Click to start walking (pointer lock); while walking, a click selects what you're looking at.
         renderer.domElement.addEventListener('click', () => {
+            noteUserInput();   // Step 4.3
             if (controls && !options.useFirstPerson && controls.isLocked === false) controls.lock();
             else if (hovered) showInfo(hovered);
         });
@@ -4221,7 +4341,7 @@ async function init() {
         renderer.domElement.addEventListener('webglcontextrestored', () => {
             console.warn('WebGL context restored - rebuilding scene');
             _contextLost = false;
-            renderer.setPixelRatio(Math.min(window.devicePixelRatio * S.pixelScale, 2));
+            applyPixelRatio();
             renderer.setSize(window.innerWidth, window.innerHeight);
             clearScene();
             displayDatacenter();
@@ -4278,6 +4398,7 @@ async function init() {
             // Pointer lock needs a focused document. Browser extensions can hold focus in their own
             // frame, which makes requestPointerLock reject with "The document is not focused" — try
             // to take focus back first, then proceed either way.
+            noteUserInput();   // Step 4.3
             try { document.body.focus(); } catch (e) { /* body may not be focusable; harmless */ }
             // Fall back to the plain PointerLockControls path. Its lock() returns a Promise in
             // newer three.js and undefined in older builds, so guard before attaching .catch.
@@ -4391,7 +4512,7 @@ function animate() {
     updateDisco();
 
     // Delegate to DC.tick() — the single canonical render path shared by dc.html and dc-multi.js.
-    // tick owns _tickSkippedFrames / _skipExpensiveUpdates so both the animate→tick chain
+    // tick owns the idle gate (_skipExpensiveUpdates) so both the animate→tick chain
     // (dc.html) and the direct DC.tick() call (dc-multi via DC.setAnimationLoop) reach the same
     // idle-skip behaviour at the same frame count — no double-increment.
     // It lives on the window.DC object literal, NOT in module scope: a bare tick() call throws
@@ -4439,11 +4560,19 @@ function updateControls(time) {
 
 // Event handler for keydown
 function onKeyDown(event) {
-    // Don't capture keys when typing in an input, textarea, or contenteditable element
+    // Don't capture keys when the user is typing into, or operating, a form control.
+    // SELECT belongs here: an open <select> is driven with the arrow keys, and without this the
+    // same press both moved the highlighted option and walked the player across the room.
+    // `event.target` is guarded because a synthetic event (dispatched by a test, an extension or
+    // an accessibility tool) can arrive with no target at all, and `target.tagName` then throws
+    // out of the handler — taking every subsequent key binding in this switch with it.
     const target = event.target;
-    if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) {
+    if (!target) return;
+    if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA'
+        || target.tagName === 'SELECT' || target.isContentEditable) {
         return;
     }
+    noteUserInput();   // Step 4.3: a keypress is the definition of "not idle"
     switch (event.code) {
         case "ArrowUp":
         case "KeyW":
@@ -4488,7 +4617,13 @@ function onKeyDown(event) {
 }
 
 // Event handler for keyup
+// Deliberately NO form-control guard here, unlike onKeyDown. The asymmetry is the point: hold W
+// to walk, click into the search box mid-stride, release W — with a guard, the keyup is swallowed
+// and options.moveForward stays true, so the player walks into a wall forever with no key held.
+// Releasing a movement key must always clear it, wherever focus has gone. Do not "fix" this to
+// match onKeyDown.
 function onKeyUp(event) {
+    noteUserInput();
     switch (event.code) {
         case "ArrowUp":
         case "KeyW":
@@ -4515,7 +4650,19 @@ function onWindowResize() {
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
     // Also re-apply pixel ratio cap in case devicePixelRatio changed (e.g., moving between displays)
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio * S.pixelScale, 2));
+    applyPixelRatio();
+    resizePostFX();
+}
+
+// R3.7: neither post-processing path was resized. renderer.setSize() does not reach the render
+// targets a composer or a TSL pass owns, so after any window resize AO kept rendering at the
+// startup resolution and the composite came out stretched or clipped — on the WebGL path the
+// composer's own target, on the node path the pass's MRT. Called from onWindowResize() and from
+// applyPixelRatio(), because changing the pixel ratio changes the drawing-buffer size too.
+function resizePostFX() {
+    const w = window.innerWidth, h = window.innerHeight;
+    if (_composer) _composer.setSize(w, h);
+    if (_postProcessing && _postProcessing.scenePass) _postProcessing.scenePass.setSize(w, h);
 }
 
 // Draw calls for the frame just rendered. The node renderer redefined info.render.calls as the
@@ -4562,19 +4709,85 @@ function _fitShadowCamera() {
     cam.updateProjectionMatrix();
 }
 
-// --- Step 7.4: WebGPU TSL postprocessing setup (GTAONode ambient occlusion) ---
-// NOTE: WebGPU AO via TSL requires three.js r185+ with TSL support enabled. If GTAONode
-// is not available, _postProcessing stays null and the WebGPU path falls back to plain render.
+// R3.7: is ambient occlusion actually going to be applied to the next frame?
+//
+// Three things have to line up: the user asked for it, a pipeline finished building (both setups
+// are async and either can fail to a null), and the pipeline that built is the one for this
+// backend. Anything that reports on AO — the render branch, bench(), the quality scaler — asks
+// this rather than re-deriving it, because bench() previously hardcoded `ao: false` and every
+// benchmark run claimed AO was off while the composer was rendering.
+function aoActive() {
+    if (!options.ambientOcclusion) return false;
+    return !!(_composer || (_postProcessing && _postProcessing.post));
+}
+
+// The single place a frame is painted. Both the idle fast path and the normal path call this, so
+// they cannot drift: before R3.7 the idle branch knew about the WebGL composer but not the node
+// pipeline, which meant AO switched itself off after five idle minutes on the WebGPU path only.
+function drawFrame() {
+    if (options.ambientOcclusion) {
+        if (_composer) { _composer.render(); return; }
+        if (_postProcessing && _postProcessing.post) { _postProcessing.post.render(); return; }
+    }
+    renderer.render(scene, camera);
+}
+
+// --- Step 7.4: node-renderer TSL postprocessing (GTAONode ambient occlusion) ---
+//
+// R3.7: this used to import the `ao` TSL function, store `{ ao, ready: true }`, and log that the
+// pipeline was "initialized". There was no PostProcessing instance, no pass(), no outputNode and
+// no resize handling — nothing that could put a pixel on screen. The render branch that consumed
+// it was byte-identical to the plain `else`, so even on the path where it "initialized" the frame
+// was a plain renderer.render(). Below is the real graph.
+//
+// The chain, which is the standard three.js GTAO recipe:
+//   pass(scene, camera) renders the scene once into an MRT with two attachments — the shaded
+//   colour, and view-space normals. GTAO needs normals and depth, and taking them off the same
+//   pass is what makes it one geometry pass rather than two. ao() consumes depth + normals and
+//   produces an occlusion factor; multiplying that into the colour is the composite.
+//
+// This runs on BOTH node backends. The WebGL2 fallback (?renderer=webgpu-gl) compiles the same
+// node graph to GLSL, so it is exercised in CI under SwiftShader where real WebGPU is absent.
 async function _setupWebgpuPostFX() {
     try {
-        // Dynamic import to avoid loading TSL modules on non-WebGPU paths
+        // r185 renamed PostProcessing to RenderPipeline and left a deprecation shim behind. Prefer
+        // the new name — asking for the old one logs a rename warning on every load — but keep the
+        // fallback so the page still works against an older three.js in public_html/lib.
+        const webgpu = await import('three/webgpu');
+        const Pipeline = webgpu.RenderPipeline || webgpu.PostProcessing;
+        const { pass, mrt, output, normalView, vec3, vec4 } = await import('three/tsl');
         const { ao } = await import('three/addons/tsl/display/GTAONode.js');
-        // _postProcessing will hold the TSL pipeline state; currently only the `ao` function
-        // is imported. Full integration with RenderPipeline would go here.
-        _postProcessing = { ao, ready: true };
-        console.info('[dc] WebGPU TSL postprocessing (GTAONode) initialized');
+
+        const scenePass = pass(scene, camera);
+        // Ask the pass for normals alongside colour. Without this getTextureNode('normal') has
+        // nothing to return and ao() silently occludes against garbage.
+        scenePass.setMRT(mrt({ output: output, normal: normalView }));
+
+        const colorNode  = scenePass.getTextureNode('output');
+        const depthNode  = scenePass.getTextureNode('depth');
+        const normalNode = scenePass.getTextureNode('normal');
+
+        const aoNode = ao(depthNode, normalNode, camera);
+        // Scene scale is metres-per-rack-unit here, not the 1-unit-per-metre GTAO assumes: a rack
+        // is ~19 units tall. Left at the default radius the effect samples a sphere smaller than a
+        // single 1U server and produces nothing visible.
+        aoNode.radius.value = _AO_RADIUS;
+        aoNode.thickness.value = _AO_THICKNESS;
+
+        const post = new Pipeline(renderer);
+        // GTAONode's output target is RedFormat: the occlusion factor is in .r and .g/.b are ZERO.
+        // Multiplying the colour by the whole texel — which is the obvious thing to write, and what
+        // an earlier draft of this did — zeroes green and blue and renders the scene dark red. The
+        // factor is a scalar, so broadcast .r across all three channels and leave alpha at 1. This
+        // is the usage GTAONode's own doc block shows.
+        post.outputNode = colorNode.mul(vec4(vec3(aoNode.getTextureNode().r), 1));
+
+        // Both are needed at render time: `post` to draw, `scenePass` to resize. PostProcessing
+        // does not forward setSize to the passes it wraps.
+        _postProcessing = { post: post, scenePass: scenePass, aoNode: aoNode, ready: true };
+        console.info('[dc] node-renderer TSL postprocessing (GTAONode) initialized');
     } catch (err) {
-        console.warn('[dc] WebGPU TSL postprocessing not available:', err && err.message);
+        console.warn('[dc] node-renderer TSL postprocessing not available:', err && err.message);
         _postProcessing = null;
     }
 }
@@ -4593,7 +4806,11 @@ async function _setupWebglPostFX() {
 
         _composer = new EffectComposer(renderer);
         _composer.addPass(new RenderPass(scene, camera));
-        _aoPass = new GTAOPass(scene, camera, renderer);
+        // R3.7: the third argument is WIDTH, not the renderer — `new GTAOPass(scene, camera,
+        // renderer)` put an object where a number goes and left height at its 512 default. It only
+        // looked fine because addPass() immediately calls setSize() and overwrote both. Passing
+        // the real size means the pass is correct before anything rescues it.
+        _aoPass = new GTAOPass(scene, camera, window.innerWidth, window.innerHeight);
         _composer.addPass(_aoPass);
         _composer.addPass(new OutputPass());
         console.info('[dc] WebGL EffectComposer (GTAOPass) ambient occlusion initialized');
@@ -4675,10 +4892,10 @@ async function bench(seconds = 10) {
             const until = performance.now() + perView;
             while (performance.now() < until) {
                 await new Promise((r) => setTimeout(r, 250));
-                // A page parked for _IDLE_FRAME_THRESHOLD frames has already switched _updateFPS()
+                // A page parked past _IDLE_MS has already switched _updateFPS()
                 // off, which leaves the window frozen at whatever it read minutes ago. noteUserInput()
                 // resets the idle gate so the FPS ring buffer keeps filling during the measurement.
-                if (window.DC.noteUserInput) window.DC.noteUserInput(); else { _tickSkippedFrames = 0; _skipExpensiveUpdates = false; }
+                noteUserInput();
                 const fps = window.DC.quality._fps;   // rolling FPS_WINDOW average; null while filling
                 if (fps) samples.push(fps);
                 drawCalls = Math.max(drawCalls, _drawCalls());
@@ -4709,7 +4926,11 @@ async function bench(seconds = 10) {
         seconds: (perView * IDLE_VIEWS.length) / 1000,
         samples: samples.length,
         // --- comparable renderer state ---
-        ao: false,                          // not yet implemented in this scene
+        // R3.7: was hardcoded `false` with a comment saying AO was "not yet implemented", which
+        // Step 7.3 had already made untrue. Every bench result reported ao:false while the
+        // composer was rendering — the field exists to make two runs comparable, and it was the
+        // one field guaranteed to be wrong. aoActive() is the same predicate drawFrame() uses.
+        ao: aoActive(),
         shadows: S.shadowsEnabled,
         shadowMapSize: _shadowMapSize,
         pixelScale: S.pixelScale,
@@ -4739,13 +4960,12 @@ window.DC = {
         if (document.hidden) return;
         const now = performance.now();
 
-        // Idle skip: after _IDLE_FRAME_THRESHOLD idle frames, gate expensive per-frame updates; reset on player movement (via setLodFocus)
+        // Idle skip: gate the expensive per-frame work once the user has been inactive for
+        // _IDLE_MS. Recomputed from the clock every frame, so it un-gates the moment input
+        // arrives rather than waiting for a counter to be reset by a caller that may not exist.
+        _refreshIdleState(now);
         if (_skipExpensiveUpdates) {
-            if (options.ambientOcclusion && _composer) {
-                _composer.render();  // Step 7.3: WebGL AO via EffectComposer
-            } else {
-                renderer.render(scene, camera);
-            }
+            drawFrame();
             if (stats) stats.update();
             return _drawCalls();
         }
@@ -4773,22 +4993,8 @@ window.DC = {
         // animate() had drawn, while the camera, player, doors and location switches all kept
         // updating invisibly. Keep this here.
         //
-        // Step 7.4: 3-way render branch:
-        // - options.ambientOcclusion && _composer: WebGL AO via EffectComposer (GTAOPass)
-        // - caps.supportsTSL && _postProcessing: WebGPU TSL path with GTAONode (future enhancement)
-        // - else: plain renderer.render()
-        if (options.ambientOcclusion && _composer) {
-            // Step 7.3: WebGL AO via EffectComposer (RenderPass → GTAOPass → OutputPass)
-            _composer.render();
-        } else if (caps.supportsTSL && _postProcessing) {
-            // WebGPU TSL path with GTAONode ambient occlusion
-            // _postProcessing.ao would be called here when full RenderPipeline integration exists
-            renderer.render(scene, camera);
-        } else {
-            renderer.render(scene, camera);
-        }
+        drawFrame();
         if (stats) stats.update();
-        if (++_tickSkippedFrames > _IDLE_FRAME_THRESHOLD) _skipExpensiveUpdates = true;
         return _drawCalls();
     },
     pick: function () { return raycastInstances(_centerNdc); },
@@ -4816,12 +5022,7 @@ window.DC = {
     },
     bench: bench,   // await DC.bench(seconds) — renderer A/B/C harness, see docs/dc_renderer_modes.md
     // --- Step 7.6: idle reset for benchmarking ---
-    noteUserInput: function () {
-        // Resets the idle-skip gate so the FPS ring buffer keeps filling during bench().
-        // Unlike setLodFocus, this is unconditional — any user activity should reset idle.
-        _tickSkippedFrames = 0;
-        _skipExpensiveUpdates = false;
-    },
+    noteUserInput: noteUserInput,
     // --- Step 6.2 shadow controls (exposed for testing) ---
     setShadowsEnabled: setShadowsEnabled,
     setShadowMapSize: setShadowMapSize,
@@ -4832,6 +5033,36 @@ window.DC = {
     traceCable: traceCable,
     clearTrace: clearTrace,
     traceCableForAsset: traceCableForAsset,
+    // Step 9.7: capacity overlay. Step 9.7's own instructions called for exposing this and it was
+    // not — so the only way to refresh the tint was to toggle the GUI dropdown, and there was no
+    // way to drive it from a test or the console at all.
+    applyOverlay: applyOverlay,
+    computeFreeU: computeFreeU,
+    // Step 4.2: the single owner of the renderer's pixel ratio. dc-multi.js delegates here rather
+    // than keeping its own copy — its `S` is a DIFFERENT object from this file's, so a local copy
+    // left dc.js's S.pixelScale at 1.0 and the next window resize restored full resolution.
+    setPixelScale: setPixelScale,
+    applyPixelRatio: applyPixelRatio,
+    // R3.7 — ambient occlusion.
+    //
+    // setAutoQuality(false) pins every quality knob where it is. Anyone comparing two frames needs
+    // that: the scaler drops AO on its first downgrade, so on a machine below FPS_TARGET — which
+    // includes every headless CI runner — AO is switched off within a second of being switched on.
+    // Returns the resulting state so a caller can confirm it took.
+    setAutoQuality: function (v) { _autoQualityEnabled = v !== false; return _autoQualityEnabled; },
+    get autoQuality() { return _autoQualityEnabled; },
+    // What the AO pipeline actually is, as opposed to what was requested. `mode` says which of the
+    // two implementations built ('webgl' = EffectComposer/GTAOPass, 'node' = TSL GTAONode, 'none' =
+    // neither, because the dynamic import failed); `active` is the same predicate the render path
+    // and bench() use, so the three can never disagree about whether AO is on.
+    postFX: function () {
+        return {
+            mode: _composer ? 'webgl' : (_postProcessing && _postProcessing.post ? 'node' : 'none'),
+            requested: !!options.ambientOcclusion,
+            active: aoActive(),
+            suspendedByScaler: _aoSuspended,
+        };
+    },
     // --- multi-building LOD + walk-between handles (used by dc-multi.js; inert for dc.html) ---
     collideWorld: collideWorld,                 // walls + current racks + neighbours' active interiors
     get buildings() { return dcBuildings; },    // wall/door rects for every building (current + neighbours)
@@ -4841,8 +5072,7 @@ window.DC = {
         // Only reset idle skip when position actually changes — prevents setLodFocus (called every
         // frame from dc-multi.js) from suppressing the idle-skip before it can trigger (F-17)
         if (moved) {
-            _tickSkippedFrames = 0;
-            _skipExpensiveUpdates = false;
+            noteUserInput();
         }
     },
     setAnimationLoop: function (cb) {

@@ -41,8 +41,14 @@ Constraints worth knowing before editing that block:
 
 `dc.js` keeps its single `import * as THREE from "three"`. Both builds export every symbol the
 scene uses; the only structural branch in the whole codebase is at renderer construction
-(`dc.js`, `isNode = !!THREE.WebGPURenderer`). The scene has no `ShaderMaterial`, no
-`onBeforeCompile`, and no `EffectComposer`, which is why no shader had to be ported to TSL.
+(`dc.js`, `isNode = !!THREE.WebGPURenderer`). The scene's *materials* are all stock — no
+`ShaderMaterial`, no `onBeforeCompile` — which is why no shader had to be ported to TSL.
+
+Post-processing is the one place where the two architectures genuinely diverge, because
+`EffectComposer` is a WebGL-only addon and the node renderer has no equivalent for it. Ambient
+occlusion is therefore implemented twice, and `dc.js` picks by capability rather than by backend
+name — see **Ambient occlusion** below. (An earlier version of this document said the scene had
+"no `EffectComposer`". That stopped being true at `dc.js`'s `_setupWebglPostFX()`.)
 
 ## How fallback works, and what the UI reports
 
@@ -74,6 +80,83 @@ no `?renderer=` always lands back on the default renderer.
 `body.dc-has-inspector` shifts `#dcPlayer` / `#dcPresence` / `#dcWsToggle` clear of the
 Inspector's fixed `#profiler-toggle`; the class is only added when the Inspector really
 attached, so the default page never sees the rule.
+
+## Ambient occlusion
+
+AO is implemented **twice**, because `EffectComposer` is a WebGL-only addon and the node renderer
+has no equivalent for it. The toggle is in the GUI's Display folder on both paths and defaults to
+off — it is the most expensive thing in the frame.
+
+| | classic path | node path |
+|---|---|---|
+| setup | `_setupWebglPostFX()` | `_setupWebgpuPostFX()` |
+| chain | `RenderPass` → `GTAOPass` → `OutputPass` in an `EffectComposer` | `pass(scene, camera)` with an MRT of `{output, normal: normalView}`, into `ao(depth, normal, camera)`, composited by a `RenderPipeline` |
+| gate | `caps.supportsEffectComposer` | `caps.supportsTSL` |
+
+The gate is a **capability**, not a backend string. Both node backends compile TSL — the WebGL 2
+fallback emits GLSL from the same node graph — so `?renderer=webgpu-gl` and a `?renderer=webgpu`
+run that fell back both take the node path. `caps.backend` is `'webgpu'`, `'webgl2-fallback'` or
+`'webgl'`; it never spells a class name. See `public_html/js/dc-caps.js`.
+
+Three things about the node graph are easy to get wrong and were:
+
+- **The MRT normal attachment is required.** GTAO needs depth *and* normals; taking both off the
+  same pass is what makes it one geometry pass rather than two. Without `setMRT`,
+  `getTextureNode('normal')` has nothing to return and the effect occludes against garbage.
+- **GTAONode's output target is `RedFormat`.** The occlusion factor is in `.r`; `.g` and `.b` are
+  zero. Multiplying the scene colour by the whole texel — the obvious thing to write — zeroes green
+  and blue and renders the scene dark red. Broadcast the scalar:
+  `colorNode.mul(vec4(vec3(aoNode.getTextureNode().r), 1))`.
+- **The sampling radius is in world units.** GTAO defaults to `0.25`, which suits a scene where a
+  character is ~1.8 units tall. Here a rack is ~19 units and a 1U server ~1, so the default samples
+  a sphere smaller than one server and finds nothing. `_AO_RADIUS` / `_AO_THICKNESS` in `dc.js` set
+  it for this scene's scale, and both paths use the same values so the two backends are comparable.
+
+`DC.postFX()` reports which implementation built and whether AO is really being applied:
+
+```js
+DC.postFX()   // { mode: 'webgl'|'node'|'none', requested, active, suspendedByScaler }
+```
+
+`mode: 'none'` means the dynamic import failed and the toggle does nothing. `active` is the same
+`aoActive()` predicate the render path and `bench()` use, so those three can never disagree.
+
+Both paths are pixel-verified in CI — `tests/playwright/dc.spec.ts` Group 13 renders the same
+frozen camera with AO off and on and asserts the mean luminance falls, on both backends.
+
+## Known performance characteristics
+
+Required by remediation step 7.5. Costs are architectural, not measurements — the only numbers we
+have are from a software rasteriser (see *Baseline measurements*), so treat these as what to expect
+and what to watch, not as figures to quote.
+
+| Feature | Cost | Notes |
+|---|---|---|
+| Ambient occlusion | **Highest.** A full screen-resolution pass over depth and normals, plus a denoise | First tier the auto-quality scaler drops. On the node path it also forces the scene through an MRT, so the geometry pass writes two attachments instead of one |
+| Shadows | One extra depth pass over every caster, per frame | `applyShadowPolicy(root, 'cable')` keeps cable bundles out of it — a 3 cm bundle casts nothing readable and would cost a shadow-map draw per merged run. See `docs/dc_shadows.md` |
+| Shadow map size | Quadratic in the dimension: 2048 is 16× the fill of 512 | Second tier dropped. Changing it reallocates the map, hence the 30 s oscillation lockout |
+| Pixel scale | Quadratic in the multiplier | Third tier. `dc-multi.js` already starts at 0.8 |
+| LOD bias | Cheap to change, large effect on neighbour buildings | Last tier |
+| Neighbour buildings | Two extra shells plus block proxies — the draw-call rise from 108 to 168 in the CI fixture | Not a regression; see *Baseline measurements* |
+
+### The auto-quality scaler
+
+`_autoQualityScale()` averages a 60-frame ring buffer and acts when it crosses `FPS_TARGET` /
+`FPS_RECOVERY`, with separate debounces for each direction. Downgrades run in cost order and
+upgrades run in reverse, so the cheapest thing to lose goes first and comes back last:
+
+```
+ambientOcclusion → shadowMapSize → pixelScale → lodBias
+```
+
+Ambient occlusion is the one tier that is a **user opt-in** rather than something the scaler owns,
+so `_aoSuspended` records that the scaler — not the user — switched it off. Recovery gives AO back
+only to someone who asked for it, and a manual toggle clears the flag so the user's choice wins.
+
+`DC.setAutoQuality(false)` pins every tier where it is. Benchmarks, screenshots and the E2E suite
+all need that: without it the scaler rewrites the thing being measured mid-measurement, and on any
+machine below `FPS_TARGET` — which includes every headless CI runner — AO is switched off within a
+second of being switched on and can never be observed at all.
 
 ## Payload cost
 
@@ -145,10 +228,11 @@ Read the fields carefully:
   auto-quality scaler drops it further under load — two runs at different `dpr` are not
   comparable, so check it before comparing FPS.
 - `drawCalls` is the worst (highest) per-frame count seen over the run.
-- `ao` is **hardcoded** `false`. This is a known defect, not a description: Step 7.3 added a
-  real `EffectComposer` + `GTAOPass` chain on the WebGL path, so a bench run with ambient
-  occlusion enabled still reports `ao: false` and two runs that differ in AO look comparable
-  when they are not. Tracked as `dc_remediation_plan.md` step R3.7.
+- `ao` reports whether ambient occlusion was actually applied — the same `aoActive()` predicate
+  the render path uses, so the bench result and the frame can never disagree. (It was hardcoded
+  `false` until R3.7, under a comment claiming AO was "not yet implemented", so every run
+  reported AO off while the composer was rendering. Two runs that differed in AO looked
+  comparable and were not.)
 - `shadows` is `true` when shadow rendering is active.
 - `shadowMapSize` is the shadow map resolution in pixels (typically 512, 1024, or 2048).
 - `pixelScale` is the quality scale multiplier applied to the renderer pixel ratio
@@ -199,9 +283,9 @@ while shadows rendered. The reported value now matches `renderer.shadowMap.enabl
   SwiftShader is a software rasteriser and its frame cadence says nothing about a real GPU.
   The CI guard therefore asserts draw calls and triangles only. Do not add an FPS assertion
   until the numbers come from real hardware.
-- **`ao: false` is still a defect, not a setting.** `bench()` hardcodes it
-  (`dc_remediation_plan.md` step R3.7), so it reports `false` whether or not the AO composer is
-  running. `shadows` was the same until R2.3 and now reports the truth.
+- **`ao: false` here is a setting, not a defect.** Ambient occlusion defaults to off, and these
+  runs did not turn it on. It was a hardcoded lie until R3.7; `bench()` now calls the same
+  `aoActive()` predicate the renderer does. `shadows` was the same until R2.3.
 - **Shadows are enabled here but nothing casts.** With no rack or server models loaded, the only
   meshes present are the room shell, which receives shadows and does not cast. The shadow depth
   pass runs and costs draw calls; the visual result in this fixture is nothing. Shadow *casting*

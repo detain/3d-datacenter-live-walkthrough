@@ -42,7 +42,11 @@
 	<link rel="modulepreload" href="/lib/three/examples/jsm/environments/RoomEnvironment.js">
 	<link rel="modulepreload" href="/lib/three/examples/jsm/libs/meshopt_decoder.module.js">
 	<link rel="modulepreload" href="/lib/three/examples/jsm/libs/stats.module.js">
-	<!-- Step 7.3: postprocessing modules for ambient occlusion (GTAOPass chain) -->
+	<!-- Step 7.3: postprocessing modules for ambient occlusion (GTAOPass chain).
+	     R3.7: EffectComposer.js was missing from this list — the one module the other three are
+	     useless without, and the first one dc.js imports. Preloading the passes but not the
+	     composer meant the composer was still a cold round-trip when AO was switched on. -->
+	<link rel="modulepreload" href="/lib/three/examples/jsm/postprocessing/EffectComposer.js">
 	<link rel="modulepreload" href="/lib/three/examples/jsm/postprocessing/RenderPass.js">
 	<link rel="modulepreload" href="/lib/three/examples/jsm/postprocessing/GTAOPass.js">
 	<link rel="modulepreload" href="/lib/three/examples/jsm/postprocessing/OutputPass.js">
@@ -69,6 +73,8 @@
 				Zoom: SCROLL WHEEL (zoom all the way in → first-person)<br>
 				Toggle 1st / 3rd person: V<br>
 				Gestures: 1-9 quick (dances / clap / wave / salute / cheer…) · G/H cycle all · 0 or ` reset<br>
+				Jump to a datacenter: ALT + 1-9<br>
+				Chat: C &nbsp;·&nbsp; Close info panel / clear isolate: ESC<br>
 			</p>
 		</div>
 	</div>

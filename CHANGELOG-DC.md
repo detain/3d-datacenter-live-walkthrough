@@ -217,6 +217,109 @@ New Playwright **Group 11** (community layout, 4 tests) and **Group 12** (info p
 
 ---
 
+### Remediation — Tier 3: finish what was left unfinished
+
+Eleven items that were shipped incomplete, shipped as a stub behind an impossible condition, or documented as done and never written. Plan: `dc_remediation_plan.md` §R3.
+
+**Suites:** unit 1104 → **1191 passing**; E2E 64 → **79 passing** (two new groups). Nine test files were converted from source-text matching to executing the code they name.
+
+#### R3.7 — Ambient occlusion: finished on both backends, not withdrawn
+
+Step 7.4 shipped `_postProcessing = { ao, ready: true }` — the imported TSL function stored in an object — and logged `"WebGPU TSL postprocessing (GTAONode) initialized"`. There was no `PostProcessing`, no `pass()`, no `outputNode`, and the render branch consuming it was byte-identical to the plain `else`. It was also unreachable, because R2.4 had not yet fixed `supportsTSL`. Step 7.3's WebGL half was real but unfinished: the composer was never resized, `GTAOPass` was constructed with the renderer where a width goes, the toggle appeared on the backend that could not use it, and `EffectComposer.js` had no modulepreload.
+
+The plan offered three options and named the worst. This takes the first: **the node path is now a real TSL pipeline**, because the WebGL2 fallback backend compiles the same node graph, which means it is testable in CI under SwiftShader where real WebGPU is absent.
+
+| | classic path | node path |
+|---|---|---|
+| chain | `RenderPass` → `GTAOPass` → `OutputPass` | `pass()` with an MRT of `{output, normal: normalView}` → `ao(depth, normal, camera)` → `RenderPipeline` |
+| gate | `caps.supportsEffectComposer` | `caps.supportsTSL` — both node backends, so `?renderer=webgpu-gl` gets it |
+
+Three things about the node graph took a browser to find, and none of them would have shown up as an error:
+
+- **`setMRT` is not optional.** GTAO needs depth *and* normals off the same pass. Without it `getTextureNode('normal')` has nothing to return and the effect occludes against garbage.
+- **GTAONode's output target is `RedFormat`.** The occlusion factor is in `.r`; `.g` and `.b` are zero. `aoNode.getTextureNode().mul(colorNode)` — the obvious thing to write, and what the first working draft did — zeroes green and blue and renders the scene **dark red**. Mean luminance fell by 118 of 255. The fix is the broadcast GTAONode's own doc block shows: `colorNode.mul(vec4(vec3(ao.r), 1))`.
+- **The sampling radius is in world units.** GTAO defaults to `0.25`, sized for a scene where a character is ~1.8 units tall. Here a rack is ~19 units, so the default samples a sphere smaller than one 1U server. `_AO_RADIUS` / `_AO_THICKNESS` set it for this scene, and both paths use the same values so the backends stay comparable.
+
+Also fixed: `onWindowResize()` and `applyPixelRatio()` now both call `resizePostFX()`, so the composer target and the TSL scene pass follow the window and the pixel ratio — without which the quality scaler could drop to 0.5 while AO kept rendering at full resolution. `GTAOPass` gets the real width and height instead of `renderer` in the width slot. The GUI toggle is offered on both paths. `EffectComposer.js` — the one module the other three are useless without — was added to the preload list.
+
+**`bench().ao` was hardcoded `false`**, under a comment claiming AO was "not yet implemented" that Step 7.3 had already made untrue. Every benchmark reported AO off while the composer was rendering, in the one field whose entire purpose is making two runs comparable. It now calls `aoActive()`, the same predicate the renderer and `DC.postFX()` use, so the three cannot disagree.
+
+**The scaler had no AO tier.** AO is a full screen-resolution pass over depth and normals with a denoise on top — the most expensive thing in the frame — so a page struggling *because of* AO ground its shadow map and pixel scale to the floor and never touched the actual cost. AO is now the first tier dropped and the last restored. `_aoSuspended` distinguishes "the scaler turned it off" from "the user never wanted it", so recovery only gives AO back to someone who asked for it, and a manual toggle clears the flag. Both GUI backends gained `updateDisplay()` so the checkbox follows.
+
+`DC.setAutoQuality(false)` is new and load-bearing for measurement: the scaler drops AO on its first downgrade, so on any machine below `FPS_TARGET` — every headless CI runner included — AO is switched off within a second of being switched on and cannot be observed at all. `DC.postFX()` reports `{mode, requested, active, suspendedByScaler}`.
+
+Both paths are pixel-verified: Playwright **Group 13** renders the same frozen camera with AO off and on and asserts mean luminance falls, on both backends. **Group 14** covers the scaler tier. Getting that measurement honest took three tries — the first two were measuring the idle-view demo moving the camera, and then the scaler switching AO off mid-capture. Both are documented in the spec, because a green test that compares two AO-off frames is worse than no test.
+
+#### R3.1 — Dispose skeletons and duck-type textures in the dc-multi teardown
+
+`Skeleton.dispose()` releases the bone texture (`Skeleton.js:298`), and nothing in a material walk reaches it. Character switching leaked one per swap. Texture disposal now duck-types on `'minFilter' in value` rather than an allowlist of property names.
+
+#### R3.2 — One owner for the pixel ratio
+
+`dc-multi.js` kept its own copy of the pixel scale in a *different* `S` object from `dc.js`'s, so the two drifted and the next window resize restored full resolution. It now delegates to `DC.setPixelScale()`. The clamp is `[0.5, 1.0]` and a non-finite value is rejected rather than propagating `NaN` into `setPixelRatio()`.
+
+#### R3.3 — The idle gate measures input, not frames
+
+`_tickSkippedFrames` counted to 18,000 and was reset only from `setLodFocus()` — which is driven by `dc-multi.js` and never called on the plain `dc.html` page. After roughly five minutes labels, highlight, blinds and the quality scaler all switched off whether or not anyone was moving, and never came back. "Idle" now means "no input for `_IDLE_MS`", recomputed from the clock every frame, with `noteUserInput()` wired into every input path.
+
+#### R3.4 / R3.5 / R3.6 — Three smaller reversals
+
+The quality-scaler toast fired on the 1.0 → 0.75 step and went silent at the 0.5 floor, under a comment saying it fired "at the floor" — and fired on upgrades too, so recovering announced "Auto-reduced quality". `onKeyDown` dereferenced a null `target` and did not exempt `<select>`. `computeFreeU()` counted every switch's U twice, because a switch is a row in `assets` and already arrives inside `rack.servers`; the switchmanager query emits the same asset again under `rack.switches`. And `applyOverlay()` hand-allocated `instanceColor` as a zero-filled `Float32Array` — RGB (0,0,0) — so any instance not written on a pass rendered **black** rather than untinted. `setColorAt()` allocates it white-filled, which is the correct neutral.
+
+#### R3.8 — The manifest work is inert no longer
+
+The deployed `public_html/images/3d/mixamo/manifest.json` had been regenerated by unfiltered code at **20.4 MB / 75,401 clips** — larger than the 16.4 MB baseline Step 3.3 existed to eliminate. It is now 745 KB / 2,736 clips, max 24 per character.
+
+`public_html/.htaccess`'s cache rule had been commented out wholesale by `d01e841c44` and left that way. The reason it had to go is that **`<LocationMatch>` is not permitted in `.htaccess` context** — Apache answers 500 for every request under the directory when it finds one. `<FilesMatch>` is permitted but matches the basename only, so it would catch any other `manifest.json` too. The rule is re-done with `SetEnvIf Request_URI` + `env=`, which is path-scoped, legal in `.htaccess`, and the same idiom the cross-origin images block below it already uses.
+
+New `tests/js/dc-playable-labels.test.js` is the drift test the step mandated: it parses `PLAYABLE_LABELS` out of `dc-multi.js` (resolving the `...GESTURE_ORDER` spread) and `VIEWER_PLAYABLE_LABELS` out of the Python, and fails in both directions — a downloader label with no viewer binding ships GLBs nothing plays; a viewer label the downloader filters out is a gesture key that silently does nothing. It also pins the two labels the Mixamo DB carries that neither list wants (`look` and `type`, 2 rows each of 114 characters), so adding either becomes a conscious edit.
+
+#### R3.9 — The test stub computed the wrong yaw
+
+`tests/js/__mocks__/three.js` had one transposed matrix element in `Euler.setFromQuaternion`: `m22` was written `1 - (xx + zz)` where three.js's `YXZ` order needs `1 - (xx + yy)`. Measured against the real class: 30° → 26.565°, 45° → 35.264°, 90° → 45°, **180° → 0°**. The comment above it enshrined the wrong answer, claiming a 90° rotation should give π/4. It was latent only because nothing asserted on the result yet.
+
+A second defect in the same function guarded the roll denominator with `m11 === 0 ? 1 : m11`. `atan2` is defined at zero — that is what gives you ±π/2 — so the guard turned the one case it fires on into a wrong answer: `q = (0.5, 0.5, 0.5, 0.5)` has `xx + zz` exactly `1.0` in floating point, and roll came out 45° instead of 90°.
+
+`tests/js/dc-stub-sanity.test.js` is the file Step 0.1 required and never got. It is the one place in the suite that imports the **real** `three` package — a deliberate exception to the project rule, because a stub is the one piece of test infrastructure nothing else can check: every other test trusts it by construction, so a wrong stub makes the suite quieter rather than louder. 32 tests run the real class side by side with the stub across a full yaw sweep, mixed pitch/yaw/roll, and both gimbal poles. `Box3.getSize()` / `getCenter()` / `isEmpty()` were added (production reads bounds through them at `dc.js:3675`), and `AnimationAction.setEffectiveWeight()` records the weight instead of returning `this` — a faded-out action and a full-weight one were previously indistinguishable, and the crossfade in `play()` is entirely a story about weights.
+
+#### R3.10 — The five missing docs, and three wrong ones
+
+None of these existed; no changelog entry flagged the omission:
+
+| File | Mandated by |
+|---|---|
+| `docs/dc_data_endpoint.md` | Steps 3.5, 3.6, 3.7, 3.8, 9.1 |
+| `docs/dc_shadows.md` | Steps 6.1–6.5 |
+| `docs/dc_deep_links.md` | Steps 9.3, 9.4 |
+| `docs/dc_isolate.md` | Steps 9.5, 9.6 |
+| `docs/dc_overlays.md` | Step 9.7 |
+
+`docs/dc_renderer_modes.md` said "ambient occlusion is not yet implemented" and "no `EffectComposer`", both untrue since Step 7.3; it gains an **Ambient occlusion** section and the **Known performance characteristics** section Step 7.5 required.
+
+`docs/dc_asset_pipeline.md`'s conversion section was substantially fabricated and is rewritten against `@gltf-transform/cli` 4.4.2 and the installed `KTX2Loader`. The commands were written as producing `.ktx2` files when the tool is glTF-in/glTF-out; `--rdo-g` and `--split-threshold` are not real options; ETC1S was described as "suitable for normal maps", which is inverted; "JPEG BC" is not a texture format; and the claim that WebGPU transcodes natively without WASM is false — `KTX2Loader` resolves `basis_transcoder.wasm` unconditionally on every path.
+
+#### R3.11 — The test honesty sweep
+
+25 of 49 files (256 of 951 `it()` blocks) never executed production code. The worst were not merely weak — they were **re-implementations of the subject inside the test file**, one of them under a comment presenting it as a technique:
+
+```js
+// Test helper: re-implement onWheel logic from source to test in isolation
+function makeOnWheel() { return function onWheel(e) { /* four lines copied out of dc-multi.js */ }; }
+```
+
+Eleven blocks then exercised that copy. It could not fail for any change to `dc-multi.js`, and the copy was already partial — it stopped at `preventDefault()` and omitted the entire dolly body, so the camera behaviour the file is named after had no coverage at all. `dc-multi.test.js` did the same for `chooseAnimation` (whose copy did not even share the real signature), `lerpAngle`, and `onWheel` twice more, plus eight hand-transcribed constants.
+
+Converted, worst first: `dc-wheel-dolly`, `dc-multi`, `dc-ktx2`, `dc-overlay`, `dc-cable-trace`, plus `dc-ao`, `dc-ao-webgpu`, `dc-idle-skip` and `dc-pixel-ratio` where R3.7 changed what they were pinning. Constants are now read from source at run time and the extractors throw on a rename, so a changed value cannot leave a stale copy behind. Where a source-text assertion is genuinely the right tool — an export list, a markup contract across three files, a "these two call sites must not drift" rule — it is kept and says so in a comment.
+
+**Converting the fakes immediately surfaced two real defects the fakes were hiding:**
+
+- **`lerpAngle` took the long way round.** `((b - a + PI) % (2*PI)) - PI` only normalises when `b - a >= -PI`, because JavaScript's `%` keeps the sign of the dividend. For a target more than half a turn below the current facing the modulo returns a negative value and subtracting π pushes it further out — down to −2π. Both endpoints are the same angle, so nothing looked broken; the avatar just spun the long way, for half of all wrap cases. Fixed in `dc-multi.js`.
+- **`dc-overlay.test.js` asserted the presence of a bug in a file that no longer had it.** `expect(fnSrc).toContain('rack.switches')` kept passing after R3.6 removed the double-counting loop, because `rack.switches` still appears — in the comment explaining the removal. A substring match cannot tell code from prose. The replacement is the only form that can detect it: a rack holding one switch must report the same free capacity whether or not `rack.switches` is populated.
+
+`dc-ktx2.test.js` gained the check its regexes structurally could not make: the transcoder path is resolved against the filesystem and the Basis `.js`/`.wasm` files asserted present. A regex derived from a line of code cannot tell you the line is wrong, and a wrong transcoder path is silent until the first KTX2 texture loads — which in CI never happens, because `public_html/images/3d` is gitignored.
+
+---
+
 ### Where each `dc_improve_plan.md` step is recorded
 
 Phases 5–9 are written up under their own step headings below. Phases 0, 1 and 4 landed before that convention and are recorded by **finding ID** instead — this table is the bridge.
