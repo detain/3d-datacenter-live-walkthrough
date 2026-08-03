@@ -217,6 +217,77 @@ New Playwright **Group 11** (community layout, 4 tests) and **Group 12** (info p
 
 ---
 
+### Field fix — periodic stutter, input lag, and quality that never came back
+
+Reported alongside the WebGPU blackout below: periodic hitching even with shadows off, input
+lagging behind the mouse at a *healthy* frame rate, and the scene looking worse than it used to.
+A console probe on the reporter's own machine produced the measurements that made this tractable —
+30 seconds of samples, and every quality tier pinned at its floor with zero recoveries.
+
+**The scaler was a one-way ratchet.** `FPS_RECOVERY` was 65 while the render loop is rAF and
+therefore vsync-capped: on a 60 Hz display the measured average can never exceed ~60, so
+`_upgradeQuality()` was unreachable code. Every dip cost a tier permanently. That is the whole of
+"the quality doesn't seem as good" — not a rendering change, just a control loop that could only
+descend. Now 45/57, a real hysteresis band strictly under the ceiling.
+
+Two things fed it. `_lastFrameTime` is written only by `_updateFPS`, which `DC.tick` skips both when
+the tab is hidden and when the idle gate is closed — so the anchor froze and the first frame back
+measured the *entire* gap. A 60-second background tab reads as ~1 fps and forced a downgrade on
+every return to the tab. `DC.tick` now drops the anchor on both paths.
+
+*This one bit twice.* The first fix was a 250 ms magnitude clamp, which looks reasonable and is
+badly wrong: a struggling renderer legitimately exceeds it, so every sample was discarded,
+`_fpsCount` never filled, and automatic quality reduction switched itself off on precisely the
+machines that depend on it. The E2E suite caught it — SwiftShader renders slower than 250 ms/frame
+and Group 14's scaler tests stopped firing. The clamp is now a 2000 ms backstop for pauses that do
+*not* skip the tick, and `tests/js/dc-quality-scaler-loop.test.js` pins the failure mode.
+
+**The hitching was garbage collection, not a timer.** The probe's hitch spacing was a broad spread
+(37 ms–5330 ms, no cluster), which rules a timer out. `updateLabels()` ran every frame and allocated
+as it went: a spread copy of both label arrays, one `{sprite, distSq}` object per label, then a full
+comparator sort — in a room the code's own comment puts at 3137 labels, roughly 190k allocations a
+second. It now ranks on a 10-frame interval into a reused scratch array, and label textures are
+budgeted to 4 builds per frame instead of unbounded (each is a 960×96 canvas plus a `needsUpdate`
+that recreates the GPU pipeline on the node renderer).
+
+**`MAX_TEXTURE_CACHE` (128) was smaller than `MAX_LABELS` (200).** Past 200 labels every new one
+evicted and *disposed* a texture a visible sprite still held, and `userData.drawn` stops it ever
+being rebuilt — a permanent dispose/re-upload treadmill. Now a 256-entry cache that drops the map
+entry without destroying the texture; `clearScene()` already frees them through the sprites.
+
+**Input lag had two causes, both measured.** The camera-collision cache guard compared `S.camDist`
+(the target) against `_lastSafeDist` (the result of the march), which are only equal when nothing
+was blocking — so indoors, among rack rows, the cache could never hit and the full ray-march ran
+every frame. And `updateHighlight()` re-picked 15×/second whether or not anything moved, with
+`raycaster.far` left at `Infinity` and a pre-filter that cannot reject a room-spanning bounding
+sphere. The pick now bails when neither the camera pose nor the instanced set has changed.
+
+**Nothing in the scene cast a shadow.** `applyShadowPolicy()` set `castShadow` on the loaded GLTF
+roots, but `extractModelMeshes()` keeps only `{geometry, material, matrix}` and the `InstancedMesh`
+built from it defaulted to false. Racks and servers *are* the room, so the renderer cleared a
+2048² depth target every frame against an empty caster list while every floor, wall and ceiling ran
+a PCF lookup that could only return 1.0 — all of the cost, none of the picture. This also corrects
+the Tier 3 note in `docs/dc_shadows.md`, which attributed `casters: 0` to CI's gitignored assets;
+it was structural and true in production. Fixing it roughly doubles the triangle bill when shadows
+are on (a second pass over the same geometry), which is why the Group 10 budget moved — worth
+knowing before deciding whether shadows should stay on by default in a production-sized room.
+
+**Cables were stuck at overview detail.** `maxTubular` was `farFromCables ? 24 : 96`, chosen from
+`camera.position.y` at *build* time — and `flyTransition()` rebuilds the scene from its `onDone`
+with the camera parked at y = 175. So every location switch after the first cached a 24-segment
+variant and nothing rebuilt it once the player descended. Only the very first load ever got 96.
+The camera's pose when geometry is built says nothing about where it spends the visit, so the
+branch and its cache-key component are gone.
+
+Also: `?inspector=0`, and one bug of my own — `raycaster.far = MAX_RAYCAST_DIST` placed above the
+`const` that declares it, which is a temporal-dead-zone throw at module scope and stopped the page
+booting entirely. Caught by Group 7/8, which exist for exactly that.
+
+**Suites:** unit 1192 → **1199 passing** (53 files, new `dc-quality-scaler-loop.test.js` drives the
+control loop with a synthetic clock rather than matching source text); E2E 85 → **85 passing**.
+
+---
+
 ### Field fix — the WebGPU scene went black on entering a building
 
 Reported from a live WebGPU session, not from a test: flying above the buildings was fine, clicking

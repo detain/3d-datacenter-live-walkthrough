@@ -39,6 +39,14 @@ function extractLine(name) {
     if (!m) throw new Error(`dc.js no longer declares const ${name} at top level — update this spec`);
     return m[0];
 }
+// updateLabels() ranks on a countdown held in a module-scope `let`. Slice the real declaration
+// rather than injecting a copy, so the sandbox shares one binding with the sliced function — the
+// same reason dc-shadow-gui.test.js declares _shadowMapSize inside its sandbox.
+function extractLet(name) {
+    const m = SRC.match(new RegExp('^let ' + name + ' = [^;]+;', 'm'));
+    if (!m) throw new Error(`dc.js no longer declares let ${name} at top level — update this spec`);
+    return m[0];
+}
 
 // ---------------------------------------------------------------------------
 // Minimal THREE stub providing only what updateLabels() needs
@@ -62,6 +70,14 @@ describe('dc.js — updateLabels() dePrioritized flag', () => {
             extractLine('MAX_LABELS'),
             extractLine('LABEL_DISTANCE'),
             extractLine('LABEL_DISTANCE_SQ'),
+            // Scratch state added when the per-frame allocation + sort was removed from the hot
+            // path. _labelRankCountdown starts at 0, so the first call still ranks — which is what
+            // every assertion below depends on.
+            extractLine('_labelScratch'),
+            extractLine('LABEL_RANK_INTERVAL'),
+            extractLine('LABEL_BUILD_BUDGET'),
+            extractLet('_labelRankCountdown'),
+            extractFn('_byLabelDistance'),
             extractFn('updateLabels'),
         ].join('\n');
 
@@ -69,7 +85,7 @@ describe('dc.js — updateLabels() dePrioritized flag', () => {
         const factory = new Function(
             'Vector3',
             'camera', 'options', 'objects', '_labelCamPos', 'makeLabelTexture',
-            prelude + '\nreturn { updateLabels, MAX_LABELS, LABEL_DISTANCE, LABEL_DISTANCE_SQ };'
+            prelude + '\nreturn { updateLabels, MAX_LABELS, LABEL_DISTANCE, LABEL_DISTANCE_SQ, LABEL_RANK_INTERVAL };'
         );
 
         const _labelCamPos = new Vector3();
@@ -78,7 +94,7 @@ describe('dc.js — updateLabels() dePrioritized flag', () => {
         const options = { showLabels: true };
         const makeLabelTexture = () => null;
 
-        const { updateLabels, MAX_LABELS, LABEL_DISTANCE } = factory(
+        const { updateLabels, MAX_LABELS, LABEL_DISTANCE, LABEL_RANK_INTERVAL } = factory(
             Vector3,
             camera, options, objects, _labelCamPos, makeLabelTexture
         );
@@ -112,19 +128,31 @@ describe('dc.js — updateLabels() dePrioritized flag', () => {
             expect(objects.labels[i].userData.dePrioritized).toBe(i >= MAX_LABELS);
         }
 
-        // --- Frame 2: camera moved close to label 210 ---
+        // --- Camera moves right on top of label 210 ---
         // Camera at x=2100 — which is ~0 units from label 210 (at x=2100).
         // Label 210 is now the CLOSEST label. Labels 0-4 are 2100, 2090, 2080, 2070, 2060 units away.
         // Sorted by distance: label 210 (dist 0), labels 209+211 (dist 10), labels 208+212 (dist 20), ...
         // Label 210 is now at sorted INDEX 0 — well within MAX_LABELS.
-        // With the bug: label 210.userData.dePrioritized stays true   (old code never clears it)
-        // With the fix:  label 210.userData.dePrioritized = false      (i=0 < MAX_LABELS)
+        // With the bug: label 210.userData.dePrioritized stays true FOREVER (never cleared).
+        // With the fix:  it is cleared on the next ranking pass.
         _labelCamPos.x = 2100; _labelCamPos.y = 0; _labelCamPos.z = 0;
-        updateLabels();
 
-        // THE BUG: label 210 stays dePrioritized = true even though it's now the closest label.
-        // After the fix: dePrioritized must be false because index 0 < MAX_LABELS.
+        // Ranking is throttled to one pass every LABEL_RANK_INTERVAL frames — the per-frame sort
+        // over every label in the scene was ~190k allocations/sec and the dominant source of the
+        // GC pauses users felt as periodic stutter. Assert the throttle explicitly, so the
+        // interval is a pinned contract rather than an accident: the very next frame must NOT
+        // re-rank, and the pass must land within the interval.
+        updateLabels();
+        expect(objects.labels[210].userData.dePrioritized).toBe(true);   // still stale, by design
+
+        // Drive out the countdown. This must converge — an un-cleared flag is the original bug,
+        // and a throttle that never fires would be the same defect wearing a different hat.
+        for (let f = 0; f < LABEL_RANK_INTERVAL; f++) updateLabels();
+
         expect(objects.labels[210].userData.dePrioritized).toBe(false);
+        // And the rest of the ranking is still correct after the delayed pass: label 210 is now
+        // nearest, so the labels furthest from x=2100 (the low indices) are the de-prioritised ones.
+        expect(objects.labels[0].userData.dePrioritized).toBe(true);
     });
 
     it('clears dePrioritized for ALL labels when total count drops below MAX_LABELS', () => {
@@ -132,6 +160,14 @@ describe('dc.js — updateLabels() dePrioritized flag', () => {
             extractLine('MAX_LABELS'),
             extractLine('LABEL_DISTANCE'),
             extractLine('LABEL_DISTANCE_SQ'),
+            // Scratch state added when the per-frame allocation + sort was removed from the hot
+            // path. _labelRankCountdown starts at 0, so the first call still ranks — which is what
+            // every assertion below depends on.
+            extractLine('_labelScratch'),
+            extractLine('LABEL_RANK_INTERVAL'),
+            extractLine('LABEL_BUILD_BUDGET'),
+            extractLet('_labelRankCountdown'),
+            extractFn('_byLabelDistance'),
             extractFn('updateLabels'),
         ].join('\n');
 

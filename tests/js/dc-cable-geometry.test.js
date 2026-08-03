@@ -30,16 +30,25 @@ describe('cable geometry constants — Step 8.3', () => {
   });
 
   describe('maxTubular LOD cap', () => {
-    it('is 24 when far from cables (reduced from 40)', () => {
-      const match = SRC.match(/const maxTubular\s*=\s*farFromCables\s*\?\s*(\d+)\s*:\s*\d+/);
-      expect(match).not.toBeNull();
-      expect(parseInt(match[1], 10)).toBe(24);
-    });
-
-    it('is 96 when close to cables (reduced from 220)', () => {
-      const match = SRC.match(/const maxTubular\s*=\s*farFromCables\s*\?\s*\d+\s*:\s*(\d+)/);
+    it('is a fixed 96 — the near-field detail, with no camera-derived branch', () => {
+      // This used to be `farFromCables ? 24 : 96`, chosen from camera.position.y at BUILD time.
+      // That was a permanent quality loss on every location change after the first:
+      // displaySwitches() runs once per location from displayDatacenter(), and flyTransition()
+      // calls displayDatacenter() from its onDone with the camera parked at y = 175 — it flies UP
+      // and out before rebuilding. So the "far" branch was taken on every switch, cables were
+      // built at 24 segments, and nothing rebuilt them once the player descended to eye height.
+      // Only the very first load got 96.
+      const match = SRC.match(/^\s*const maxTubular\s*=\s*(\d+);/m);
       expect(match).not.toBeNull();
       expect(parseInt(match[1], 10)).toBe(96);
+    });
+
+    it('no longer derives cable detail from the camera at build time', () => {
+      // The camera's position when the geometry is built says nothing about where it spends the
+      // visit, which is at eye level. Any reintroduction of a camera-height branch here brings
+      // the stuck-at-24 regression straight back.
+      expect(SRC).not.toMatch(/farFromCables/);
+      expect(SRC).not.toMatch(/const maxTubular\s*=\s*[^;]*\?/);
     });
   });
 

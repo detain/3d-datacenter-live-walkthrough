@@ -880,10 +880,26 @@ test.describe('Group 9: Renderer modes', () => {
 // increase is the feature working, not a regression; the old numbers described a scene the
 // product never intends to render.
 //
+// RE-DERIVED again after the shadow-caster fix: 181 draw calls / 125,844 triangles.
+//
+// This one is a deliberate, understood increase and the reason is worth stating, because the
+// number nearly doubled. info.render.triangles accumulates across PASSES, and until now the
+// shadow pass rendered nothing: applyShadowPolicy() set castShadow on the loaded GLTF roots, but
+// extractModelMeshes() keeps only {geometry, material, matrix} and the InstancedMesh built from it
+// defaulted to castShadow false. Racks and servers are the entire contents of the room, so the
+// renderer bound and cleared a 2048x2048 depth target every frame against an empty caster list
+// while every floor, wall and ceiling ran a PCF lookup that could only return 1.0 — all of the
+// cost, none of the picture. Now that the instances really cast, the depth pass renders them, and
+// the second pass over the same geometry is what the extra ~60k triangles are.
+//
+// So the ceiling below covers a scene that renders shadows for real. If shadows are ever defaulted
+// off (a reasonable call on a production room, where the main pass alone is millions of triangles),
+// re-measure rather than leaving the headroom sitting here unused.
+//
 // avgFps/minFps are deliberately NOT asserted: under SwiftShader the bench returns
 // samples=0 and avgFps=null, so an FPS assertion would either be vacuous or flaky. Frame
 // rate needs a real GPU to mean anything — see docs/dc_renderer_modes.md.
-const PERF_BUDGET = { drawCalls: 250, triangles: 99000 };
+const PERF_BUDGET = { drawCalls: 280, triangles: 190000 };
 
 test.describe('Group 10: Performance regression', () => {
   test.beforeEach(async ({ page }) => {

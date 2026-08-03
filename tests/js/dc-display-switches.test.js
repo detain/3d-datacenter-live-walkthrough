@@ -26,20 +26,23 @@ const funcSrc = displaySwitchesMatch[0];
 
 describe('displaySwitches() cable geometry cache — Bug F-09 fix', () => {
 
-  describe('cacheKey includes maxTubular', () => {
-    it('cacheKey definition appends maxTubular to the key string', () => {
-      // The cacheKey must include maxTubular so that far/close LOD settings don't share entries
-      // Expected pattern: const cacheKey = (sink ? locId + ':n' : locId) + ':' + maxTubular;
-      expect(funcSrc).toMatch(/const cacheKey\s*=\s*\(sink\s*\?\s*locId\s*\+\s*':n'\s*:\s*locId\)\s*\+\s*':'?\s*\+\s*maxTubular/);
+  describe('cacheKey separates main from neighbour, and nothing else', () => {
+    // F-09 added maxTubular to the key so that the far/close LOD variants would not share an
+    // entry. That fixed a collision but created a worse bug, because the LOD input was
+    // camera.position.y sampled at BUILD time: flyTransition() rebuilds the scene from its onDone
+    // with the camera at y = 175, so every location switch cached a 24-segment variant under
+    // ':24' and nothing ever rebuilt it at 96 once the player was back at eye height. The
+    // geometry is now built at one detail level, so the key has nothing left to vary on.
+    it('keys on the location and the main/neighbour split only', () => {
+      expect(funcSrc).toMatch(/const cacheKey\s*=\s*sink\s*\?\s*locId\s*\+\s*':n'\s*:\s*String\(locId\)/);
     });
 
-    it('maxTubular is declared before cacheKey so it can be referenced', () => {
-      const lines = funcSrc.split('\n');
-      const maxTubularLineIdx = lines.findIndex(l => /const maxTubular\s*=/.test(l));
-      const cacheKeyLineIdx = lines.findIndex(l => /const cacheKey\s*=/.test(l));
-      expect(maxTubularLineIdx).toBeGreaterThanOrEqual(0);
-      expect(cacheKeyLineIdx).toBeGreaterThanOrEqual(0);
-      expect(maxTubularLineIdx).toBeLessThan(cacheKeyLineIdx);
+    it('the key does not depend on the camera, directly or through maxTubular', () => {
+      // The invariant that matters: a cache entry must not encode where the camera happened to be
+      // when it was built, or a transient pose becomes a permanent quality setting.
+      const keyLine = funcSrc.match(/const cacheKey\s*=.*/);
+      expect(keyLine).not.toBeNull();
+      expect(keyLine[0]).not.toMatch(/maxTubular|camera|camY/);
     });
   });
 

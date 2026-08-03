@@ -18,7 +18,8 @@ const MANIFEST_URL = window.DC_MANIFEST_URL || "/images/3d/mixamo/manifest.json"
 
 // Camera collision cache — avoids re-running the expensive collision loop when player hasn't moved (Fix 6)
 // Includes camera direction to skip re-computation during mouse-look rotation (Fix 9)
-let _lastSafeDist = 11;  // default; will be set to S.camDist when first used
+let _lastSafeDist = 11;  // RESULT of the last ray-march (may be < camDist when something blocks)
+let _lastCamDist = null; // the camDist that march was run FOR — see the cache guard below
 const _lastPlayerPos = new THREE.Vector3();
 let _lastCollisionCamPos = null;  // "x,z" rounded to 1 decimal
 let _lastCollisionCamDir = null;  // "x,y,z" rounded to 1 decimal (camera world direction)
@@ -545,7 +546,12 @@ function placeCamera() {
     _lastPlayerPos.x.toFixed(1) !== S.player.position.x.toFixed(1) ||
     _lastPlayerPos.z.toFixed(1) !== S.player.position.z.toFixed(1)
   );
-  if (!playerMoved && _posKey === _lastCollisionCamPos && _camDirKey === _lastCollisionCamDir && S.camDist === _lastSafeDist) {
+  // The last term used to be `S.camDist === _lastSafeDist`, which compares the TARGET distance
+  // against the RESULT of the march. Those are only equal when the previous frame found nothing
+  // blocking — so indoors, where there is always a rack or a wall behind you, the cache could
+  // never hit and the full ray-march ran every single frame. Compare against the camDist the
+  // march was actually run for instead.
+  if (!playerMoved && _posKey === _lastCollisionCamPos && _camDirKey === _lastCollisionCamDir && S.camDist === _lastCamDist) {
     dist = _lastSafeDist;
   } else {
     dist = S.camDist;
@@ -565,6 +571,7 @@ function placeCamera() {
       }
     }
     _lastSafeDist = dist;
+    _lastCamDist = S.camDist;
     _lastPlayerPos.copy(S.player.position);
     _lastCollisionCamPos = _posKey;
     _lastCollisionCamDir = _camDirKey;

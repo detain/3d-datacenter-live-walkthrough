@@ -195,8 +195,18 @@ let _fpsCount = 0;                // how many slots are filled (max FPS_WINDOW)
 let _lastFrameTime = 0;         // timestamp of last frame
 let _qualityDowngradeTime = 0;  // when we last downgraded (debounce guard)
 let _lastUpgradeTime = 0;       // when we last upgraded (debounce guard)
-const FPS_TARGET = 55;          // FPS below this triggers a downgrade
-const FPS_RECOVERY = 65;        // FPS needed to suggest an upgrade
+// Both thresholds must sit BELOW the display's refresh rate, or the scaler becomes a one-way
+// ratchet. The loop is rAF, so it is vsync-capped: on a 60 Hz panel the measured average can never
+// exceed ~60. FPS_RECOVERY was 65, i.e. physically unreachable, which made _upgradeQuality() dead
+// code — every dip cost a tier permanently and nothing ever came back. A field session bore this
+// out exactly: 30 seconds of samples with pixelScale/shadowMap/lodBias all pinned at the floor,
+// FPS 40-58, and not one upgrade. That is the whole of "the quality doesn't seem as good".
+//
+// 45/57 restores a real hysteresis band strictly under a 60 Hz ceiling: a healthy scene reads
+// ~59-60 and can climb, and only a genuinely struggling one (below 45) gives up a tier. On a
+// higher-refresh panel the band is simply more lenient, which is the safe direction to err.
+const FPS_TARGET = 45;          // FPS below this triggers a downgrade
+const FPS_RECOVERY = 57;        // FPS needed to suggest an upgrade (must be < refresh rate)
 const DOWNGRADE_COOLDOWN = 10000; // ms between downgrades (debounce)
 const UPGRADE_COOLDOWN = 3000;   // ms between upgrades (debounce)
 
@@ -347,11 +357,26 @@ const _ceilingTextureCache = new Map();
 
 // LRU eviction for texture caches (Fix #19)
 const MAX_TEXTURE_CACHE = 128;
+// Must stay strictly above MAX_LABELS or the cache thrashes against its own consumers; see
+// cacheWithEvict. 256 leaves headroom for labels that scroll in and out of the nearest-200 set.
+const MAX_LABEL_TEXTURE_CACHE = 256;
 const _cacheOrder = {
     label: new Set(), poster: new Set(), sign: new Set(), floor: new Set(), ceiling: new Set()
 };
 
-function cacheWithEvict(cacheMap, key, value, orderSet) {
+// `limit` and `disposeOnEvict` exist for the label cache, which breaks both defaults.
+//
+// Its cap was MAX_TEXTURE_CACHE (128) while MAX_LABELS (200) labels get textured, so past 200
+// labels every new one evicted a texture that a VISIBLE sprite still held as material.map — and
+// because sprite.userData.drawn stays true, makeLabelTexture() was never called for it again.
+// three.js then re-uploads the whole 960x96 texture on the next draw, so the scene sat on a
+// dispose/re-upload treadmill: continuous GPU traffic, in bursts, forever.
+//
+// Two things were wrong: the cap has to exceed the number of live consumers, and evicting a
+// SHARED texture must not destroy it. clearScene() already disposes every label's map through the
+// sprite that owns it (see the rackLabels/labels loop), so dropping the map entry alone is
+// sufficient and leaks nothing.
+function cacheWithEvict(cacheMap, key, value, orderSet, limit = MAX_TEXTURE_CACHE, disposeOnEvict = true) {
     if (cacheMap.has(key)) {
         // move to end (most recently used): delete and re-add is O(1) with Set
         orderSet.delete(key);  // O(1) delete
@@ -359,11 +384,11 @@ function cacheWithEvict(cacheMap, key, value, orderSet) {
         cacheMap.set(key, value);
         return;
     }
-    if (cacheMap.size >= MAX_TEXTURE_CACHE) {
+    if (cacheMap.size >= limit) {
         const oldest = orderSet.values().next().value;  // O(1) get first (LRU)
         orderSet.delete(oldest);  // O(1) delete
         const oldVal = cacheMap.get(oldest);
-        if (oldVal && oldVal.dispose) oldVal.dispose();
+        if (disposeOnEvict && oldVal && oldVal.dispose) oldVal.dispose();
         cacheMap.delete(oldest);
     }
     orderSet.add(key);  // O(1) add
@@ -677,9 +702,25 @@ const serverTypes = [
 ];
 
 // --- FPS tracking for automatic quality scaling ---
+// Backstop for gaps that are not frames at all: a GC pause, a modal dialog, a debugger break.
+//
+// This has to stay GENEROUS. The first version of this guard was 250ms, which looks reasonable and
+// is badly wrong: a struggling renderer legitimately produces frames slower than that, and
+// discarding them meant _fpsCount never reached FPS_WINDOW, so _autoQualityScale returned at its
+// first line and the scaler never fired — disabling automatic quality reduction on precisely the
+// machines that need it. It was caught by the E2E suite, where SwiftShader renders slower than
+// 250ms/frame and Group 14's scaler tests stopped firing entirely.
+//
+// The real cause of the poison sample is handled where it happens instead: DC.tick nulls
+// _lastFrameTime whenever it returns without measuring (tab hidden, idle gate closed), so the
+// `_lastFrameTime > 0` guard below discards the resume frame on its own. 2000ms (0.5fps) is below
+// anything a live renderer produces and above any plausible real frame.
+const MAX_PLAUSIBLE_FRAME_MS = 2000;
+
 function _updateFPS(now) {
     if (_lastFrameTime > 0) {
         const delta = now - _lastFrameTime;
+        if (delta > MAX_PLAUSIBLE_FRAME_MS) { _lastFrameTime = now; return; }
         // MAJOR-3: Ring buffer — O(1) insert instead of O(n) Array.shift()
         _fpsHistory[_fpsHead] = delta;
         _fpsHead = (_fpsHead + 1) % FPS_WINDOW;
@@ -1795,6 +1836,16 @@ function buildInstanced(model, placements, kind, sink) {
         }
         inst.instanceMatrix.needsUpdate = true;
         inst.computeBoundingSphere();
+        // applyShadowPolicy() runs on the loaded GLTF root, but extractModelMeshes() keeps only
+        // {geometry, material, matrix} and throws the nodes away — so the flags it set never
+        // reached anything that renders, and an InstancedMesh defaults to castShadow false.
+        // Racks and servers are the entire contents of the room, which meant NOTHING in the scene
+        // cast a shadow: the renderer bound and cleared a 2048x2048 depth target every frame with
+        // an empty caster list, and every floor, wall and ceiling ran a PCF lookup that could only
+        // ever return 1.0. All of the cost, none of the picture. 'model' is the same policy the
+        // GLTF root was given, so this restores the intent rather than inventing one.
+        inst.castShadow = true;
+        inst.receiveShadow = true;
         inst.userData.kind = kind;           // 'rack' | 'server'
         inst.userData.assetIds = assetIds;   // instanceId -> rack/server id
         inst.userData.assetData = assetData; // instanceId -> asset object (hostname/name/id)
@@ -1992,6 +2043,15 @@ function displayServerText(text, asset, x, y, z) {
 const LABEL_DISTANCE = 40;                                  // draw a label only within this many world units
 const LABEL_DISTANCE_SQ = LABEL_DISTANCE * LABEL_DISTANCE;
 const MAX_LABELS = 200;                                     // max labels to texture at once (IDEA-6)
+// Scratch state for updateLabels(), all module-scope so the per-frame path allocates nothing.
+const _labelScratch = [];                 // reused every ranking pass; never re-created
+const LABEL_RANK_INTERVAL = 10;           // frames between nearest-MAX_LABELS re-rankings
+let _labelRankCountdown = 0;              // 0 => rank on the next call (so the first frame ranks)
+const LABEL_BUILD_BUDGET = 4;             // max label textures built per frame (see updateLabels)
+// Named comparator, hoisted: an inline arrow here would allocate a closure per sort call.
+function _byLabelDistance(a, b) {
+    return a.userData._distSq - b.userData._distSq;
+}
 const _labelCamPos = new THREE.Vector3();
 // Shared quad geometry for ALL flat labels. NOT disposed on scene clear because
 // it remains in use by every label Mesh — disposing it would break all live labels.
@@ -2035,7 +2095,8 @@ function makeLabelTexture(text) {
     const texture = new THREE.CanvasTexture(canvas);
     texture.colorSpace = THREE.SRGBColorSpace;
     texture.anisotropy = maxAnisotropy || 1; // sharpen at oblique viewing angles
-    cacheWithEvict(_labelTextureCache, text, texture, _cacheOrder.label);
+    // Above MAX_LABELS, and non-destructive on eviction — see cacheWithEvict.
+    cacheWithEvict(_labelTextureCache, text, texture, _cacheOrder.label, MAX_LABEL_TEXTURE_CACHE, false);
     return texture;
 }
 
@@ -2065,35 +2126,65 @@ function updateLabels() {
     const show = options.showLabels;
     camera.getWorldPosition(_labelCamPos);
 
-    // IDEA-6: If too many labels, only texture the closest MAX_LABELS to avoid overworking the GPU
-    const allLabels = [...objects.labels, ...objects.rackLabels];
-    if (allLabels.length > MAX_LABELS) {
-        // Sort by distance and mark the furthest as "de-prioritized" (skip texture creation)
-        const withDist = allLabels.map(s => ({
-            sprite: s,
-            distSq: s.position.distanceToSquared(_labelCamPos),
-        }));
-        withDist.sort((a, b) => a.distSq - b.distSq);
-        // Start at 0 and assign the flag BOTH ways. The old loop started at MAX_LABELS and
-        // only ever set it true, and nothing anywhere set it false again — so the first frame
-        // a label fell outside the nearest 200 it was hidden for the rest of the session, even
-        // at point-blank range. In a room with 3137 labels that meant every label died within
-        // seconds of walking.
-        for (let i = 0; i < withDist.length; i++) {
-            withDist[i].sprite.userData.dePrioritized = (i >= MAX_LABELS);
+    // IDEA-6: If too many labels, only texture the closest MAX_LABELS to avoid overworking the GPU.
+    //
+    // This used to run EVERY frame and allocate as it went: a spread copy of both label arrays, then
+    // one {sprite, distSq} object per label, then a full comparator sort. The comment below cites a
+    // room with 3137 labels, so that was ~3140 short-lived objects and an O(n log n) sort per frame
+    // — roughly 190k allocations/sec at 60fps. The resulting minor GC pauses are the periodic hitch
+    // users report, and they are self-reinforcing: each pause drags the FPS average down and feeds
+    // the quality scaler evidence for another downgrade.
+    //
+    // Two changes, no behavioural difference in what ends up flagged:
+    //   1. Reuse persistent scratch arrays instead of rebuilding them (the set only changes when a
+    //      building is built or torn down, which already rebuilds the label arrays wholesale).
+    //   2. Re-rank on an interval rather than per frame. Ranking decides which labels are ALLOWED a
+    //      texture, not where anything is drawn — visibility below still runs every frame off the
+    //      live distance. At walking speed the nearest-200 set cannot meaningfully change in 10
+    //      frames, so this is invisible and removes the sort from the hot path.
+    _labelRankCountdown--;
+    if (_labelRankCountdown <= 0) {
+        _labelRankCountdown = LABEL_RANK_INTERVAL;
+        const all = _labelScratch;
+        all.length = 0;
+        for (const s of objects.labels) all.push(s);
+        for (const s of objects.rackLabels) all.push(s);
+        if (all.length > MAX_LABELS) {
+            // Sort the sprites themselves against a distance keyed off the same camera position,
+            // so no per-label wrapper object is needed. distanceToSquared is cheap and the
+            // comparator runs O(n log n) times either way — the allocation was the cost, not this.
+            for (const s of all) s.userData._distSq = s.position.distanceToSquared(_labelCamPos);
+            all.sort(_byLabelDistance);
+            // Start at 0 and assign the flag BOTH ways. The old loop started at MAX_LABELS and
+            // only ever set it true, and nothing anywhere set it false again — so the first frame
+            // a label fell outside the nearest 200 it was hidden for the rest of the session, even
+            // at point-blank range. In a room with 3137 labels that meant every label died within
+            // seconds of walking.
+            for (let i = 0; i < all.length; i++) {
+                all[i].userData.dePrioritized = (i >= MAX_LABELS);
+            }
+        } else {
+            // Below the cap nothing is de-prioritised; clear any flag left over from a frame
+            // when the count was higher (e.g. after a neighbouring building unloaded).
+            for (const s of all) s.userData.dePrioritized = false;
         }
-    } else {
-        // Below the cap nothing is de-prioritised; clear any flag left over from a frame
-        // when the count was higher (e.g. after a neighbouring building unloaded).
-        for (const s of allLabels) s.userData.dePrioritized = false;
     }
+
+    // Building a label texture is a 960x96 canvas rasterisation plus a GPU upload, and setting
+    // material.map where there was none changes the shader permutation — a recompile on WebGL, a
+    // pipeline recreation on the node renderer. Walking into a dense aisle brings dozens of labels
+    // inside LABEL_DISTANCE on the same frame, and there was no limit on how many were built in
+    // one go. Budget it so they stream in over a few frames instead of stalling one.
+    let _builtThisFrame = 0;
 
     for (const arr of [objects.labels, objects.rackLabels]) {
         for (const sprite of arr) {
             const near = show && sprite.position.distanceToSquared(_labelCamPos) < LABEL_DISTANCE_SQ;
             // IDEA-6: Skip texture creation for de-prioritized labels (too far/too many)
-            const canTexture = near && !sprite.userData.drawn && !sprite.userData.dePrioritized;
+            const canTexture = near && !sprite.userData.drawn && !sprite.userData.dePrioritized
+                && _builtThisFrame < LABEL_BUILD_BUDGET;
             if (canTexture) {
+                _builtThisFrame++;
                 sprite.material.map = makeLabelTexture(sprite.userData.text);
                 sprite.material.needsUpdate = true;
                 sprite.userData.drawn = true;
@@ -2187,12 +2278,23 @@ function displaySwitches(locId, dx, dz, sink) {
     dx = dx || 0; dz = dz || 0;
     const intraOnly = !!sink;   // neighbours: only draw cables whose endpoints are inside THIS building
 
-    // IDEA-4: Cable geometry LOD — reduce tubular segments when camera is far (overview mode)
-    const camY = camera ? camera.position.y : 0;
-    const farFromCables = camY > 25;
-    const maxTubular = farFromCables ? 24 : 96;
+    // IDEA-4 built cables at a reduced tubular-segment count when the camera was high, and keyed
+    // the geometry cache on that count. Both halves are wrong together, and the result was a
+    // permanent quality loss on every location change after the first:
+    //
+    // displaySwitches() runs once per location, from displayDatacenter() — and flyTransition()
+    // calls displayDatacenter() from its onDone with the camera parked at y = 175 (it flies UP and
+    // out before rebuilding). So camY > 25 was true for every switch, cables were built at 24
+    // segments, cached under ':24', and nothing ever rebuilt them once the player descended to eye
+    // height. Only the very first load — where the camera starts inside the room — got 96.
+    //
+    // The camera's position at BUILD time says nothing about where it spends the visit, which is
+    // at eye level, so there is no honest LOD signal to read here. Build at the detail the player
+    // actually sees and keep one entry per location, as it was before the count entered the key.
+    // The cap only binds on runs longer than ~96 units; short cables are unaffected either way.
+    const maxTubular = 96;
 
-    const cacheKey = (sink ? locId + ':n' : locId) + ':' + maxTubular;  // cache main and neighbour cable geometry separately (LOD-aware)
+    const cacheKey = sink ? locId + ':n' : String(locId);  // cache main and neighbour cable geometry separately
     const racks = (locations[locId] || {}).racks; if (!racks) return;
 
     // Fix #10: Cache cable geometry per location (main and neighbours separately, not LOD-reduced)
@@ -3682,11 +3784,30 @@ function setupControls() {
 // ---- Phase 7: interaction (look-highlight, click-to-info, search + fly-to) ----
 const raycaster = new THREE.Raycaster();
 raycaster.firstHitOnly = true; // Step 8.1: BVH accelerated raycasting — stop at first hit
+// Pose of the camera at the last pick. Standing still, the answer cannot change, but the pick was
+// re-running 15x/second regardless — and it is not cheap: the pre-filter cannot reject anything
+// (each InstancedMesh spans the whole room, so its bounding sphere radius is room-sized and
+// `distance - radius <= 50` is true from anywhere inside), so every call walks EVERY instance,
+// transforming the ray per instance. That is a few milliseconds landing on every 4th frame — a
+// sawtooth that leaves the average near 60fps while every fourth frame is late, which is what
+// "sustained 60fps but the mouse feels laggy" actually looks like.
+const _lastPickPos = new THREE.Vector3();
+const _lastPickQuat = new THREE.Quaternion();
+let _lastPickCount = -1;
 const _centerNdc = new THREE.Vector2(0, 0);   // screen centre = "what you're looking at"
 const _hoverMatrix = new THREE.Matrix4();
 const _hoverPos = new THREE.Vector3();
 const _hoverSize = new THREE.Vector3();
 const MAX_RAYCAST_DIST = 50;  // only raycast instanced meshes within this distance
+// raycaster.far defaults to Infinity, so the ray traversed every BVH to the back of the room even
+// though the pre-filter in raycastInstances() only ever intended to consider meshes within
+// MAX_RAYCAST_DIST. Bounding the ray honours that same intent where it actually saves work.
+//
+// This assignment must stay BELOW the const it reads: `const` is in the temporal dead zone until
+// its declaration is evaluated, and dc.js is a module executed top to bottom, so putting it up
+// beside the other raycaster setup throws "Cannot access 'MAX_RAYCAST_DIST' before initialization"
+// at import time and the whole page fails to boot.
+raycaster.far = MAX_RAYCAST_DIST;
 const _rcTempV = new THREE.Vector3();   // scratch for the raycast pre-filter; see raycastInstances()
 
 let highlightBox = null;
@@ -3750,6 +3871,19 @@ function raycastInstances(ndc) {
 
 function updateHighlight() {
     if (!camera) return;
+    // Nothing under the crosshair can have changed if neither the camera nor the set of instanced
+    // meshes has. Comparing the instanced count as well catches a location switch or an LOD
+    // enter/exit, which replace objects.instanced wholesale — a pose-only check would keep a stale
+    // highlight pointing at a mesh that no longer exists.
+    if (_lastPickCount === objects.instanced.length
+        && camera.position.equals(_lastPickPos)
+        && camera.quaternion.equals(_lastPickQuat)) {
+        return;
+    }
+    _lastPickPos.copy(camera.position);
+    _lastPickQuat.copy(camera.quaternion);
+    _lastPickCount = objects.instanced.length;
+
     ensureHighlightBox();
     const hit = raycastInstances(_centerNdc);
     if (!hit) { highlightBox.visible = false; hovered = null; return; }
@@ -4989,7 +5123,13 @@ window.DC = {
     clear: clearScene,
     cull: updateLabels,
     tick: function () {
-        if (document.hidden) return;
+        // Drop the FPS anchor on the way out. _lastFrameTime is written only by _updateFPS, which
+        // this early return skips, so leaving it set means the first frame after the tab comes
+        // back measures the ENTIRE hidden period as one frame — a 60s background tab yields a
+        // 60000ms sample, which averages the window down to ~1fps and forces a downgrade on every
+        // single return to the tab. Nulling it makes _updateFPS's `_lastFrameTime > 0` guard
+        // discard that frame, which is what it was always for.
+        if (document.hidden) { _lastFrameTime = 0; return; }
         const now = performance.now();
 
         // Idle skip: gate the expensive per-frame work once the user has been inactive for
@@ -4997,6 +5137,9 @@ window.DC = {
         // arrives rather than waiting for a counter to be reset by a caller that may not exist.
         _refreshIdleState(now);
         if (_skipExpensiveUpdates) {
+            // Same reason as the document.hidden return above: this path skips _updateFPS, so the
+            // anchor must not survive the idle period and be charged to the frame that ends it.
+            _lastFrameTime = 0;
             drawFrame();
             if (stats) stats.update();
             return _drawCalls();
