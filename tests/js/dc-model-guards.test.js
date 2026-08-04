@@ -53,7 +53,10 @@ const path = require('node:path');
 const DC_JS = path.resolve(__dirname, '../../public_html/js/dc.js');
 const DC_PHP = path.resolve(__dirname, '../../public_html/ajax/datacenter.php');
 const SRC = fs.readFileSync(DC_JS, 'utf8');
-const PHP = fs.readFileSync(DC_PHP, 'utf8');
+// The data endpoint lives in the MyAdmin monorepo, not in this standalone repo (no PHP is extracted
+// here — see README "Provenance"). When it is absent the cross-language contract block at the bottom
+// of this file is skipped rather than failing; everything above it is pure JS and always runs.
+const PHP = fs.existsSync(DC_PHP) ? fs.readFileSync(DC_PHP, 'utf8') : null;
 
 // ---------------------------------------------------------------------------
 // Slicing the real source
@@ -937,7 +940,7 @@ describe('dc.js — the two rack/server loaders stay symmetric', () => {
 // row/column, so its two loop bounds ARE indexes into dc.js's arrays — and nothing but this check
 // connects the two files.
 // ---------------------------------------------------------------------------
-describe('ajax/datacenter.php ?test=1 grid stays inside dc.js\'s type arrays', () => {
+describe.skipIf(PHP === null)('ajax/datacenter.php ?test=1 grid stays inside dc.js\'s type arrays', () => {
     const phpInt = (name) => {
         const m = PHP.match(new RegExp('\\$' + name + '\\s*=\\s*(\\d+)\\s*;'));
         if (!m) throw new Error(`datacenter.php no longer defines $${name} — update this spec`);

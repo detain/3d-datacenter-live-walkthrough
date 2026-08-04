@@ -40,7 +40,11 @@ const JS_SRC = path.resolve(__dirname, '../../public_html/js/dc-multi.js');
 const PY_SRC = path.resolve(__dirname, '../../scripts/mixamo_downloader/mixamo_downloader.py');
 
 const JS = fs.readFileSync(JS_SRC, 'utf8');
-const PY = fs.readFileSync(PY_SRC, 'utf8');
+// scripts/mixamo_downloader/ lives in the MyAdmin monorepo, not in this standalone repo (see README
+// "Provenance"). When the downloader is absent, the assertions that compare the two languages are
+// skipped rather than failing; the JS-only halves of both blocks always run.
+const PY = fs.existsSync(PY_SRC) ? fs.readFileSync(PY_SRC, 'utf8') : null;
+const HAS_PY = PY !== null;
 
 // ---------------------------------------------------------------------------
 // Extractors. Each throws on a shape it does not recognise — a rename must fail loudly rather
@@ -86,24 +90,24 @@ const sorted = (set) => [...set].sort();
 // ---------------------------------------------------------------------------
 describe('mixamo playable labels — the JS and Python lists agree', () => {
 
-  it('both lists are found and non-trivially sized', () => {
+  it.skipIf(!HAS_PY)('both lists are found and non-trivially sized', () => {
     // The guard against this whole file passing because two extractors both returned nothing.
     expect(jsPlayableLabels().size).toBeGreaterThan(10);
     expect(pyViewerLabels().size).toBeGreaterThan(10);
   });
 
-  it('the sets are identical', () => {
+  it.skipIf(!HAS_PY)('the sets are identical', () => {
     expect(sorted(jsPlayableLabels())).toEqual(sorted(pyViewerLabels()));
   });
 
-  it('nothing is downloaded that the viewer cannot play', () => {
+  it.skipIf(!HAS_PY)('nothing is downloaded that the viewer cannot play', () => {
     // Direction 1: Python ⊄ JS means shipped GLBs no code path ever requests.
     const js = jsPlayableLabels();
     const extra = sorted(pyViewerLabels()).filter((l) => !js.has(l));
     expect(extra, `downloader ships labels the viewer never plays: ${extra.join(', ')}`).toEqual([]);
   });
 
-  it('nothing the viewer plays is missing from the manifest filter', () => {
+  it.skipIf(!HAS_PY)('nothing the viewer plays is missing from the manifest filter', () => {
     // Direction 2: JS ⊄ Python means a gesture key bound to a clip that was never downloaded.
     // This one is the quieter failure — the key simply does nothing.
     const py = pyViewerLabels();
@@ -130,14 +134,14 @@ describe('mixamo playable labels — the JS and Python lists agree', () => {
     for (const l of ['idle', 'walk', 'run', 'jump']) expect(playable.has(l), l).toBe(true);
   });
 
-  it('the downloader filters the manifest against this exact set', () => {
+  it.skipIf(!HAS_PY)('the downloader filters the manifest against this exact set', () => {
     // A list that agrees with the viewer but is never applied would pass every test above while
     // the manifest still carried thousands of unplayable clips — which is the state Step 3.3
     // existed to fix.
     expect(PY).toMatch(/label["']?\s*\)?\s*in VIEWER_PLAYABLE_LABELS/);
   });
 
-  it('records the two labels the Mixamo DB carries that neither list wants', () => {
+  it.skipIf(!HAS_PY)('records the two labels the Mixamo DB carries that neither list wants', () => {
     // scripts/mixamo_downloader/database/mixamo.db has `look` (2 rows) and `type` (2 rows). They
     // are on nobody's list, which is a decision rather than an oversight: they exist for only 2 of
     // 114 characters, so binding a key to them would do nothing for 98% of the roster. Pinned here
@@ -167,7 +171,7 @@ describe('mixamo playable labels — the extractors fail loudly', () => {
     for (const g of jsArrayLiteral('GESTURE_ORDER')) expect(labels.has(g), g).toBe(true);
   });
 
-  it('the Python extractor reads a set literal, not the comment above it', () => {
+  it.skipIf(!HAS_PY)('the Python extractor reads a set literal, not the comment above it', () => {
     const py = pyViewerLabels();
     expect(py.has('idle')).toBe(true);
     expect(py.has('mirrors')).toBe(false);   // a word from the comment line directly above it
