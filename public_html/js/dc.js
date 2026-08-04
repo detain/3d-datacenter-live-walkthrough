@@ -4315,7 +4315,13 @@ async function init() {
 
     // Step 8.2: register KTX2Loader for compressed texture support (UASTC/ETC1S)
     loaderGltf.ktx2Loader = new KTX2Loader();
-    loaderGltf.ktx2Loader.setTranscoderPath('/node_modules/three/examples/jsm/libs/basis/');
+    // /lib/, not /node_modules/. Both resolve to the same directory on a box where someone has
+    // hand-made a second symlink, but only public_html/lib is created by package.json's
+    // postinstall and only /lib/ is what the rest of the page uses (17 references in dc.html).
+    // On a clean deploy — or CI — /node_modules/ is a 404, and a missing transcoder does not
+    // announce itself: KTX2Loader just fails to decode and every compressed texture silently
+    // disappears.
+    loaderGltf.ktx2Loader.setTranscoderPath('/lib/three/examples/jsm/libs/basis/');
     loaderGltf.ktx2Loader.detectSupport(renderer);
 
     // Step 7.4: set up WebGPU TSL postprocessing (GTAONode) if on the node-renderer path.

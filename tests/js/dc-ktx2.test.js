@@ -160,12 +160,22 @@ describe('KTX2 transcoder path — resolved against the filesystem', () => {
     }
   });
 
-  it('the path resolves through the public_html/node_modules symlink', () => {
-    // That symlink is what makes an absolute /node_modules/… URL servable at all. Without it the
-    // path is a 404 and every compressed texture silently fails to decode.
-    const link = path.join(REPO, 'public_html/node_modules');
-    expect(fs.existsSync(link), 'public_html/node_modules is missing').toBe(true);
+  it('the path resolves through public_html/lib, the symlink postinstall actually creates', () => {
+    // This used to assert public_html/node_modules, and it passed only on machines where someone
+    // had hand-made a SECOND symlink years ago. package.json's postinstall creates exactly one —
+    // public_html/lib — so on a clean checkout /node_modules/… was a 404 and every compressed
+    // texture silently failed to decode. CI proved it: the directory simply was not there.
+    const link = path.join(REPO, 'public_html/lib');
+    expect(fs.existsSync(link), 'public_html/lib is missing — postinstall did not run or failed').toBe(true);
     expect(fs.realpathSync(link)).toBe(fs.realpathSync(path.join(REPO, 'node_modules')));
+  });
+
+  it('requests the transcoder from /lib/, the path the rest of the page uses', () => {
+    // dc.html references /lib/ seventeen times; this was the one /node_modules/ URL in the whole
+    // page. Keeping them consistent is what stops the next clean deploy losing textures again.
+    const setup = stripComments(SRC);
+    expect(setup).toMatch(/setTranscoderPath\(\s*['"]\/lib\//);
+    expect(setup).not.toMatch(/setTranscoderPath\(\s*['"]\/node_modules\//);
   });
 
 });

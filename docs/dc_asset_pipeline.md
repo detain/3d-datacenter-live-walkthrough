@@ -113,13 +113,23 @@ const loaderGltf = new GLTFLoader();
 loaderGltf.setMeshoptDecoder(MeshoptDecoder); // EXT_meshopt_compression (mesh geometry)
 
 loaderGltf.ktx2Loader = new KTX2Loader();
-loaderGltf.ktx2Loader.setTranscoderPath('/node_modules/three/examples/jsm/libs/basis/');
+loaderGltf.ktx2Loader.setTranscoderPath('/lib/three/examples/jsm/libs/basis/');
 loaderGltf.ktx2Loader.detectSupport(renderer);
 ```
 
-`public_html/node_modules` is a symlink to the repository's `node_modules/`, which is what makes
-that absolute path resolve — the transcoder is served from the installed three.js package rather
-than being copied into the tree.
+`public_html/lib` is a symlink to the repository's `node_modules/`, which is what makes that
+absolute path resolve — the transcoder is served from the installed three.js package rather than
+being copied into the tree.
+
+That symlink is created by `package.json`'s `ensure-lib-symlink` script (run from `postinstall`,
+and explicitly in CI) and is **not** in git, so it has to exist on every checkout and every deploy.
+
+This path used to read `/node_modules/…`, which resolved only on machines where someone had
+hand-made a *second*, undocumented symlink at `public_html/node_modules`. Nothing created it — so
+on a clean deploy the transcoder was a 404, and a missing transcoder does not announce itself:
+`KTX2Loader` simply fails to decode and every compressed texture silently disappears. CI caught it
+once the assertions were resolved against the filesystem instead of matched as text. Everything
+else the page loads — three.js, lil-gui, three-mesh-bvh — already went through `/lib/`.
 
 ### What `detectSupport(renderer)` actually does
 
