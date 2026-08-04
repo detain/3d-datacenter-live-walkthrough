@@ -1,0 +1,73 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  js-tests:
+    name: JS Tests (Vitest + Playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Setup PHP (playwright.config.ts serves the page with `php -S`)
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+
+      - name: Install dependencies
+        run: npm install
+
+      # public_html/lib -> ../node_modules is what serves three.js, lil-gui, three-mesh-bvh and the
+      # Basis transcoder to the page; dc.html alone references /lib/ seventeen times. It is NOT in
+      # git, so every checkout depends on it being created here. postinstall does create it, but run
+      # it explicitly so a failure is a failure rather than four unrelated-looking "missing file"
+      # test failures.
+      - name: Ensure public_html/lib symlink
+        run: npm run ensure-lib-symlink
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Vitest unit tests
+        run: npx vitest run --coverage --coverage.reporter=lcov --coverage.reporter=text
+
+      # Advisory, not expected to fail: the Vitest job above is the hard gate. This one depends on
+      # a browser — chromium download, SwiftShader software GL, headless timing — and an
+      # infrastructure flake in that stack should not block a PR. Every page load goes through
+      # dc.spec.ts's bootHermetic() helper, which stubs the WebSocket, the datacenter data endpoint
+      # and the Mixamo manifest, so asset volume is not the variable it used to be.
+      - name: Run Playwright E2E tests
+        continue-on-error: true
+        run: npx playwright test
+
+      # Performance regression guard — intentionally fails CI on regression (no continue-on-error).
+      # Runs only Group 10, which asserts DC.bench() metrics stay within agreed thresholds.
+      - name: Run Playwright performance regression test
+        run: npx playwright test --grep "Performance regression" tests/playwright/dc.spec.ts
+
+      - name: Upload Vitest coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage/lcov.info
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload Playwright test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
+          if-no-files-found: ignore

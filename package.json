@@ -1,0 +1,42 @@
+{
+  "name": "3d-datacenter-live-walkthrough",
+  "version": "1.0.0",
+  "description": "3D datacenter live walkthrough — browser scene, WebSocket presence, and its test suites",
+  "private": true,
+  "license": "MIT",
+  "author": "Joe Huss <detain@interserver.net>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/detain/3d-datacenter-live-walkthrough.git"
+  },
+  "keywords": [
+    "threejs",
+    "webgpu",
+    "webgl",
+    "datacenter",
+    "walkthrough",
+    "websocket"
+  ],
+  "scripts": {
+    "test:js": "vitest run",
+    "test:js:watch": "vitest",
+    "test:js:coverage": "vitest run --coverage",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "ensure-lib-symlink": "node -e \"const fs=require('fs'),p=require('path'); const link='public_html/lib'; if (fs.existsSync(link)) { console.log('[lib] ' + link + ' already present'); process.exit(0) } try { fs.symlinkSync(p.resolve('node_modules'), link, 'junction'); console.log('[lib] created ' + link) } catch (e) { console.error('[lib] FAILED to create ' + link + ': ' + e.message); process.exit(1) }\"",
+    "postinstall": "npm run ensure-lib-symlink"
+  },
+  "dependencies": {
+    "lil-gui": "0.21.0",
+    "three": "0.185.1",
+    "three-mesh-bvh": "^0.9.14"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "@vitest/coverage-v8": "^4.1.10",
+    "vitest": "^4.1.10"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

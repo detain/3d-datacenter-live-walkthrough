@@ -1,0 +1,23 @@
+node_modules/
+coverage/
+playwright-report/
+test-results/
+blob-report/
+.playwright/
+
+# public_html/lib is a symlink to node_modules/, created by `npm run ensure-lib-symlink`
+# (which postinstall runs). It must never be committed.
+public_html/lib
+
+# agent tooling scratch
+.caliber/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+npm-debug.log*
+yarn-error.log*
